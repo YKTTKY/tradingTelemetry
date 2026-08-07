@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 — Live conflated bar updates
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Sidebar docks right and can be shown/hidden
 - [x] Multiple named watchlists; user can switch which list is active
@@ -27,3 +27,4 @@
 - Engine IPC: snapshot includes `workspace.watchlists` + `active_watchlist_id` + top-level `quotes`; mutations via `POST /v1/watchlist/{active,add,remove}`; live `quote_update` conflated on WS.
 - Default lists: **Core** (product defaults) + empty **Focus** for multi-list switcher.
 - TUI: `w` toggle sidebar, `n`/`p` cycle lists, `a` add, `x`/`d` remove, ↑/↓ select row.
+- LSE futures mapping: domain `ES`/`NQ` → wire `ES.F`/`NQ.F` (bare `ES` is equity Eversource). Commits: `ea00152` (sidebar), `b3508b9` (futures map).
