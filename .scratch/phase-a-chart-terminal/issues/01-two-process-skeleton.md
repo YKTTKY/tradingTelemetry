@@ -4,7 +4,7 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [x] Engine project is created and run via **uv** (lockfile, sync, run, test entrypoints exist)
 - [x] TUI process starts and connects to the engine over HTTP + WebSocket on localhost
