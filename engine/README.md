@@ -19,11 +19,12 @@ uv run market-engine
 
 Default (and currently only) **vendor mode is `fake`**. Real LSE mode lands with the LSE vendor adapter ticket.
 
-## IPC (v1 skeleton)
+## IPC (v1)
 
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /v1/snapshot` | Bootstrap snapshot including `feed` status |
+| `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` |
 | `WS /v1/ws` | Live events: `feed_status`, then `heartbeat` |
 
 Example snapshot:
@@ -37,6 +38,27 @@ Example snapshot:
   }
 }
 ```
+
+Example chart interest (fake vendor knows **SPY** @ **1D**; unknown pairs return `status: unavailable` with empty `bars`):
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
+  -H 'Content-Type: application/json' \
+  -d '{"instrument":"SPY","timeframe":"1D"}'
+```
+
+```json
+{
+  "instrument": "SPY",
+  "timeframe": "1D",
+  "status": "ok",
+  "bars": [
+    {"ts": 1719792000, "open": 540.0, "high": 540.5, "low": 539.5, "close": 540.0, "volume": 50000000.0}
+  ]
+}
+```
+
+Instrument ids are **canonical** (`SPY`, `QQQ`, …) — never a `:test` suffix. Fake vs real is `vendor_mode`, not ticker encoding.
 
 ## Test
 

@@ -31,8 +31,10 @@ def main() -> None:
     # Import after parse so --help stays light.
     from market_engine.app import create_app
     from market_engine.feed import default_feed_state
+    from market_engine.vendor import default_vendor
 
-    app = create_app(feed=default_feed_state(vendor_mode=args.vendor))
+    feed = default_feed_state(vendor_mode=args.vendor)
+    app = create_app(feed=feed, vendor=default_vendor(args.vendor))
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

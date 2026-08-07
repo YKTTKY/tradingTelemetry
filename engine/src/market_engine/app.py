@@ -8,20 +8,41 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket
 from fastapi.websockets import WebSocketDisconnect
+from pydantic import BaseModel, Field
 
+from market_engine.chart import ChartService
 from market_engine.feed import FeedState, default_feed_state
+from market_engine.vendor import MarketDataVendor, default_vendor
 
 
-def create_app(feed: FeedState | None = None) -> FastAPI:
+class ChartInterestBody(BaseModel):
+    instrument: str = Field(min_length=1)
+    timeframe: str = Field(min_length=1)
+
+
+def create_app(
+    feed: FeedState | None = None,
+    vendor: MarketDataVendor | None = None,
+) -> FastAPI:
     """Build the ASGI app. Defaults to fake vendor mode when no vendor selected."""
     state = feed if feed is not None else default_feed_state()
+    market_vendor = vendor if vendor is not None else default_vendor(state.vendor_mode)
+    charts = ChartService(vendor=market_vendor)
+
     app = FastAPI(title="market-engine", version="0.1.0")
     app.state.feed = state
+    app.state.charts = charts
 
     @app.get("/v1/snapshot")
     def snapshot() -> dict[str, Any]:
         feed_state: FeedState = app.state.feed
         return {"feed": feed_state.to_snapshot()}
+
+    @app.post("/v1/chart/interest")
+    def chart_interest(body: ChartInterestBody) -> dict[str, Any]:
+        chart_svc: ChartService = app.state.charts
+        result = chart_svc.set_interest(body.instrument, body.timeframe)
+        return result.to_interest_response()
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

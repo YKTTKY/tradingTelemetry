@@ -17,6 +17,9 @@ Quick checks:
 
 ```bash
 curl -s http://127.0.0.1:8765/v1/snapshot | python3 -m json.tool
+curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
+  -H 'Content-Type: application/json' \
+  -d '{"instrument":"SPY","timeframe":"1D"}' | python3 -m json.tool
 # WebSocket: /v1/ws  (feed_status then heartbeat events)
 uv run pytest
 ```
@@ -29,8 +32,9 @@ cargo run
 # optional: ENGINE_URL=http://127.0.0.1:8765 cargo run
 ```
 
-- **Welcome** shows feed status (connected / disconnected).
-- **Enter** opens an empty **workspace** shell (charts land in later tickets).
+- **Welcome** shows feed status (connected / disconnected; vendor mode **fake** by default).
+- **Enter** opens the default **workspace** (`single` layout, **SPY** @ **1D**) and loads historical candles from the engine.
+- Unavailable instrument/timeframe shows **Data Currently not Available** (no invented series).
 - **q** / **Esc** quits.
 
 The TUI does **not** call any market vendor; only the engine does.
@@ -47,5 +51,6 @@ The TUI does **not** call any market vendor; only the engine does.
 ## Defaults
 
 - Engine vendor mode: **fake** when no real vendor is selected (`--vendor fake`).
-- IPC: JSON over HTTP `/v1/snapshot` and WebSocket `/v1/ws`.
+- Default chart: **SPY** @ **1D** (canonical instrument id — not `SPY:test`).
+- IPC: JSON over HTTP `/v1/snapshot`, `/v1/chart/interest`, and WebSocket `/v1/ws`.
 - No ZeroMQ, Redis, or Postgres in v1.

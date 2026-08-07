@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -26,6 +26,12 @@ impl EngineEndpoint {
         self.base
             .join("/v1/snapshot")
             .expect("snapshot path joins base")
+    }
+
+    pub fn chart_interest_url(&self) -> Url {
+        self.base
+            .join("/v1/chart/interest")
+            .expect("chart interest path joins base")
     }
 
     pub fn ws_url(&self) -> Url {
@@ -52,6 +58,30 @@ struct SnapshotBody {
     feed: FeedSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChartInterestRequest {
+    pub instrument: String,
+    pub timeframe: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct OhlcvBar {
+    pub ts: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ChartInterestResponse {
+    pub instrument: String,
+    pub timeframe: String,
+    pub status: String,
+    pub bars: Vec<OhlcvBar>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcEvent {
     Snapshot(FeedSnapshot),
@@ -61,6 +91,10 @@ pub enum IpcEvent {
     },
     Heartbeat {
         ts: f64,
+    },
+    ChartSeries(ChartInterestResponse),
+    ChartLoadFailed {
+        message: String,
     },
     Disconnected {
         reason: String,
@@ -91,6 +125,29 @@ pub async fn fetch_snapshot(endpoint: &EngineEndpoint) -> Result<FeedSnapshot, I
         .json()
         .await?;
     Ok(body.feed)
+}
+
+pub async fn post_chart_interest(
+    endpoint: &EngineEndpoint,
+    instrument: &str,
+    timeframe: &str,
+) -> Result<ChartInterestResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = ChartInterestRequest {
+        instrument: instrument.to_string(),
+        timeframe: timeframe.to_string(),
+    };
+    let response: ChartInterestResponse = client
+        .post(endpoint.chart_interest_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
 }
 
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
@@ -183,6 +240,10 @@ mod tests {
         assert_eq!(
             ep.snapshot_url().as_str(),
             "http://127.0.0.1:8765/v1/snapshot"
+        );
+        assert_eq!(
+            ep.chart_interest_url().as_str(),
+            "http://127.0.0.1:8765/v1/chart/interest"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Trading Telemetry TUI — Welcome → workspace shell over engine HTTP+WS.
+//! Trading Telemetry TUI — Welcome → default SPY@1D chart over engine HTTP+WS.
 
 mod app;
 mod ipc;
@@ -14,7 +14,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ipc::{run_ipc_loop, EngineEndpoint};
+use ipc::{post_chart_interest, run_ipc_loop, EngineEndpoint, IpcEvent};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -28,12 +28,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid ENGINE_URL: {engine_url}"))?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_ipc_loop(endpoint, tx));
+    tokio::spawn(run_ipc_loop(endpoint.clone(), tx.clone()));
 
     let mut terminal = setup_terminal()?;
     let mut app = App::default();
 
-    let result = run_loop(&mut terminal, &mut app, &mut rx).await;
+    let result = run_loop(&mut terminal, &mut app, &endpoint, &tx, &mut rx).await;
 
     restore_terminal(&mut terminal)?;
     result
@@ -42,11 +42,33 @@ async fn main() -> Result<()> {
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    rx: &mut mpsc::UnboundedReceiver<ipc::IpcEvent>,
+    endpoint: &EngineEndpoint,
+    tx: &mpsc::UnboundedSender<IpcEvent>,
+    rx: &mut mpsc::UnboundedReceiver<IpcEvent>,
 ) -> Result<()> {
     loop {
         while let Ok(ev) = rx.try_recv() {
             app.apply_ipc(ev);
+        }
+
+        if app.needs_chart_load {
+            app.chart_load_started();
+            let instrument = app.chart.instrument.clone();
+            let timeframe = app.chart.timeframe.clone();
+            let ep = endpoint.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match post_chart_interest(&ep, &instrument, &timeframe).await {
+                    Ok(series) => {
+                        let _ = tx.send(IpcEvent::ChartSeries(series));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(IpcEvent::ChartLoadFailed {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            });
         }
 
         terminal.draw(|frame| ui::draw(frame, app))?;
