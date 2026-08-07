@@ -444,11 +444,14 @@ class LseVendor:
         lse_tf = DOMAIN_TO_LSE_TIMEFRAME[timeframe]
         lse_sym = domain_to_lse_instrument(instrument)
         try:
+            # Newest page first: vault order=asc+limit returns the *oldest* rows
+            # (e.g. SPY 1m from 2003). Mixing that with live 2020s prices collapses
+            # the chart y-scale (ancient strip at bottom, live tip floating alone).
             rows = self._client.candles(
                 lse_sym,
                 lse_tf,
                 limit=self._history_limit,
-                order="asc",
+                order="desc",
             )
         except Exception:
             # LSEError, transport, bad key, unknown symbol — explicit unavailable.
@@ -465,7 +468,9 @@ class LseVendor:
                 available=False,
                 bars=(),
             )
-        bars = bars_from_lse_candles(list(rows))
+        # Chart series and IPC expect ascending time (oldest → newest).
+        rows = list(reversed(list(rows)))
+        bars = bars_from_lse_candles(rows)
         if not bars:
             return HistoryResult(
                 instrument=instrument,

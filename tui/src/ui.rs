@@ -154,25 +154,40 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
         return;
     }
 
-    let mut min_p = bars[0].low;
-    let mut max_p = bars[0].high;
-    for b in bars {
+    // Fit roughly one candle per terminal column (inner width minus borders).
+    // Drawing 500 sub-pixel bodies makes the series unreadable even with good data.
+    let inner_w = area.width.saturating_sub(2).max(8) as usize;
+    let visible = visible_bar_window(bars, inner_w);
+    let n = visible.len() as f64;
+
+    let mut min_p = visible[0].low;
+    let mut max_p = visible[0].high;
+    for b in visible {
         min_p = min_p.min(b.low);
         max_p = max_p.max(b.high);
+    }
+    // Flat series (or single print) still needs a non-zero y span for Canvas.
+    if (max_p - min_p).abs() < f64::EPSILON {
+        min_p -= 1.0;
+        max_p += 1.0;
     }
     let pad = ((max_p - min_p) * 0.05).max(0.01);
     min_p -= pad;
     max_p += pad;
 
-    let n = bars.len() as f64;
     let last = bars.last().expect("non-empty");
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}",
         last.open,
         last.high,
         last.low,
         last.close,
-        bars.len()
+        bars.len(),
+        if visible.len() < bars.len() {
+            format!(" show={}", visible.len())
+        } else {
+            String::new()
+        }
     );
 
     let block = Block::default()
@@ -183,13 +198,17 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
             Style::default().fg(Color::DarkGray),
         )));
 
+    // Body width in data units: leave a small gap between neighbors.
+    let body_w = 0.7_f64;
+    let half_w = body_w / 2.0;
+
     let canvas = Canvas::default()
         .block(block)
         .marker(symbols::Marker::Block)
         .x_bounds([0.0, n])
         .y_bounds([min_p, max_p])
         .paint(|ctx| {
-            for (i, bar) in bars.iter().enumerate() {
+            for (i, bar) in visible.iter().enumerate() {
                 let x = i as f64 + 0.5;
                 let up = bar.close >= bar.open;
                 let color = if up { Color::Green } else { Color::Red };
@@ -206,11 +225,11 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
                 // Open–close body
                 let top = bar.open.max(bar.close);
                 let bottom = bar.open.min(bar.close);
-                let height = (top - bottom).max((max_p - min_p) * 0.002);
+                let height = (top - bottom).max((max_p - min_p) * 0.004);
                 ctx.draw(&Rectangle {
-                    x: x - 0.35,
+                    x: x - half_w,
                     y: bottom,
-                    width: 0.7,
+                    width: body_w,
                     height,
                     color,
                 });
@@ -218,6 +237,15 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
         });
 
     frame.render_widget(canvas, area);
+}
+
+/// Right-aligned window of bars that fit the chart width (~1 candle per column).
+fn visible_bar_window(bars: &[OhlcvBar], max_bars: usize) -> &[OhlcvBar] {
+    if bars.len() <= max_bars {
+        bars
+    } else {
+        &bars[bars.len() - max_bars..]
+    }
 }
 
 fn feed_line(app: &App) -> Line<'static> {

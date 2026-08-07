@@ -43,7 +43,7 @@ class StubLseClient:
         default_factory=dict
     )
     fail_with: Exception | None = None
-    candles_calls: list[tuple[str, str]] = field(default_factory=list)
+    candles_calls: list[tuple[str, str, str]] = field(default_factory=list)
     subscribed: list[str] = field(default_factory=list)
     unsubscribed: list[str] = field(default_factory=list)
     connect_calls: list[list[str] | None] = field(default_factory=list)
@@ -60,10 +60,16 @@ class StubLseClient:
         order: str = "asc",
         dataset: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.candles_calls.append((symbol, timeframe))
+        self.candles_calls.append((symbol, timeframe, order))
         if self.fail_with is not None:
             raise self.fail_with
-        return list(self.candles_by_key.get((symbol, timeframe), []))
+        rows = list(self.candles_by_key.get((symbol, timeframe), []))
+        # Mirror vault: desc returns newest-first; asc is chronological storage order.
+        if order == "desc":
+            rows = list(reversed(rows))
+        if limit is not None:
+            rows = rows[: int(limit)]
+        return rows
 
     def on(self, event: str, callback: Callable) -> StubLseClient:
         if event == "tick":
@@ -228,6 +234,52 @@ def test_lse_fetch_history_maps_domain_tf_and_returns_bars():
     assert result.bars[-1].volume == 1_200_000.0
     # Canonical instrument — never a :test suffix
     assert ":" not in result.instrument
+    # Must request newest page (desc); returned series stays ascending for charts.
+    assert stub.candles_calls == [("SPY", "1d", "desc")]
+    assert result.bars[0].ts < result.bars[-1].ts
+
+
+def test_lse_fetch_history_uses_newest_page_not_oldest():
+    """Regression: asc+limit pulled 2003 SPY (~$100) while live is modern prices."""
+    from market_engine.vendor import LseVendor
+
+    # Store chronological (old → new). desc+limit must keep the newest N only.
+    old = {
+        "timestamp": "2003-09-10T00:00:00Z",
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.5,
+        "volume": 1.0,
+    }
+    mid = {
+        "timestamp": "2024-07-01T00:00:00Z",
+        "open": 540.0,
+        "high": 541.0,
+        "low": 539.0,
+        "close": 540.5,
+        "volume": 2.0,
+    }
+    new = {
+        "timestamp": "2024-07-02T00:00:00Z",
+        "open": 540.5,
+        "high": 542.0,
+        "low": 540.0,
+        "close": 541.75,
+        "volume": 3.0,
+    }
+    stub = StubLseClient(candles_by_key={("SPY", "1d"): [old, mid, new]})
+    vendor = LseVendor(client=stub, history_limit=2)
+
+    result = vendor.fetch_history("SPY", "1D")
+
+    assert result.available is True
+    assert len(result.bars) == 2
+    assert result.bars[0].close == 540.5
+    assert result.bars[-1].close == 541.75
+    # Ancient page must not be included when limit trims to newest.
+    assert all(b.close != 100.5 for b in result.bars)
+    assert stub.candles_calls[-1][2] == "desc"
 
 
 def test_lse_fetch_history_unavailable_when_empty_rows():
