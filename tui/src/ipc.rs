@@ -82,6 +82,16 @@ pub struct ChartInterestResponse {
     pub bars: Vec<OhlcvBar>,
 }
 
+/// Live bar tip update from the engine (conflated WebSocket event).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BarUpdateEvent {
+    pub instrument: String,
+    pub timeframe: String,
+    #[serde(default)]
+    pub completed_bars: Vec<OhlcvBar>,
+    pub bar: OhlcvBar,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcEvent {
     Snapshot(FeedSnapshot),
@@ -93,6 +103,7 @@ pub enum IpcEvent {
         ts: f64,
     },
     ChartSeries(ChartInterestResponse),
+    BarUpdate(BarUpdateEvent),
     ChartLoadFailed {
         message: String,
     },
@@ -215,6 +226,18 @@ async fn connect_session(
                             let ts = value.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
                             if tx.send(IpcEvent::Heartbeat { ts }).is_err() {
                                 return Ok(());
+                            }
+                        }
+                        Some("bar_update") => {
+                            match serde_json::from_value::<BarUpdateEvent>(value) {
+                                Ok(update) => {
+                                    if tx.send(IpcEvent::BarUpdate(update)).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(_) => {
+                                    // Ignore malformed bar_update frames.
+                                }
                             }
                         }
                         _ => {}

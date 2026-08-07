@@ -1,7 +1,12 @@
-"""Market-data vendor seam: history fetch with fake (and later LSE) adapters."""
+"""Market-data vendor seam: history + live ticks (fake adapter; LSE later)."""
 
 from __future__ import annotations
 
+import asyncio
+import random
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -29,6 +34,16 @@ class Bar:
 
 
 @dataclass(frozen=True)
+class Tick:
+    """A single last-sale (or mid) print used to advance live bars."""
+
+    instrument: str
+    price: float
+    volume: float
+    ts: float
+
+
+@dataclass(frozen=True)
 class HistoryResult:
     """Historical series for an instrument+timeframe, or explicit unavailability."""
 
@@ -46,10 +61,17 @@ class HistoryResult:
         }
 
 
+TickHandler = Callable[[Tick], None]
+
+
 class MarketDataVendor(Protocol):
-    """Vendor adapter: resolve history for domain instrument + timeframe ids."""
+    """Vendor adapter: history fetch + per-instrument live tick subscription."""
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult: ...
+
+    def subscribe(self, instrument: str, handler: TickHandler) -> None: ...
+
+    def unsubscribe(self, instrument: str, handler: TickHandler) -> None: ...
 
 
 # Deterministic daily closes for SPY @ 1D (known literals for contract tests).
@@ -106,7 +128,23 @@ _FAKE_HISTORY: dict[tuple[str, str], tuple[Bar, ...]] = {
 
 
 class FakeVendor:
-    """In-process fake: known instruments/timeframes only; never invents the rest."""
+    """In-process fake: known history; live ticks via inject or optional auto-walk."""
+
+    def __init__(
+        self,
+        auto_ticks: bool = False,
+        auto_tick_interval_s: float = 0.25,
+    ) -> None:
+        self._auto_ticks = auto_ticks
+        self._auto_tick_interval_s = auto_tick_interval_s
+        self._handlers: dict[str, list[TickHandler]] = {}
+        self._lock = threading.Lock()
+        self._last_price: dict[str, float] = {}
+        # Synthetic clock anchored to history tip so live ticks update the last
+        # bar instead of immediately rolling a new period on wall-clock time.
+        self._sim_ts: dict[str, float] = {}
+        self._auto_task: asyncio.Task[None] | None = None
+        self._auto_instruments: set[str] = set()
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult:
         key = (instrument, timeframe)
@@ -118,6 +156,10 @@ class FakeVendor:
                 available=False,
                 bars=(),
             )
+        if bars:
+            self._last_price[instrument] = bars[-1].close
+            # Start just inside the open last bar so the first live print updates tip.
+            self._sim_ts[instrument] = float(bars[-1].ts) + 1.0
         return HistoryResult(
             instrument=instrument,
             timeframe=timeframe,
@@ -125,8 +167,105 @@ class FakeVendor:
             bars=bars,
         )
 
+    def subscribe(self, instrument: str, handler: TickHandler) -> None:
+        with self._lock:
+            handlers = self._handlers.setdefault(instrument, [])
+            if handler not in handlers:
+                handlers.append(handler)
+            self._auto_instruments.add(instrument)
+        if self._auto_ticks:
+            self._ensure_auto_loop()
 
-def default_vendor(mode: str = "fake") -> MarketDataVendor:
+    def unsubscribe(self, instrument: str, handler: TickHandler) -> None:
+        with self._lock:
+            handlers = self._handlers.get(instrument)
+            if not handlers:
+                return
+            if handler in handlers:
+                handlers.remove(handler)
+            if not handlers:
+                self._handlers.pop(instrument, None)
+                self._auto_instruments.discard(instrument)
+
+    def inject_tick(
+        self,
+        instrument: str,
+        price: float,
+        volume: float = 0.0,
+        ts: float | None = None,
+    ) -> None:
+        """Test / control-plane hook: emit one tick to current subscribers."""
+        if ts is None:
+            with self._lock:
+                base = self._sim_ts.get(instrument)
+                if base is None:
+                    ts = time.time()
+                else:
+                    base += 1.0
+                    self._sim_ts[instrument] = base
+                    ts = base
+        else:
+            with self._lock:
+                self._sim_ts[instrument] = ts
+        tick = Tick(
+            instrument=instrument,
+            price=price,
+            volume=volume,
+            ts=ts,
+        )
+        self._last_price[instrument] = price
+        self._dispatch(tick)
+
+    def _dispatch(self, tick: Tick) -> None:
+        with self._lock:
+            handlers = list(self._handlers.get(tick.instrument, ()))
+        for handler in handlers:
+            handler(tick)
+
+    def _ensure_auto_loop(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._auto_task is None or self._auto_task.done():
+            self._auto_task = loop.create_task(self._auto_tick_loop(), name="fake-auto-ticks")
+
+    async def _auto_tick_loop(self) -> None:
+        rng = random.Random(42)
+        try:
+            while True:
+                await asyncio.sleep(self._auto_tick_interval_s)
+                with self._lock:
+                    instruments = list(self._auto_instruments)
+                for instrument in instruments:
+                    last = self._last_price.get(instrument)
+                    if last is None:
+                        continue
+                    # Small deterministic-ish random walk for demo liveliness.
+                    # Timestamp advances on the sim clock (history-anchored).
+                    delta = rng.uniform(-0.15, 0.15)
+                    price = max(0.01, last + delta)
+                    self.inject_tick(
+                        instrument,
+                        price=round(price, 4),
+                        volume=float(rng.randint(100, 2_000)),
+                        ts=None,
+                    )
+        except asyncio.CancelledError:
+            raise
+
+    async def stop_auto_ticks(self) -> None:
+        task = self._auto_task
+        self._auto_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+def default_vendor(mode: str = "fake", *, auto_ticks: bool = True) -> MarketDataVendor:
     if mode == "fake":
-        return FakeVendor()
+        return FakeVendor(auto_ticks=auto_ticks)
     raise ValueError(f"unsupported vendor mode: {mode}")

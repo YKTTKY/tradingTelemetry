@@ -34,7 +34,8 @@ def main() -> None:
     from market_engine.vendor import default_vendor
 
     feed = default_feed_state(vendor_mode=args.vendor)
-    app = create_app(feed=feed, vendor=default_vendor(args.vendor))
+    # Interactive default: fake vendor walks last price so open charts stay live.
+    app = create_app(feed=feed, vendor=default_vendor(args.vendor, auto_ticks=True))
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

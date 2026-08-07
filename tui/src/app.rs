@@ -1,6 +1,6 @@
 //! Application state: Welcome → single-layout workspace with default chart.
 
-use crate::ipc::{ChartInterestResponse, FeedSnapshot, IpcEvent, OhlcvBar};
+use crate::ipc::{BarUpdateEvent, ChartInterestResponse, FeedSnapshot, IpcEvent, OhlcvBar};
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
 pub const UNAVAILABLE_COPY: &str = "Data Currently not Available";
@@ -150,6 +150,9 @@ impl App {
             IpcEvent::ChartSeries(series) => {
                 self.apply_chart_series(series);
             }
+            IpcEvent::BarUpdate(update) => {
+                self.apply_bar_update(update);
+            }
             IpcEvent::ChartLoadFailed { message } => {
                 self.apply_chart_load_error(message);
             }
@@ -183,6 +186,20 @@ impl App {
         self.chart.series = ChartSeriesState::Error { message };
     }
 
+    /// Apply a conflated live bar tip (and any completed bars from a period roll).
+    pub fn apply_bar_update(&mut self, update: BarUpdateEvent) {
+        if update.instrument != self.chart.instrument || update.timeframe != self.chart.timeframe {
+            return;
+        }
+        let ChartSeriesState::Available { bars } = &mut self.chart.series else {
+            return;
+        };
+        for completed in update.completed_bars {
+            merge_bar(bars, completed);
+        }
+        merge_bar(bars, update.bar);
+    }
+
     fn set_feed(&mut self, feed: FeedSnapshot) {
         let connected = feed.status == "connected" && feed.engine == "up";
         self.connection = if connected {
@@ -206,6 +223,24 @@ impl App {
         match self.chart.series {
             ChartSeriesState::Unavailable => Some(UNAVAILABLE_COPY),
             _ => None,
+        }
+    }
+}
+
+/// Replace last bar when timestamps match; append when the tip advances.
+fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
+    match bars.last_mut() {
+        Some(last) if last.ts == bar.ts => {
+            *last = bar;
+        }
+        Some(last) if bar.ts > last.ts => {
+            bars.push(bar);
+        }
+        Some(_) => {
+            // Stale / out-of-order tip — ignore.
+        }
+        None => {
+            bars.push(bar);
         }
     }
 }
@@ -311,5 +346,130 @@ mod tests {
             }],
         });
         assert_eq!(app.chart.series, ChartSeriesState::Loading);
+    }
+
+    #[test]
+    fn bar_update_mutates_last_bar_close() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1_720_569_600,
+                open: 546.25,
+                high: 548.5,
+                low: 545.75,
+                close: 548.0,
+                volume: 50_900_000.0,
+            }],
+        });
+        app.apply_bar_update(BarUpdateEvent {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            completed_bars: vec![],
+            bar: OhlcvBar {
+                ts: 1_720_569_600,
+                open: 546.25,
+                high: 549.25,
+                low: 545.75,
+                close: 549.25,
+                volume: 50_910_000.0,
+            },
+        });
+        match &app.chart.series {
+            ChartSeriesState::Available { bars } => {
+                assert_eq!(bars.len(), 1);
+                assert_eq!(bars[0].close, 549.25);
+                assert_eq!(bars[0].high, 549.25);
+                assert_eq!(bars[0].volume, 50_910_000.0);
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bar_update_period_roll_appends_new_bar() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1_720_569_600,
+                open: 546.25,
+                high: 548.5,
+                low: 545.75,
+                close: 548.0,
+                volume: 50_900_000.0,
+            }],
+        });
+        app.apply_bar_update(BarUpdateEvent {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            completed_bars: vec![OhlcvBar {
+                ts: 1_720_569_600,
+                open: 546.25,
+                high: 548.5,
+                low: 545.75,
+                close: 548.0,
+                volume: 50_900_000.0,
+            }],
+            bar: OhlcvBar {
+                ts: 1_720_569_600 + 86_400,
+                open: 550.0,
+                high: 550.0,
+                low: 550.0,
+                close: 550.0,
+                volume: 5_000.0,
+            },
+        });
+        match &app.chart.series {
+            ChartSeriesState::Available { bars } => {
+                assert_eq!(bars.len(), 2);
+                assert_eq!(bars[0].close, 548.0);
+                assert_eq!(bars[1].ts, 1_720_569_600 + 86_400);
+                assert_eq!(bars[1].close, 550.0);
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bar_update_ignores_other_instrument() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+        });
+        app.apply_bar_update(BarUpdateEvent {
+            instrument: "QQQ".into(),
+            timeframe: "1D".into(),
+            completed_bars: vec![],
+            bar: OhlcvBar {
+                ts: 1,
+                open: 9.0,
+                high: 9.0,
+                low: 9.0,
+                close: 9.0,
+                volume: 9.0,
+            },
+        });
+        match &app.chart.series {
+            ChartSeriesState::Available { bars } => assert_eq!(bars[0].close, 1.0),
+            other => panic!("expected Available, got {other:?}"),
+        }
     }
 }
