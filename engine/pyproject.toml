@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
+    "lse-data>=0.14.0",
     "uvicorn>=0.52.1",
     "websockets>=17.0.1",
 ]

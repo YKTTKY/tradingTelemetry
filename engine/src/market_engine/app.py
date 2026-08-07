@@ -48,6 +48,9 @@ def create_app(
         hub.start()
         yield
         await hub.stop()
+        close = getattr(market_vendor, "close", None)
+        if callable(close):
+            close()
 
     app = FastAPI(title="market-engine", version="0.1.0", lifespan=lifespan)
     app.state.feed = state

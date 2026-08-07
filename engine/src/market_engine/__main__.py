@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import uvicorn
 
 
-def main() -> None:
+def _env_vendor_default() -> str:
+    raw = os.environ.get("MARKET_ENGINE_VENDOR", "fake").strip().lower()
+    if raw in ("fake", "lse"):
+        return raw
+    return "fake"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Argparse surface for the engine CLI (also used by contract tests)."""
     parser = argparse.ArgumentParser(description="Trading Telemetry market engine")
     parser.add_argument(
         "--host",
@@ -22,10 +31,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--vendor",
-        choices=("fake",),
-        default="fake",
-        help="Market-data vendor mode (default: fake; real vendors land later)",
+        choices=("fake", "lse"),
+        default=_env_vendor_default(),
+        help=(
+            "Market-data vendor mode: fake (default, CI/offline) or lse "
+            "(London Strategic Edge; requires LSE_API_KEY). "
+            "Also settable via MARKET_ENGINE_VENDOR."
+        ),
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     # Import after parse so --help stays light.
@@ -34,8 +52,12 @@ def main() -> None:
     from market_engine.vendor import default_vendor
 
     feed = default_feed_state(vendor_mode=args.vendor)
-    # Interactive default: fake vendor walks last price so open charts stay live.
-    app = create_app(feed=feed, vendor=default_vendor(args.vendor, auto_ticks=True))
+    # Interactive fake: random-walk last price. LSE: live stream from vendor.
+    auto_ticks = args.vendor == "fake"
+    app = create_app(
+        feed=feed,
+        vendor=default_vendor(args.vendor, auto_ticks=auto_ticks),
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

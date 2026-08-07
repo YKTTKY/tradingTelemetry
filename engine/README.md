@@ -15,9 +15,22 @@ uv sync --extra dev
 ```bash
 uv run market-engine
 # uv run market-engine --host 127.0.0.1 --port 8765 --vendor fake
+# uv run market-engine --vendor lse   # requires LSE_API_KEY
 ```
 
-Default (and currently only) **vendor mode is `fake`**. Real LSE mode lands with the LSE vendor adapter ticket.
+**Vendor modes** (one engine, swappable adapter):
+
+| Mode | Selection | Notes |
+|------|-----------|--------|
+| `fake` | **default** (`--vendor fake` or omit) | Offline/CI; known fixtures for SPY/QQQ/ES |
+| `lse` | `--vendor lse` or `MARKET_ENGINE_VENDOR=lse` | London Strategic Edge; needs `LSE_API_KEY` |
+
+```bash
+export LSE_API_KEY=lse_live_xxxxxxxxxxxx   # from https://londonstrategicedge.com/data
+uv run market-engine --vendor lse
+```
+
+Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution mapping lives only in the adapter.
 
 ## IPC (v1)
 
@@ -84,4 +97,6 @@ Primary suite is the **engine IPC seam** (black-box over HTTP+WS):
 
 ```bash
 uv run pytest -v
+# Live LSE integration (optional; skipped without credentials):
+# LSE_API_KEY=... uv run pytest -v -k live_lse
 ```
