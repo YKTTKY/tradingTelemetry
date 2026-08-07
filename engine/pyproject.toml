@@ -1,0 +1,36 @@
+[project]
+name = "market-engine"
+version = "0.1.0"
+description = "Local market engine for Trading Telemetry (HTTP + WebSocket IPC)"
+readme = "README.md"
+authors = [
+    { name = "YKTTKY", email = "yugio.tang.dev@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.1",
+    "websockets>=17.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[project.scripts]
+market-engine = "market_engine.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv]
+package = true

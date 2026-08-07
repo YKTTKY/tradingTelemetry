@@ -6,14 +6,14 @@
 
 **Status:** ready-for-agent
 
-- [ ] Engine project is created and run via **uv** (lockfile, sync, run, test entrypoints exist)
-- [ ] TUI process starts and connects to the engine over HTTP + WebSocket on localhost
-- [ ] HTTP serves a snapshot that includes feed status (engine reachable)
-- [ ] WebSocket accepts a connection and can deliver at least a trivial live event (e.g. heartbeat/status)
-- [ ] TUI shows Welcome then a shell that reflects connected/disconnected feed status
-- [ ] Engine defaults to **fake** vendor mode when no real vendor is selected (even if fake serves no bars yet)
-- [ ] No ZeroMQ, Redis, or Postgres; TUI does not call any market vendor
-- [ ] Smoke path documented enough to start engine (uv) and TUI (cargo) in two terminals
+- [x] Engine project is created and run via **uv** (lockfile, sync, run, test entrypoints exist)
+- [x] TUI process starts and connects to the engine over HTTP + WebSocket on localhost
+- [x] HTTP serves a snapshot that includes feed status (engine reachable)
+- [x] WebSocket accepts a connection and can deliver at least a trivial live event (e.g. heartbeat/status)
+- [x] TUI shows Welcome then a shell that reflects connected/disconnected feed status
+- [x] Engine defaults to **fake** vendor mode when no real vendor is selected (even if fake serves no bars yet)
+- [x] No ZeroMQ, Redis, or Postgres; TUI does not call any market vendor
+- [x] Smoke path documented enough to start engine (uv) and TUI (cargo) in two terminals
 
 ## Notes
 

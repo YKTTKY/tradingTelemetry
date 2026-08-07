@@ -1,2 +1,19 @@
 *.swp
 .DS_Store
+
+# Python / uv
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+*.egg-info/
+
+# Rust
+**/target/
+**/*.rs.bk
+
+# Local agent scratch (optional large artifacts only; issues stay tracked)
+.scratch/**/*.parquet
+.scratch/**/*.db
