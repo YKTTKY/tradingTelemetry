@@ -18,6 +18,7 @@
 
 - Parent spec: `.scratch/phase-a-chart-terminal/spec.md`
 - Fake data uses the same Instrument vocabulary as production
+- **Candle polish deferred:** v1 canvas candles are functional only (block-marker bodies). Do **not** expand this ticket for visual polish. Improve chart rendering later when live bars, overlays (MA/Volume/VP), or dual layout force a real chart-view path — or as a short dedicated polish pass after the series path is stable.
 
 ## Comments
 
@@ -26,3 +27,7 @@
 - **Vendor seam:** `engine/src/market_engine/vendor.py` — `MarketDataVendor` protocol, `FakeVendor` with deterministic SPY/QQQ @ 1D history.
 - **IPC:** `POST /v1/chart/interest` `{instrument, timeframe}` → `{status: ok|unavailable, bars: [...]}`.
 - **TUI:** default workspace single · SPY · 1D; on Enter loads history; canvas candle chart; empty state uses exact copy.
+
+### Follow-up (not blocking done)
+
+- Candlestick **visual quality** (spacing, wick/body, markers, price axis) is out of scope for 02; polish in a future ticket once chart chrome stabilizes.
