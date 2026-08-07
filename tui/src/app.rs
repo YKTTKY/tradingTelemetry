@@ -8,6 +8,11 @@ pub const UNAVAILABLE_COPY: &str = "Data Currently not Available";
 pub const DEFAULT_INSTRUMENT: &str = "SPY";
 pub const DEFAULT_TIMEFRAME: &str = "1D";
 
+/// v1 product timeframes only (domain). Cycle order is coarse → fine wrap.
+pub const V1_TIMEFRAMES: [&str; 9] = [
+    "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Welcome,
@@ -17,6 +22,13 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
     Single,
+}
+
+/// Modal input for instrument selection (and future prompts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    InstrumentPrompt { buffer: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +90,7 @@ pub struct App {
     pub last_heartbeat_ts: Option<f64>,
     /// When true, the main loop should POST chart interest for the focused chart.
     pub needs_chart_load: bool,
+    pub input_mode: InputMode,
     pub should_quit: bool,
 }
 
@@ -91,6 +104,7 @@ impl Default for App {
             feed: None,
             last_heartbeat_ts: None,
             needs_chart_load: false,
+            input_mode: InputMode::Normal,
             should_quit: false,
         }
     }
@@ -115,6 +129,88 @@ impl App {
 
     pub fn quit(&mut self) {
         self.should_quit = true;
+    }
+
+    /// Cycle focused chart timeframe by `delta` steps within [`V1_TIMEFRAMES`] only.
+    /// No-op outside workspace normal mode, or when the index would not change.
+    pub fn cycle_timeframe(&mut self, delta: i32) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        let Some(idx) = V1_TIMEFRAMES
+            .iter()
+            .position(|&tf| tf == self.chart.timeframe)
+        else {
+            // Unknown stored value — snap to default.
+            self.chart.timeframe = DEFAULT_TIMEFRAME.to_string();
+            self.request_chart_load();
+            return;
+        };
+        let n = V1_TIMEFRAMES.len() as i32;
+        let next = (idx as i32 + delta).rem_euclid(n) as usize;
+        let new_tf = V1_TIMEFRAMES[next];
+        if new_tf == self.chart.timeframe {
+            return;
+        }
+        self.chart.timeframe = new_tf.to_string();
+        self.request_chart_load();
+    }
+
+    /// Set focused chart instrument. Returns true when interest changed (reload armed).
+    pub fn set_instrument(&mut self, raw: &str) -> bool {
+        if self.screen != Screen::Workspace {
+            return false;
+        }
+        let symbol = normalize_instrument(raw);
+        if symbol.is_empty() || symbol == self.chart.instrument {
+            return false;
+        }
+        self.chart.instrument = symbol;
+        self.request_chart_load();
+        true
+    }
+
+    pub fn begin_instrument_prompt(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        self.input_mode = InputMode::InstrumentPrompt {
+            buffer: String::new(),
+        };
+    }
+
+    pub fn cancel_instrument_prompt(&mut self) {
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn prompt_push_char(&mut self, c: char) {
+        if let InputMode::InstrumentPrompt { buffer } = &mut self.input_mode {
+            // Instruments are alnum; allow `.` and `-` for future vendor symbols.
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                if buffer.len() < 16 {
+                    buffer.push(c.to_ascii_uppercase());
+                }
+            }
+        }
+    }
+
+    pub fn prompt_pop_char(&mut self) {
+        if let InputMode::InstrumentPrompt { buffer } = &mut self.input_mode {
+            buffer.pop();
+        }
+    }
+
+    /// Apply the instrument prompt buffer. Returns true when interest changed.
+    pub fn apply_instrument_prompt(&mut self) -> bool {
+        let InputMode::InstrumentPrompt { buffer } = &self.input_mode else {
+            return false;
+        };
+        let raw = buffer.clone();
+        self.input_mode = InputMode::Normal;
+        self.set_instrument(&raw)
     }
 
     pub fn apply_ipc(&mut self, event: IpcEvent) {
@@ -153,8 +249,12 @@ impl App {
             IpcEvent::BarUpdate(update) => {
                 self.apply_bar_update(update);
             }
-            IpcEvent::ChartLoadFailed { message } => {
-                self.apply_chart_load_error(message);
+            IpcEvent::ChartLoadFailed {
+                instrument,
+                timeframe,
+                message,
+            } => {
+                self.apply_chart_load_error(&instrument, &timeframe, message);
             }
             IpcEvent::Disconnected { reason } => {
                 self.connection = ConnectionStatus::Disconnected { reason };
@@ -182,7 +282,16 @@ impl App {
         }
     }
 
-    pub fn apply_chart_load_error(&mut self, message: String) {
+    pub fn apply_chart_load_error(
+        &mut self,
+        instrument: &str,
+        timeframe: &str,
+        message: String,
+    ) {
+        // Ignore stale failures from a prior instrument/timeframe selection.
+        if instrument != self.chart.instrument || timeframe != self.chart.timeframe {
+            return;
+        }
         self.chart.series = ChartSeriesState::Error { message };
     }
 
@@ -225,6 +334,11 @@ impl App {
             _ => None,
         }
     }
+}
+
+/// Canonical instrument id: trim + uppercase ASCII (e.g. `qqq` → `QQQ`).
+fn normalize_instrument(raw: &str) -> String {
+    raw.trim().to_ascii_uppercase()
 }
 
 /// Replace last bar when timestamps match; append when the tip advances.
@@ -467,6 +581,160 @@ mod tests {
                 volume: 9.0,
             },
         });
+        match &app.chart.series {
+            ChartSeriesState::Available { bars } => assert_eq!(bars[0].close, 1.0),
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v1_timeframes_are_exactly_the_product_set() {
+        assert_eq!(
+            V1_TIMEFRAMES,
+            ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"]
+        );
+    }
+
+    #[test]
+    fn cycle_timeframe_next_from_1d_goes_to_1w_then_wraps_to_1m() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![],
+        });
+        assert_eq!(app.chart.timeframe, "1D");
+
+        app.cycle_timeframe(1);
+        assert_eq!(app.chart.timeframe, "1W");
+        assert!(app.needs_chart_load);
+        assert_eq!(app.chart.series, ChartSeriesState::Loading);
+
+        app.chart_load_started();
+        app.cycle_timeframe(1);
+        assert_eq!(app.chart.timeframe, "1m");
+    }
+
+    #[test]
+    fn cycle_timeframe_prev_from_1d_goes_to_4h() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+
+        app.cycle_timeframe(-1);
+        assert_eq!(app.chart.timeframe, "4h");
+        assert!(app.needs_chart_load);
+    }
+
+    #[test]
+    fn set_instrument_reloads_history_and_normalizes_symbol() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+        });
+
+        assert!(app.set_instrument("qqq"));
+        assert_eq!(app.chart.instrument, "QQQ");
+        assert_eq!(app.chart.timeframe, "1D");
+        assert!(app.needs_chart_load);
+        assert_eq!(app.chart.series, ChartSeriesState::Loading);
+    }
+
+    #[test]
+    fn set_instrument_same_symbol_is_noop() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        assert!(!app.set_instrument("SPY"));
+        assert!(!app.needs_chart_load);
+    }
+
+    #[test]
+    fn set_instrument_rejects_empty() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        assert!(!app.set_instrument("   "));
+        assert_eq!(app.chart.instrument, "SPY");
+        assert!(!app.needs_chart_load);
+    }
+
+    #[test]
+    fn instrument_prompt_apply_changes_focused_chart() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+
+        app.begin_instrument_prompt();
+        assert!(matches!(app.input_mode, InputMode::InstrumentPrompt { .. }));
+        app.prompt_push_char('e');
+        app.prompt_push_char('s');
+        assert!(app.apply_instrument_prompt());
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.chart.instrument, "ES");
+        assert!(app.needs_chart_load);
+    }
+
+    #[test]
+    fn instrument_prompt_cancel_restores_normal_mode() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        app.begin_instrument_prompt();
+        app.prompt_push_char('x');
+        app.cancel_instrument_prompt();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.chart.instrument, "SPY");
+        assert!(!app.needs_chart_load);
+    }
+
+    #[test]
+    fn cycle_timeframe_ignored_during_instrument_prompt() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        app.begin_instrument_prompt();
+        app.cycle_timeframe(1);
+        assert_eq!(app.chart.timeframe, "1D");
+        assert!(!app.needs_chart_load);
+    }
+
+    #[test]
+    fn chart_load_error_for_stale_interest_is_ignored() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.set_instrument("QQQ");
+        app.chart_load_started();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "QQQ".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+        });
+        // Late failure from previous SPY interest must not clobber QQQ.
+        app.apply_chart_load_error("SPY", "1D", "timeout".into());
         match &app.chart.series {
             ChartSeriesState::Available { bars } => assert_eq!(bars[0].close, 1.0),
             other => panic!("expected Available, got {other:?}"),

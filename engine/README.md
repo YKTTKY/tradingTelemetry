@@ -39,7 +39,7 @@ Example snapshot:
 }
 ```
 
-Example chart interest (fake vendor knows **SPY** @ **1D**; unknown pairs return `status: unavailable` with empty `bars`):
+Example chart interest (fake vendor knows **SPY** @ **1D**, **SPY** @ **1h**, **QQQ** @ **1D**, **ES** @ **1D**; unknown pairs return `status: unavailable` with empty `bars`):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
@@ -59,6 +59,8 @@ curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
 ```
 
 Instrument ids are **canonical** (`SPY`, `QQQ`, …) — never a `:test` suffix. Fake vs real is `vendor_mode`, not ticker encoding.
+
+**Selection:** each `POST /v1/chart/interest` becomes the **sole active** instrument+timeframe (history reload + live subscription track the new pair). Supported product timeframes are exactly: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1D`, `1W`. Outside that set (or unknown pairs) → `status: unavailable` with empty `bars` (no invented series). Dual concurrent interests land with the dual-layout ticket.
 
 ### Live bar updates (WebSocket)
 

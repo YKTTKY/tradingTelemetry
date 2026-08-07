@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use app::App;
+use app::{InputMode, Screen};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -64,6 +65,8 @@ async fn run_loop(
                     }
                     Err(err) => {
                         let _ = tx.send(IpcEvent::ChartLoadFailed {
+                            instrument,
+                            timeframe,
                             message: err.to_string(),
                         });
                     }
@@ -80,16 +83,41 @@ async fn run_loop(
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-                        KeyCode::Enter => app.enter_workspace(),
-                        _ => {}
-                    }
+                    handle_key(app, key.code);
                 }
             }
         }
     }
     Ok(())
+}
+
+fn handle_key(app: &mut App, code: KeyCode) {
+    match &app.input_mode {
+        InputMode::InstrumentPrompt { .. } => match code {
+            KeyCode::Esc => app.cancel_instrument_prompt(),
+            KeyCode::Enter => {
+                let _ = app.apply_instrument_prompt();
+            }
+            KeyCode::Backspace => app.prompt_pop_char(),
+            KeyCode::Char(c) => app.prompt_push_char(c),
+            _ => {}
+        },
+        InputMode::Normal => match code {
+            KeyCode::Char('q') => app.quit(),
+            KeyCode::Esc => {
+                if app.screen == Screen::Welcome {
+                    app.quit();
+                }
+            }
+            KeyCode::Enter => app.enter_workspace(),
+            KeyCode::Char(']') if app.screen == Screen::Workspace => app.cycle_timeframe(1),
+            KeyCode::Char('[') if app.screen == Screen::Workspace => app.cycle_timeframe(-1),
+            KeyCode::Char('i') | KeyCode::Char('I') if app.screen == Screen::Workspace => {
+                app.begin_instrument_prompt();
+            }
+            _ => {}
+        },
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

@@ -12,7 +12,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ChartSeriesState, ConnectionStatus, Screen, UNAVAILABLE_COPY};
+use crate::app::{App, ChartSeriesState, ConnectionStatus, InputMode, Screen, UNAVAILABLE_COPY};
 use crate::ipc::OhlcvBar;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -58,11 +58,17 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
 
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let prompt_h = if matches!(app.input_mode, InputMode::InstrumentPrompt { .. }) {
+        3
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
+            Constraint::Length(prompt_h),
             Constraint::Length(1),
         ])
         .split(area);
@@ -76,15 +82,24 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
 
     draw_chart(frame, chunks[1], app);
 
+    if let InputMode::InstrumentPrompt { buffer } = &app.input_mode {
+        let prompt = Paragraph::new(format!("Instrument: {buffer}_")).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Change instrument (Enter apply · Esc cancel) "),
+        );
+        frame.render_widget(prompt, chunks[2]);
+    }
+
     let layout = match app.layout {
         crate::app::LayoutMode::Single => "single",
     };
     let help = Paragraph::new(format!(
-        "{layout} · {} · {}  ·  engine HTTP+WS  ·  q quits",
+        "{layout} · {} · {}  ·  [ ] timeframe  ·  i instrument  ·  q quit",
         app.chart.instrument, app.chart.timeframe
     ))
     .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(help, chunks[3]);
 }
 
 fn draw_chart(frame: &mut Frame, area: Rect, app: &App) {

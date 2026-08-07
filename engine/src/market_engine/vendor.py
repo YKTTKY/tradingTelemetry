@@ -89,12 +89,38 @@ _SPY_1D_CLOSES: tuple[float, ...] = (
     548.0,
 )
 
-# Anchor: 2024-07-01 00:00:00 UTC, then +1 calendar day per bar.
+# SPY @ 1h: short intraday series for timeframe-selection contract tests.
+_SPY_1H_CLOSES: tuple[float, ...] = (
+    540.0,
+    540.2,
+    540.5,
+    540.1,
+    540.8,
+    541.0,
+    541.2,
+    541.0,
+    541.5,
+    541.8,
+)
+
+# Anchor: 2024-07-01 00:00:00 UTC.
 _SPY_1D_START_TS = 1_719_792_000
 _DAY_SECONDS = 86_400
+_HOUR_SECONDS = 3_600
+
+# v1 product timeframes (domain). Unknown intervals are unavailable.
+V1_TIMEFRAMES: frozenset[str] = frozenset(
+    {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"}
+)
 
 
-def _bars_from_closes(start_ts: int, closes: tuple[float, ...]) -> tuple[Bar, ...]:
+def _bars_from_closes(
+    start_ts: int,
+    closes: tuple[float, ...],
+    *,
+    period_seconds: int,
+    base_volume: float = 50_000_000.0,
+) -> tuple[Bar, ...]:
     bars: list[Bar] = []
     prev_close = closes[0]
     for i, close in enumerate(closes):
@@ -102,10 +128,10 @@ def _bars_from_closes(start_ts: int, closes: tuple[float, ...]) -> tuple[Bar, ..
         # Deterministic wick geometry from open/close (no randomness).
         high = max(open_, close) + 0.5
         low = min(open_, close) - 0.5
-        volume = 50_000_000.0 + i * 100_000.0
+        volume = base_volume + i * 100_000.0
         bars.append(
             Bar(
-                ts=start_ts + i * _DAY_SECONDS,
+                ts=start_ts + i * period_seconds,
                 open=open_,
                 high=high,
                 low=low,
@@ -118,11 +144,27 @@ def _bars_from_closes(start_ts: int, closes: tuple[float, ...]) -> tuple[Bar, ..
 
 
 _FAKE_HISTORY: dict[tuple[str, str], tuple[Bar, ...]] = {
-    ("SPY", "1D"): _bars_from_closes(_SPY_1D_START_TS, _SPY_1D_CLOSES),
+    ("SPY", "1D"): _bars_from_closes(
+        _SPY_1D_START_TS, _SPY_1D_CLOSES, period_seconds=_DAY_SECONDS
+    ),
+    ("SPY", "1h"): _bars_from_closes(
+        _SPY_1D_START_TS,
+        _SPY_1H_CLOSES,
+        period_seconds=_HOUR_SECONDS,
+        base_volume=1_000_000.0,
+    ),
     # QQQ ready for dual-layout defaults later; still valid fake coverage.
     ("QQQ", "1D"): _bars_from_closes(
         _SPY_1D_START_TS,
         tuple(c - 50.0 for c in _SPY_1D_CLOSES),
+        period_seconds=_DAY_SECONDS,
+    ),
+    # ES for instrument-selection demos (distinct level from SPY/QQQ).
+    ("ES", "1D"): _bars_from_closes(
+        _SPY_1D_START_TS,
+        tuple(c + 5000.0 for c in _SPY_1D_CLOSES),
+        period_seconds=_DAY_SECONDS,
+        base_volume=200_000.0,
     ),
 }
 
@@ -147,6 +189,14 @@ class FakeVendor:
         self._auto_instruments: set[str] = set()
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult:
+        # Outside the v1 set → explicit unavailable (no invented series).
+        if timeframe not in V1_TIMEFRAMES:
+            return HistoryResult(
+                instrument=instrument,
+                timeframe=timeframe,
+                available=False,
+                bars=(),
+            )
         key = (instrument, timeframe)
         bars = _FAKE_HISTORY.get(key)
         if bars is None:

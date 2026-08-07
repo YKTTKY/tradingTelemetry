@@ -105,6 +105,8 @@ pub enum IpcEvent {
     ChartSeries(ChartInterestResponse),
     BarUpdate(BarUpdateEvent),
     ChartLoadFailed {
+        instrument: String,
+        timeframe: String,
         message: String,
     },
     Disconnected {

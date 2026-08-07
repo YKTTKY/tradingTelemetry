@@ -34,8 +34,9 @@ cargo run
 
 - **Welcome** shows feed status (connected / disconnected; vendor mode **fake** by default).
 - **Enter** opens the default **workspace** (`single` layout, **SPY** @ **1D**) and loads historical candles from the engine.
+- **Workspace keys:** `]` / `[` cycle timeframe (`1m`…`1W`); `i` change instrument (type symbol, Enter apply, Esc cancel); **q** quits.
 - Unavailable instrument/timeframe shows **Data Currently not Available** (no invented series).
-- **q** / **Esc** quits.
+- Fake vendor history covers **SPY**@**1D**, **SPY**@**1h**, **QQQ**@**1D**, **ES**@**1D** (other pairs may be unavailable).
 
 The TUI does **not** call any market vendor; only the engine does.
 
