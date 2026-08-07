@@ -75,32 +75,39 @@ def apply_tick(bars: list[Bar], timeframe: str, tick: Tick) -> tuple[list[Bar], 
 
 
 @dataclass
-class ChartService:
-    """Loads history for chart interest and keeps live series from vendor ticks.
+class _ChartSlot:
+    instrument: str
+    timeframe: str
+    bars: list[Bar]
 
-    Phase A single-chart path: each ``set_interest`` becomes the sole active
-    pair so live subscription tracks the focused selection. Dual layout
-    (multiple concurrent pairs) lands with the workspace/layout ticket.
+
+@dataclass
+class ChartService:
+    """Loads history per chart slot and keeps live series from vendor ticks.
+
+    Multiple chart slots may be active (dual layout). Each ``set_interest``
+    updates one ``chart_id`` without clearing the others. Layout changes call
+    ``sync_active_charts`` to drop slots that are no longer visible.
     """
 
     vendor: MarketDataVendor
     on_bar_update: BarUpdateCallback | None = None
-    _series: dict[tuple[str, str], list[Bar]] = field(default_factory=dict)
+    _slots: dict[str, _ChartSlot] = field(default_factory=dict)
     _subscribed: set[str] = field(default_factory=set)
 
-    def set_interest(self, instrument: str, timeframe: str) -> HistoryResult:
-        """Replace active interest; return history or explicit unavailability.
-
-        Live ticks only advance the current pair after a successful load.
-        Unavailable pairs clear interest so the chart does not keep a stale
-        live series.
-        """
+    def set_interest(
+        self,
+        instrument: str,
+        timeframe: str,
+        chart_id: str = "primary",
+    ) -> HistoryResult:
+        """Set interest for one chart slot; return history or unavailability."""
         instrument = instrument.strip().upper()
         timeframe = timeframe.strip()
-        # Reject non-v1 timeframes before vendor so the domain set is enforced
-        # at the engine boundary (vendor may also guard).
+        chart_id = chart_id.strip()
+
         if timeframe not in TIMEFRAME_SECONDS:
-            self._clear_interest()
+            self._drop_slot(chart_id)
             return HistoryResult(
                 instrument=instrument,
                 timeframe=timeframe,
@@ -109,26 +116,52 @@ class ChartService:
             )
 
         result = self.vendor.fetch_history(instrument, timeframe)
-        # Echo canonical instrument id even when the vendor returns a raw form.
         result = HistoryResult(
             instrument=instrument,
             timeframe=timeframe,
             available=result.available,
             bars=result.bars,
         )
-        # Single active interest: drop previous pair so live follows the new one.
-        self._clear_interest()
+
         if result.available:
-            key = (instrument, timeframe)
-            self._series[key] = list(result.bars)
+            self._slots[chart_id] = _ChartSlot(
+                instrument=instrument,
+                timeframe=timeframe,
+                bars=list(result.bars),
+            )
             self._ensure_subscribed(instrument)
+            self._prune_subscriptions()
+        else:
+            # Keep the slot's selection for workspace but no live series.
+            self._drop_slot(chart_id)
+            self._prune_subscriptions()
+
         return result
 
-    def _clear_interest(self) -> None:
+    def sync_active_charts(self, chart_ids: list[str]) -> None:
+        """Drop series for chart slots not in the active layout set."""
+        active = set(chart_ids)
+        for chart_id in list(self._slots):
+            if chart_id not in active:
+                del self._slots[chart_id]
+        self._prune_subscriptions()
+
+    def active_series_keys(self) -> list[tuple[str, str, str]]:
+        """Return (chart_id, instrument, timeframe) for slots with live series."""
+        return [
+            (cid, slot.instrument, slot.timeframe)
+            for cid, slot in self._slots.items()
+        ]
+
+    def _drop_slot(self, chart_id: str) -> None:
+        self._slots.pop(chart_id, None)
+
+    def _prune_subscriptions(self) -> None:
+        needed = {slot.instrument for slot in self._slots.values()}
         for instrument in list(self._subscribed):
-            self.vendor.unsubscribe(instrument, self._on_tick)
-        self._subscribed.clear()
-        self._series.clear()
+            if instrument not in needed:
+                self.vendor.unsubscribe(instrument, self._on_tick)
+                self._subscribed.discard(instrument)
 
     def _ensure_subscribed(self, instrument: str) -> None:
         if instrument in self._subscribed:
@@ -137,12 +170,19 @@ class ChartService:
         self._subscribed.add(instrument)
 
     def _on_tick(self, tick: Tick) -> None:
-        for (instrument, timeframe), bars in list(self._series.items()):
-            if instrument != tick.instrument:
+        # Group by (instrument, timeframe) so two charts on the same pair
+        # share one update event (hub keys on instrument+timeframe).
+        emitted: set[tuple[str, str]] = set()
+        for slot in list(self._slots.values()):
+            if slot.instrument != tick.instrument:
                 continue
-            change = apply_tick(bars, timeframe, tick)
+            change = apply_tick(slot.bars, slot.timeframe, tick)
             if change is None:
                 continue
             completed, last = change
+            key = (slot.instrument, slot.timeframe)
+            if key in emitted:
+                continue
+            emitted.add(key)
             if self.on_bar_update is not None:
-                self.on_bar_update(instrument, timeframe, completed, last)
+                self.on_bar_update(slot.instrument, slot.timeframe, completed, last)

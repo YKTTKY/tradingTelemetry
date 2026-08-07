@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -13,6 +14,13 @@ def _env_vendor_default() -> str:
     if raw in ("fake", "lse"):
         return raw
     return "fake"
+
+
+def _default_workspace_path() -> str:
+    raw = os.environ.get("MARKET_ENGINE_WORKSPACE", "").strip()
+    if raw:
+        return raw
+    return str(Path.home() / ".local" / "share" / "trading-telemetry" / "workspace.json")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Also settable via MARKET_ENGINE_VENDOR."
         ),
     )
+    parser.add_argument(
+        "--workspace",
+        default=_default_workspace_path(),
+        help=(
+            "Path to file-backed workspace JSON "
+            "(default: ~/.local/share/trading-telemetry/workspace.json "
+            "or MARKET_ENGINE_WORKSPACE)."
+        ),
+    )
     return parser
 
 
@@ -57,6 +74,7 @@ def main() -> None:
     app = create_app(
         feed=feed,
         vendor=default_vendor(args.vendor, auto_ticks=auto_ticks),
+        workspace_path=Path(args.workspace),
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

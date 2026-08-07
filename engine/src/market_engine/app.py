@@ -6,9 +6,10 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
@@ -16,22 +17,31 @@ from market_engine.chart import ChartService
 from market_engine.feed import FeedState, default_feed_state
 from market_engine.publish import ConflatingHub
 from market_engine.vendor import Bar, MarketDataVendor, default_vendor
+from market_engine.workspace import VALID_LAYOUTS, WorkspaceStore
 
 
 class ChartInterestBody(BaseModel):
     instrument: str = Field(min_length=1)
     timeframe: str = Field(min_length=1)
+    chart_id: str | None = None
+
+
+class WorkspaceBody(BaseModel):
+    layout_mode: str = Field(min_length=1)
 
 
 def create_app(
     feed: FeedState | None = None,
     vendor: MarketDataVendor | None = None,
     conflate_interval_s: float = 0.05,
+    workspace_path: Path | str | None = None,
 ) -> FastAPI:
     """Build the ASGI app. Defaults to fake vendor mode when no vendor selected."""
     state = feed if feed is not None else default_feed_state()
     market_vendor = vendor if vendor is not None else default_vendor(state.vendor_mode)
     hub = ConflatingHub(interval_s=conflate_interval_s)
+    path = Path(workspace_path) if workspace_path is not None else None
+    workspace = WorkspaceStore(path=path)
 
     def on_bar_update(
         instrument: str,
@@ -57,17 +67,51 @@ def create_app(
     app.state.charts = charts
     app.state.hub = hub
     app.state.vendor = market_vendor
+    app.state.workspace = workspace
+
+    def public_workspace() -> dict[str, Any]:
+        return workspace.state.to_public()
 
     @app.get("/v1/snapshot")
     def snapshot() -> dict[str, Any]:
         feed_state: FeedState = app.state.feed
-        return {"feed": feed_state.to_snapshot()}
+        return {
+            "feed": feed_state.to_snapshot(),
+            "workspace": public_workspace(),
+        }
+
+    @app.post("/v1/workspace")
+    def set_workspace(body: WorkspaceBody) -> dict[str, Any]:
+        if body.layout_mode not in VALID_LAYOUTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"layout_mode must be one of {sorted(VALID_LAYOUTS)}",
+            )
+        public = workspace.set_layout(body.layout_mode)
+        # Drop live series for charts that left the layout; TUI reloads interest.
+        charts.sync_active_charts(workspace.state.active_chart_ids())
+        return public
 
     @app.post("/v1/chart/interest")
     def chart_interest(body: ChartInterestBody) -> dict[str, Any]:
         chart_svc: ChartService = app.state.charts
-        result = chart_svc.set_interest(body.instrument, body.timeframe)
-        return result.to_interest_response()
+        try:
+            chart_id = workspace.state.resolve_chart_id(body.chart_id)
+            workspace.state.validate_chart_id_for_layout(chart_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        result = chart_svc.set_interest(
+            body.instrument,
+            body.timeframe,
+            chart_id=chart_id,
+        )
+        # Persist selection even when vendor reports unavailable so restore
+        # matches the trader's last choice (empty state on that pair).
+        workspace.set_chart(chart_id, result.instrument, result.timeframe)
+        response = result.to_interest_response()
+        response["chart_id"] = chart_id
+        return response
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

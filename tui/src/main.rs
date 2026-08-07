@@ -1,4 +1,4 @@
-//! Trading Telemetry TUI — Welcome → default SPY@1D chart over engine HTTP+WS.
+//! Trading Telemetry TUI — Welcome → workspace charts over engine HTTP+WS.
 
 mod app;
 mod ipc;
@@ -8,14 +8,15 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::App;
-use app::{InputMode, Screen};
+use app::{App, InputMode, Screen};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ipc::{post_chart_interest, run_ipc_loop, EngineEndpoint, IpcEvent};
+use ipc::{
+    post_chart_interest, post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -52,26 +53,49 @@ async fn run_loop(
             app.apply_ipc(ev);
         }
 
-        if app.needs_chart_load {
-            app.chart_load_started();
-            let instrument = app.chart.instrument.clone();
-            let timeframe = app.chart.timeframe.clone();
+        if let Some(layout) = app.pending_layout {
+            app.layout_request_started();
             let ep = endpoint.clone();
             let tx = tx.clone();
+            let mode = layout.as_str().to_string();
             tokio::spawn(async move {
-                match post_chart_interest(&ep, &instrument, &timeframe).await {
-                    Ok(series) => {
-                        let _ = tx.send(IpcEvent::ChartSeries(series));
+                match post_workspace_layout(&ep, &mode).await {
+                    Ok(ws) => {
+                        let _ = tx.send(IpcEvent::Workspace(ws));
                     }
                     Err(err) => {
-                        let _ = tx.send(IpcEvent::ChartLoadFailed {
-                            instrument,
-                            timeframe,
+                        let _ = tx.send(IpcEvent::WorkspaceFailed {
                             message: err.to_string(),
                         });
                     }
                 }
             });
+        }
+
+        if app.needs_chart_load {
+            app.chart_load_started();
+            for chart in app.charts.iter() {
+                let instrument = chart.instrument.clone();
+                let timeframe = chart.timeframe.clone();
+                let chart_id = chart.id.clone();
+                let ep = endpoint.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match post_chart_interest(&ep, &instrument, &timeframe, &chart_id).await {
+                        Ok(series) => {
+                            let _ = tx.send(IpcEvent::ChartSeries(series));
+                        }
+                        Err(err) => {
+                            let _ = tx.send(IpcEvent::ChartLoadFailed {
+                                chart_id,
+                                instrument,
+                                timeframe,
+                                message: err.to_string(),
+                            });
+                        }
+                    }
+                });
+            }
         }
 
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -114,6 +138,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('[') if app.screen == Screen::Workspace => app.cycle_timeframe(-1),
             KeyCode::Char('i') | KeyCode::Char('I') if app.screen == Screen::Workspace => {
                 app.begin_instrument_prompt();
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') if app.screen == Screen::Workspace => {
+                app.toggle_layout();
+            }
+            KeyCode::Tab if app.screen == Screen::Workspace => {
+                app.focus_next();
             }
             _ => {}
         },

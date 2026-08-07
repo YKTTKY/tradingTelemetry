@@ -36,9 +36,12 @@ Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /v1/snapshot` | Bootstrap snapshot including `feed` status |
-| `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe`; arms live updates |
+| `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts) |
+| `POST /v1/workspace` | Set `layout_mode` (`single` \| `dual-vertical`); persists to disk |
+| `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` (+ optional `chart_id`); arms live updates; persists selection |
 | `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` |
+
+**Workspace file:** default `~/.local/share/trading-telemetry/workspace.json` (override with `--workspace` or `MARKET_ENGINE_WORKSPACE`). No Redis/Postgres.
 
 Example snapshot:
 
@@ -48,6 +51,12 @@ Example snapshot:
     "status": "connected",
     "vendor_mode": "fake",
     "engine": "up"
+  },
+  "workspace": {
+    "layout_mode": "single",
+    "charts": [
+      {"id": "primary", "instrument": "SPY", "timeframe": "1D"}
+    ]
   }
 }
 ```
@@ -57,7 +66,7 @@ Example chart interest (fake vendor knows **SPY** @ **1D**, **SPY** @ **1h**, **
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
   -H 'Content-Type: application/json' \
-  -d '{"instrument":"SPY","timeframe":"1D"}'
+  -d '{"instrument":"SPY","timeframe":"1D","chart_id":"primary"}'
 ```
 
 ```json
@@ -65,6 +74,7 @@ curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
   "instrument": "SPY",
   "timeframe": "1D",
   "status": "ok",
+  "chart_id": "primary",
   "bars": [
     {"ts": 1719792000, "open": 540.0, "high": 540.5, "low": 539.5, "close": 540.0, "volume": 50000000.0}
   ]
@@ -73,7 +83,18 @@ curl -s -X POST http://127.0.0.1:8765/v1/chart/interest \
 
 Instrument ids are **canonical** (`SPY`, `QQQ`, …) — never a `:test` suffix. Fake vs real is `vendor_mode`, not ticker encoding.
 
-**Selection:** each `POST /v1/chart/interest` becomes the **sole active** instrument+timeframe (history reload + live subscription track the new pair). Supported product timeframes are exactly: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1D`, `1W`. Outside that set (or unknown pairs) → `status: unavailable` with empty `bars` (no invented series). Dual concurrent interests land with the dual-layout ticket.
+**Layout / selection:**
+- `layout_mode`: `single` (chart id `primary`) or `dual-vertical` (ids `top`, `bottom`, equal-height stack).
+- First dual open with no saved dual memory: top **QQQ** @ **1D**, bottom **SPY** @ **1D**. Single default remains **SPY** @ **1D**.
+- Single and dual chart memories are independent; toggling layout restores each mode’s last instruments/timeframes.
+- Multiple chart slots may hold concurrent interest (dual layout). `chart_id` defaults to `primary` (single) or `top` (dual) when omitted.
+- Supported product timeframes: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1D`, `1W`. Outside that set (or unknown pairs) → `status: unavailable` with empty `bars` (no invented series).
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/v1/workspace \
+  -H 'Content-Type: application/json' \
+  -d '{"layout_mode":"dual-vertical"}'
+```
 
 ### Live bar updates (WebSocket)
 

@@ -1,4 +1,4 @@
-//! Ratatui views: Welcome, workspace feed status, and single-chart candles.
+//! Ratatui views: Welcome, workspace feed status, single/dual charts.
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -12,7 +12,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ChartSeriesState, ConnectionStatus, InputMode, Screen, UNAVAILABLE_COPY};
+use crate::app::{
+    App, Chart, ChartSeriesState, ConnectionStatus, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
+};
 use crate::ipc::OhlcvBar;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -80,7 +82,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(status, chunks[0]);
 
-    draw_chart(frame, chunks[1], app);
+    draw_charts(frame, chunks[1], app);
 
     if let InputMode::InstrumentPrompt { buffer } = &app.input_mode {
         let prompt = Paragraph::new(format!("Instrument: {buffer}_")).block(
@@ -91,20 +93,50 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         frame.render_widget(prompt, chunks[2]);
     }
 
-    let layout = match app.layout {
-        crate::app::LayoutMode::Single => "single",
+    let focused = app.focused_chart();
+    let focus_hint = if app.layout == LayoutMode::DualVertical {
+        "  ·  Tab focus"
+    } else {
+        ""
     };
     let help = Paragraph::new(format!(
-        "{layout} · {} · {}  ·  [ ] timeframe  ·  i instrument  ·  q quit",
-        app.chart.instrument, app.chart.timeframe
+        "{} · {} · {}  ·  l layout  ·  [ ] timeframe  ·  i instrument{}  ·  q quit",
+        app.layout.as_str(),
+        focused.instrument,
+        focused.timeframe,
+        focus_hint,
     ))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, chunks[3]);
 }
 
-fn draw_chart(frame: &mut Frame, area: Rect, app: &App) {
-    let title = format!(" {} ", app.chart.title());
-    match &app.chart.series {
+fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
+    match app.layout {
+        LayoutMode::Single => {
+            if let Some(chart) = app.charts.first() {
+                draw_chart(frame, area, app, chart, true);
+            }
+        }
+        LayoutMode::DualVertical => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            for (i, chart) in app.charts.iter().enumerate() {
+                if i >= rows.len() {
+                    break;
+                }
+                let focused = i == app.focused;
+                draw_chart(frame, rows[i], app, chart, focused);
+            }
+        }
+    }
+}
+
+fn draw_chart(frame: &mut Frame, area: Rect, app: &App, chart: &Chart, focused: bool) {
+    let focus_mark = if focused { "● " } else { "  " };
+    let title = format!(" {focus_mark}{} ", chart.title());
+    match &chart.series {
         ChartSeriesState::Idle | ChartSeriesState::Loading => {
             let body = Paragraph::new("Loading history…")
                 .alignment(Alignment::Center)
@@ -112,7 +144,9 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App) {
             frame.render_widget(body, area);
         }
         ChartSeriesState::Unavailable => {
-            let copy = app.empty_state_copy().unwrap_or(UNAVAILABLE_COPY);
+            let copy = app
+                .empty_state_copy_for(chart)
+                .unwrap_or(UNAVAILABLE_COPY);
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(

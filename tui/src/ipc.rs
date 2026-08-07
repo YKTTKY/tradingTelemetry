@@ -34,6 +34,12 @@ impl EngineEndpoint {
             .expect("chart interest path joins base")
     }
 
+    pub fn workspace_url(&self) -> Url {
+        self.base
+            .join("/v1/workspace")
+            .expect("workspace path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -53,15 +59,37 @@ pub struct FeedSnapshot {
     pub engine: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkspaceChartSnapshot {
+    pub id: String,
+    pub instrument: String,
+    pub timeframe: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkspaceSnapshot {
+    pub layout_mode: String,
+    pub charts: Vec<WorkspaceChartSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct SnapshotBody {
     feed: FeedSnapshot,
+    #[serde(default)]
+    workspace: Option<WorkspaceSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChartInterestRequest {
     pub instrument: String,
     pub timeframe: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chart_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceRequest {
+    pub layout_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -80,6 +108,8 @@ pub struct ChartInterestResponse {
     pub timeframe: String,
     pub status: String,
     pub bars: Vec<OhlcvBar>,
+    #[serde(default)]
+    pub chart_id: Option<String>,
 }
 
 /// Live bar tip update from the engine (conflated WebSocket event).
@@ -94,7 +124,10 @@ pub struct BarUpdateEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcEvent {
-    Snapshot(FeedSnapshot),
+    Snapshot {
+        feed: FeedSnapshot,
+        workspace: Option<WorkspaceSnapshot>,
+    },
     FeedStatus {
         status: String,
         vendor_mode: String,
@@ -104,9 +137,14 @@ pub enum IpcEvent {
     },
     ChartSeries(ChartInterestResponse),
     BarUpdate(BarUpdateEvent),
+    Workspace(WorkspaceSnapshot),
     ChartLoadFailed {
+        chart_id: String,
         instrument: String,
         timeframe: String,
+        message: String,
+    },
+    WorkspaceFailed {
         message: String,
     },
     Disconnected {
@@ -126,7 +164,9 @@ pub enum IpcError {
     Url(#[from] url::ParseError),
 }
 
-pub async fn fetch_snapshot(endpoint: &EngineEndpoint) -> Result<FeedSnapshot, IpcError> {
+pub async fn fetch_snapshot(
+    endpoint: &EngineEndpoint,
+) -> Result<(FeedSnapshot, Option<WorkspaceSnapshot>), IpcError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -137,13 +177,14 @@ pub async fn fetch_snapshot(endpoint: &EngineEndpoint) -> Result<FeedSnapshot, I
         .error_for_status()?
         .json()
         .await?;
-    Ok(body.feed)
+    Ok((body.feed, body.workspace))
 }
 
 pub async fn post_chart_interest(
     endpoint: &EngineEndpoint,
     instrument: &str,
     timeframe: &str,
+    chart_id: &str,
 ) -> Result<ChartInterestResponse, IpcError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -151,9 +192,31 @@ pub async fn post_chart_interest(
     let body = ChartInterestRequest {
         instrument: instrument.to_string(),
         timeframe: timeframe.to_string(),
+        chart_id: Some(chart_id.to_string()),
     };
     let response: ChartInterestResponse = client
         .post(endpoint.chart_interest_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
+pub async fn post_workspace_layout(
+    endpoint: &EngineEndpoint,
+    layout_mode: &str,
+) -> Result<WorkspaceSnapshot, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = WorkspaceRequest {
+        layout_mode: layout_mode.to_string(),
+    };
+    let response: WorkspaceSnapshot = client
+        .post(endpoint.workspace_url())
         .json(&body)
         .send()
         .await?
@@ -186,10 +249,13 @@ async fn connect_session(
     endpoint: &EngineEndpoint,
     tx: &mpsc::UnboundedSender<IpcEvent>,
 ) -> Result<(), String> {
-    let feed = fetch_snapshot(endpoint)
+    let (feed, workspace) = fetch_snapshot(endpoint)
         .await
         .map_err(|e| e.to_string())?;
-    if tx.send(IpcEvent::Snapshot(feed)).is_err() {
+    if tx
+        .send(IpcEvent::Snapshot { feed, workspace })
+        .is_err()
+    {
         return Ok(());
     }
 
@@ -269,6 +335,10 @@ mod tests {
         assert_eq!(
             ep.chart_interest_url().as_str(),
             "http://127.0.0.1:8765/v1/chart/interest"
+        );
+        assert_eq!(
+            ep.workspace_url().as_str(),
+            "http://127.0.0.1:8765/v1/workspace"
         );
     }
 }
