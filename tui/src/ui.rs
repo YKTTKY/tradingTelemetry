@@ -1,4 +1,4 @@
-//! Ratatui views: Welcome, workspace feed status, single/dual charts.
+//! Ratatui views: Welcome, workspace feed status, single/dual charts, watchlist.
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -15,7 +15,7 @@ use ratatui::{
 use crate::app::{
     App, Chart, ChartSeriesState, ConnectionStatus, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
 };
-use crate::ipc::OhlcvBar;
+use crate::ipc::{OhlcvBar, QuoteRow};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
@@ -60,10 +60,9 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
 
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let prompt_h = if matches!(app.input_mode, InputMode::InstrumentPrompt { .. }) {
-        3
-    } else {
-        0
+    let prompt_h = match &app.input_mode {
+        InputMode::InstrumentPrompt { .. } | InputMode::WatchlistAddPrompt { .. } => 3,
+        InputMode::Normal => 0,
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -82,15 +81,36 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(status, chunks[0]);
 
-    draw_charts(frame, chunks[1], app);
+    // Charts left, optional watchlist sidebar docked right.
+    if app.watchlist_visible {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(36)])
+            .split(chunks[1]);
+        draw_charts(frame, body[0], app);
+        draw_watchlist(frame, body[1], app);
+    } else {
+        draw_charts(frame, chunks[1], app);
+    }
 
-    if let InputMode::InstrumentPrompt { buffer } = &app.input_mode {
-        let prompt = Paragraph::new(format!("Instrument: {buffer}_")).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Change instrument (Enter apply · Esc cancel) "),
-        );
-        frame.render_widget(prompt, chunks[2]);
+    match &app.input_mode {
+        InputMode::InstrumentPrompt { buffer } => {
+            let prompt = Paragraph::new(format!("Instrument: {buffer}_")).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Change instrument (Enter apply · Esc cancel) "),
+            );
+            frame.render_widget(prompt, chunks[2]);
+        }
+        InputMode::WatchlistAddPrompt { buffer } => {
+            let prompt = Paragraph::new(format!("Add symbol: {buffer}_")).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Watchlist add (Enter apply · Esc cancel) "),
+            );
+            frame.render_widget(prompt, chunks[2]);
+        }
+        InputMode::Normal => {}
     }
 
     let focused = app.focused_chart();
@@ -99,15 +119,118 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
     } else {
         ""
     };
+    let wl_name = app
+        .active_watchlist()
+        .map(|w| w.name.as_str())
+        .unwrap_or("—");
     let help = Paragraph::new(format!(
-        "{} · {} · {}  ·  l layout  ·  [ ] timeframe  ·  i instrument{}  ·  q quit",
+        "{} · {} · {}  ·  l layout  ·  [ ] tf  ·  i instr{}  ·  w watchlist  ·  n/p list  ·  a add  ·  x rem  ·  ↑↓  ·  q  [{}]",
         app.layout.as_str(),
         focused.instrument,
         focused.timeframe,
         focus_hint,
+        wl_name,
     ))
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, chunks[3]);
+}
+
+fn draw_watchlist(frame: &mut Frame, area: Rect, app: &App) {
+    let list = app.active_watchlist();
+    let title = match list {
+        Some(wl) => format!(" {} ", wl.name),
+        None => " Watchlist ".to_string(),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Header row — no logos.
+    lines.push(Line::from(Span::styled(
+        format!("{:<6} {:>8} {:>8} {:>7}", "Sym", "Last", "Chg", "Chg%"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let symbols = app.active_symbols();
+    if symbols.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty — press a to add)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, sym) in symbols.iter().enumerate() {
+            let selected = i == app.watchlist_selected.min(symbols.len() - 1);
+            let quote = app.quote_for(sym);
+            lines.push(watchlist_row(sym, quote, selected));
+        }
+    }
+
+    let switcher = app
+        .watchlists
+        .iter()
+        .map(|wl| {
+            if wl.id == app.active_watchlist_id {
+                format!("[{}]", wl.name)
+            } else {
+                wl.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(Line::from(Span::styled(
+            format!(" {switcher} "),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+    let body = Paragraph::new(lines).block(block);
+    frame.render_widget(body, area);
+}
+
+fn watchlist_row(symbol: &str, quote: Option<&QuoteRow>, selected: bool) -> Line<'static> {
+    let base = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let sym = format!("{symbol:<6}");
+    match quote {
+        Some(q) if q.status == "ok" => {
+            let last = q.last.map(|v| format!("{v:>8.2}")).unwrap_or_else(|| format!("{:>8}", "—"));
+            let chg = q.change.map(|v| format!("{v:>+8.2}")).unwrap_or_else(|| format!("{:>8}", "—"));
+            let pct = q
+                .change_pct
+                .map(|v| format!("{:>+6.2}%", v * 100.0))
+                .unwrap_or_else(|| format!("{:>7}", "—"));
+            let dir_color = match q.change {
+                Some(c) if c > 0.0 => Color::Green,
+                Some(c) if c < 0.0 => Color::Red,
+                _ => Color::Gray,
+            };
+            Line::from(vec![
+                Span::styled(sym, base),
+                Span::styled(format!(" {last}"), base),
+                Span::styled(format!(" {chg}"), base.fg(dir_color)),
+                Span::styled(format!(" {pct}"), base.fg(dir_color)),
+            ])
+        }
+        Some(q) if q.status == "unavailable" => Line::from(vec![
+            Span::styled(sym, base),
+            Span::styled(
+                format!(" {:>8} {:>8} {:>7}", "n/a", "—", "—"),
+                base.fg(Color::DarkGray),
+            ),
+        ]),
+        _ => Line::from(vec![
+            Span::styled(sym, base),
+            Span::styled(
+                format!(" {:>8} {:>8} {:>7}", "…", "—", "—"),
+                base.fg(Color::DarkGray),
+            ),
+        ]),
+    }
 }
 
 fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {

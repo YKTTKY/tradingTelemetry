@@ -40,6 +40,24 @@ impl EngineEndpoint {
             .expect("workspace path joins base")
     }
 
+    pub fn watchlist_active_url(&self) -> Url {
+        self.base
+            .join("/v1/watchlist/active")
+            .expect("watchlist active path joins base")
+    }
+
+    pub fn watchlist_add_url(&self) -> Url {
+        self.base
+            .join("/v1/watchlist/add")
+            .expect("watchlist add path joins base")
+    }
+
+    pub fn watchlist_remove_url(&self) -> Url {
+        self.base
+            .join("/v1/watchlist/remove")
+            .expect("watchlist remove path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -67,16 +85,43 @@ pub struct WorkspaceChartSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WatchlistSnapshot {
+    pub id: String,
+    pub name: String,
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkspaceSnapshot {
     pub layout_mode: String,
     pub charts: Vec<WorkspaceChartSnapshot>,
+    #[serde(default)]
+    pub watchlists: Vec<WatchlistSnapshot>,
+    #[serde(default)]
+    pub active_watchlist_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct QuoteRow {
+    pub symbol: String,
+    pub status: String,
+    #[serde(default)]
+    pub last: Option<f64>,
+    #[serde(default)]
+    pub previous_close: Option<f64>,
+    #[serde(default)]
+    pub change: Option<f64>,
+    #[serde(default)]
+    pub change_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct SnapshotBody {
     feed: FeedSnapshot,
     #[serde(default)]
     workspace: Option<WorkspaceSnapshot>,
+    #[serde(default)]
+    quotes: Vec<QuoteRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -90,6 +135,23 @@ pub struct ChartInterestRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkspaceRequest {
     pub layout_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WatchlistActiveRequest {
+    pub watchlist_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WatchlistSymbolRequest {
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WatchlistMutationResponse {
+    pub workspace: WorkspaceSnapshot,
+    #[serde(default)]
+    pub quotes: Vec<QuoteRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -122,11 +184,40 @@ pub struct BarUpdateEvent {
     pub bar: OhlcvBar,
 }
 
+/// Live quote update from the engine (conflated WebSocket event).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct QuoteUpdateEvent {
+    pub symbol: String,
+    pub status: String,
+    #[serde(default)]
+    pub last: Option<f64>,
+    #[serde(default)]
+    pub previous_close: Option<f64>,
+    #[serde(default)]
+    pub change: Option<f64>,
+    #[serde(default)]
+    pub change_pct: Option<f64>,
+}
+
+impl QuoteUpdateEvent {
+    pub fn to_row(&self) -> QuoteRow {
+        QuoteRow {
+            symbol: self.symbol.clone(),
+            status: self.status.clone(),
+            last: self.last,
+            previous_close: self.previous_close,
+            change: self.change,
+            change_pct: self.change_pct,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IpcEvent {
     Snapshot {
         feed: FeedSnapshot,
         workspace: Option<WorkspaceSnapshot>,
+        quotes: Vec<QuoteRow>,
     },
     FeedStatus {
         status: String,
@@ -137,7 +228,12 @@ pub enum IpcEvent {
     },
     ChartSeries(ChartInterestResponse),
     BarUpdate(BarUpdateEvent),
+    QuoteUpdate(QuoteUpdateEvent),
     Workspace(WorkspaceSnapshot),
+    WatchlistState {
+        workspace: WorkspaceSnapshot,
+        quotes: Vec<QuoteRow>,
+    },
     ChartLoadFailed {
         chart_id: String,
         instrument: String,
@@ -145,6 +241,9 @@ pub enum IpcEvent {
         message: String,
     },
     WorkspaceFailed {
+        message: String,
+    },
+    WatchlistFailed {
         message: String,
     },
     Disconnected {
@@ -166,7 +265,7 @@ pub enum IpcError {
 
 pub async fn fetch_snapshot(
     endpoint: &EngineEndpoint,
-) -> Result<(FeedSnapshot, Option<WorkspaceSnapshot>), IpcError> {
+) -> Result<(FeedSnapshot, Option<WorkspaceSnapshot>, Vec<QuoteRow>), IpcError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -177,7 +276,7 @@ pub async fn fetch_snapshot(
         .error_for_status()?
         .json()
         .await?;
-    Ok((body.feed, body.workspace))
+    Ok((body.feed, body.workspace, body.quotes))
 }
 
 pub async fn post_chart_interest(
@@ -226,6 +325,69 @@ pub async fn post_workspace_layout(
     Ok(response)
 }
 
+pub async fn post_watchlist_active(
+    endpoint: &EngineEndpoint,
+    watchlist_id: &str,
+) -> Result<WatchlistMutationResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = WatchlistActiveRequest {
+        watchlist_id: watchlist_id.to_string(),
+    };
+    let response: WatchlistMutationResponse = client
+        .post(endpoint.watchlist_active_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
+pub async fn post_watchlist_add(
+    endpoint: &EngineEndpoint,
+    symbol: &str,
+) -> Result<WatchlistMutationResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = WatchlistSymbolRequest {
+        symbol: symbol.to_string(),
+    };
+    let response: WatchlistMutationResponse = client
+        .post(endpoint.watchlist_add_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
+pub async fn post_watchlist_remove(
+    endpoint: &EngineEndpoint,
+    symbol: &str,
+) -> Result<WatchlistMutationResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = WatchlistSymbolRequest {
+        symbol: symbol.to_string(),
+    };
+    let response: WatchlistMutationResponse = client
+        .post(endpoint.watchlist_remove_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
 pub async fn run_ipc_loop(endpoint: EngineEndpoint, tx: mpsc::UnboundedSender<IpcEvent>) {
     loop {
@@ -249,11 +411,15 @@ async fn connect_session(
     endpoint: &EngineEndpoint,
     tx: &mpsc::UnboundedSender<IpcEvent>,
 ) -> Result<(), String> {
-    let (feed, workspace) = fetch_snapshot(endpoint)
+    let (feed, workspace, quotes) = fetch_snapshot(endpoint)
         .await
         .map_err(|e| e.to_string())?;
     if tx
-        .send(IpcEvent::Snapshot { feed, workspace })
+        .send(IpcEvent::Snapshot {
+            feed,
+            workspace,
+            quotes,
+        })
         .is_err()
     {
         return Ok(());
@@ -308,6 +474,18 @@ async fn connect_session(
                                 }
                             }
                         }
+                        Some("quote_update") => {
+                            match serde_json::from_value::<QuoteUpdateEvent>(value) {
+                                Ok(update) => {
+                                    if tx.send(IpcEvent::QuoteUpdate(update)).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(_) => {
+                                    // Ignore malformed quote_update frames.
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -339,6 +517,10 @@ mod tests {
         assert_eq!(
             ep.workspace_url().as_str(),
             "http://127.0.0.1:8765/v1/workspace"
+        );
+        assert_eq!(
+            ep.watchlist_add_url().as_str(),
+            "http://127.0.0.1:8765/v1/watchlist/add"
         );
     }
 }

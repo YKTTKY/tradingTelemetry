@@ -8,14 +8,15 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, InputMode, Screen};
+use app::{App, InputMode, PendingWatchlistOp, Screen};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ipc::{
-    post_chart_interest, post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
+    post_chart_interest, post_watchlist_active, post_watchlist_add, post_watchlist_remove,
+    post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -72,6 +73,36 @@ async fn run_loop(
             });
         }
 
+        if let Some(op) = app.pending_watchlist.clone() {
+            app.watchlist_request_started();
+            let ep = endpoint.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = match op {
+                    PendingWatchlistOp::SetActive { watchlist_id } => {
+                        post_watchlist_active(&ep, &watchlist_id).await
+                    }
+                    PendingWatchlistOp::Add { symbol } => post_watchlist_add(&ep, &symbol).await,
+                    PendingWatchlistOp::Remove { symbol } => {
+                        post_watchlist_remove(&ep, &symbol).await
+                    }
+                };
+                match result {
+                    Ok(body) => {
+                        let _ = tx.send(IpcEvent::WatchlistState {
+                            workspace: body.workspace,
+                            quotes: body.quotes,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(IpcEvent::WatchlistFailed {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
         if app.needs_chart_load {
             app.chart_load_started();
             for chart in app.charts.iter() {
@@ -118,9 +149,18 @@ async fn run_loop(
 fn handle_key(app: &mut App, code: KeyCode) {
     match &app.input_mode {
         InputMode::InstrumentPrompt { .. } => match code {
-            KeyCode::Esc => app.cancel_instrument_prompt(),
+            KeyCode::Esc => app.cancel_prompt(),
             KeyCode::Enter => {
                 let _ = app.apply_instrument_prompt();
+            }
+            KeyCode::Backspace => app.prompt_pop_char(),
+            KeyCode::Char(c) => app.prompt_push_char(c),
+            _ => {}
+        },
+        InputMode::WatchlistAddPrompt { .. } => match code {
+            KeyCode::Esc => app.cancel_prompt(),
+            KeyCode::Enter => {
+                let _ = app.apply_watchlist_add_prompt();
             }
             KeyCode::Backspace => app.prompt_pop_char(),
             KeyCode::Char(c) => app.prompt_push_char(c),
@@ -141,6 +181,29 @@ fn handle_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Char('l') | KeyCode::Char('L') if app.screen == Screen::Workspace => {
                 app.toggle_layout();
+            }
+            KeyCode::Char('w') | KeyCode::Char('W') if app.screen == Screen::Workspace => {
+                app.toggle_watchlist_sidebar();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if app.screen == Screen::Workspace => {
+                app.cycle_watchlist(1);
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') if app.screen == Screen::Workspace => {
+                app.cycle_watchlist(-1);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') if app.screen == Screen::Workspace => {
+                app.begin_watchlist_add_prompt();
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('d') | KeyCode::Char('D')
+                if app.screen == Screen::Workspace =>
+            {
+                app.remove_selected_watchlist_symbol();
+            }
+            KeyCode::Up if app.screen == Screen::Workspace => {
+                app.watchlist_select_delta(-1);
+            }
+            KeyCode::Down if app.screen == Screen::Workspace => {
+                app.watchlist_select_delta(1);
             }
             KeyCode::Tab if app.screen == Screen::Workspace => {
                 app.focus_next();

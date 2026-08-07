@@ -36,10 +36,13 @@ Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts) |
+| `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts + watchlists) + `quotes` |
 | `POST /v1/workspace` | Set `layout_mode` (`single` \| `dual-vertical`); persists to disk |
 | `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` (+ optional `chart_id`); arms live updates; persists selection |
-| `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` |
+| `POST /v1/watchlist/active` | Switch active watchlist (`watchlist_id`); persists |
+| `POST /v1/watchlist/add` | Add `symbol` to the active watchlist; persists; returns workspace + quotes |
+| `POST /v1/watchlist/remove` | Remove `symbol` from the active watchlist; persists |
+| `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` + `quote_update` |
 
 **Workspace file:** default `~/.local/share/trading-telemetry/workspace.json` (override with `--workspace` or `MARKET_ENGINE_WORKSPACE`). No Redis/Postgres.
 
@@ -56,10 +59,20 @@ Example snapshot:
     "layout_mode": "single",
     "charts": [
       {"id": "primary", "instrument": "SPY", "timeframe": "1D"}
-    ]
-  }
+    ],
+    "watchlists": [
+      {"id": "core", "name": "Core", "symbols": ["ES", "NQ", "SPY", "QQQ", "SOXL"]},
+      {"id": "focus", "name": "Focus", "symbols": []}
+    ],
+    "active_watchlist_id": "core"
+  },
+  "quotes": [
+    {"symbol": "SPY", "status": "ok", "last": 548.0, "previous_close": 546.25, "change": 1.75, "change_pct": 0.003203}
+  ]
 }
 ```
+
+**Watchlists:** multiple named lists (default **Core** + empty **Focus**). Core first-launch symbols: **ES, NQ, SPY, QQQ, SOXL**, plus **VIX** only when the vendor resolves it. Quote fields: `last`, `previous_close`, `change` (last − previous close), `change_pct` (change / previous close). Unavailable symbols return `status: "unavailable"` without failing the list. Live `quote_update` frames are conflated like bars.
 
 Example chart interest (fake vendor knows **SPY** @ **1D**, **SPY** @ **1h**, **QQQ** @ **1D**, **ES** @ **1D**; unknown pairs return `status: unavailable` with empty `bars`):
 

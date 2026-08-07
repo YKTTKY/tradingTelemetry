@@ -1,4 +1,4 @@
-"""Conflating event hub: coalesce bar updates before WebSocket fan-out."""
+"""Conflating event hub: coalesce bar/quote updates before WebSocket fan-out."""
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ class ConflatingHub:
     def __init__(self, interval_s: float = 0.05) -> None:
         self.interval_s = interval_s
         self._pending: dict[tuple[str, str], PendingBarUpdate] = {}
+        self._pending_quotes: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._clients: list[_Client] = []
         self._clients_lock = asyncio.Lock()
@@ -72,6 +73,14 @@ class ConflatingHub:
                 )
             else:
                 existing.merge(completed_bars, bar)
+
+    def note_quote_update(self, symbol: str, payload: dict[str, Any]) -> None:
+        """Coalesce latest quote fields per symbol until the next flush."""
+        event = dict(payload)
+        event["type"] = "quote_update"
+        event["symbol"] = symbol
+        with self._lock:
+            self._pending_quotes[symbol] = event
 
     async def add_client(self, websocket: WebSocket) -> None:
         async with self._clients_lock:
@@ -124,11 +133,14 @@ class ConflatingHub:
 
     async def _flush(self) -> None:
         with self._lock:
-            batch = list(self._pending.values())
+            bar_batch = list(self._pending.values())
             self._pending.clear()
-        if not batch:
+            quote_batch = list(self._pending_quotes.values())
+            self._pending_quotes.clear()
+        events: list[dict[str, Any]] = [item.to_event() for item in bar_batch]
+        events.extend(quote_batch)
+        if not events:
             return
-        events = [item.to_event() for item in batch]
         async with self._clients_lock:
             clients = list(self._clients)
         dead: list[WebSocket] = []

@@ -267,8 +267,36 @@ class FakeVendor:
         self._sim_ts: dict[str, float] = {}
         self._auto_task: asyncio.Task[None] | None = None
         self._auto_instruments: set[str] = set()
+        # Mutable overlay on module fixtures (tests may seed VIX etc.).
+        self._extra_history: dict[tuple[str, str], tuple[Bar, ...]] = {}
+
+    def seed_history(
+        self,
+        instrument: str,
+        timeframe: str,
+        *,
+        closes: tuple[float, ...] | list[float],
+        start_ts: int,
+        period_seconds: int,
+        base_volume: float = 50_000_000.0,
+    ) -> None:
+        """Test/control hook: register deterministic history for an instrument."""
+        bars = _bars_from_closes(
+            start_ts,
+            tuple(closes),
+            period_seconds=period_seconds,
+            base_volume=base_volume,
+        )
+        key = (instrument.strip().upper(), timeframe.strip())
+        self._extra_history[key] = bars
+
+    def resolves(self, instrument: str, timeframe: str = "1D") -> bool:
+        """True when the vendor can serve history for the pair."""
+        return self.fetch_history(instrument, timeframe).available
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult:
+        instrument = instrument.strip().upper()
+        timeframe = timeframe.strip()
         # Outside the v1 set → explicit unavailable (no invented series).
         if timeframe not in V1_TIMEFRAMES:
             return HistoryResult(
@@ -278,7 +306,9 @@ class FakeVendor:
                 bars=(),
             )
         key = (instrument, timeframe)
-        bars = _FAKE_HISTORY.get(key)
+        bars = self._extra_history.get(key)
+        if bars is None:
+            bars = _FAKE_HISTORY.get(key)
         if bars is None:
             return HistoryResult(
                 instrument=instrument,

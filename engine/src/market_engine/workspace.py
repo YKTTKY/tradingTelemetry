@@ -1,4 +1,4 @@
-"""File-backed workspace: layout mode + per-chart instrument/timeframe."""
+"""File-backed workspace: layout mode + charts + multi-list watchlists."""
 
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ VALID_LAYOUTS: frozenset[str] = frozenset({LAYOUT_SINGLE, LAYOUT_DUAL})
 CHART_PRIMARY = "primary"
 CHART_TOP = "top"
 CHART_BOTTOM = "bottom"
+
+WATCHLIST_CORE_ID = "core"
+WATCHLIST_FOCUS_ID = "focus"
+
+# Always present on first-launch Core. VIX is appended only when the vendor resolves it.
+CORE_DEFAULT_SYMBOLS: tuple[str, ...] = ("ES", "NQ", "SPY", "QQQ", "SOXL")
+CORE_OPTIONAL_VIX = "VIX"
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,59 @@ def default_dual_bottom() -> ChartSelection:
 
 
 @dataclass
+class Watchlist:
+    """Named sheet of instruments for the sidebar."""
+
+    id: str
+    name: str
+    symbols: list[str] = field(default_factory=list)
+
+    def to_public(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "symbols": list(self.symbols),
+        }
+
+    def to_storage(self) -> dict[str, Any]:
+        return self.to_public()
+
+    @classmethod
+    def from_storage(cls, data: dict[str, Any]) -> Watchlist | None:
+        wid = str(data.get("id", "")).strip()
+        name = str(data.get("name", "")).strip()
+        if not wid or not name:
+            return None
+        raw_syms = data.get("symbols", [])
+        symbols: list[str] = []
+        if isinstance(raw_syms, list):
+            for s in raw_syms:
+                sym = str(s).strip().upper()
+                if sym and sym not in symbols:
+                    symbols.append(sym)
+        return cls(id=wid, name=name, symbols=symbols)
+
+
+def default_core_symbols(*, include_vix: bool) -> list[str]:
+    symbols = list(CORE_DEFAULT_SYMBOLS)
+    if include_vix:
+        symbols.append(CORE_OPTIONAL_VIX)
+    return symbols
+
+
+def default_watchlists(*, include_vix: bool = False) -> list[Watchlist]:
+    """First-launch multi-list desk: Core (defaults) + empty Focus for switching."""
+    return [
+        Watchlist(
+            id=WATCHLIST_CORE_ID,
+            name="Core",
+            symbols=default_core_symbols(include_vix=include_vix),
+        ),
+        Watchlist(id=WATCHLIST_FOCUS_ID, name="Focus", symbols=[]),
+    ]
+
+
+@dataclass
 class WorkspaceState:
     """In-memory workspace with independent single vs dual chart memories."""
 
@@ -47,6 +107,8 @@ class WorkspaceState:
     primary: ChartSelection = field(default_factory=default_single)
     dual_top: ChartSelection = field(default_factory=default_dual_top)
     dual_bottom: ChartSelection = field(default_factory=default_dual_bottom)
+    watchlists: list[Watchlist] = field(default_factory=lambda: default_watchlists())
+    active_watchlist_id: str = WATCHLIST_CORE_ID
 
     def active_charts(self) -> list[dict[str, str]]:
         """Charts visible for the current layout (for snapshot / TUI restore)."""
@@ -61,6 +123,8 @@ class WorkspaceState:
         return {
             "layout_mode": self.layout_mode,
             "charts": self.active_charts(),
+            "watchlists": [wl.to_public() for wl in self.watchlists],
+            "active_watchlist_id": self.active_watchlist_id,
         }
 
     def set_layout(self, layout_mode: str) -> None:
@@ -118,6 +182,47 @@ class WorkspaceState:
             return self.dual_bottom
         raise ValueError(f"unknown chart_id: {chart_id}")
 
+    def active_watchlist(self) -> Watchlist:
+        for wl in self.watchlists:
+            if wl.id == self.active_watchlist_id:
+                return wl
+        if self.watchlists:
+            self.active_watchlist_id = self.watchlists[0].id
+            return self.watchlists[0]
+        # Should not happen; re-seed.
+        self.watchlists = default_watchlists()
+        self.active_watchlist_id = WATCHLIST_CORE_ID
+        return self.watchlists[0]
+
+    def all_watchlist_symbols(self) -> list[str]:
+        seen: list[str] = []
+        for wl in self.watchlists:
+            for sym in wl.symbols:
+                if sym not in seen:
+                    seen.append(sym)
+        return seen
+
+    def set_active_watchlist(self, watchlist_id: str) -> None:
+        wid = watchlist_id.strip()
+        if not any(wl.id == wid for wl in self.watchlists):
+            raise ValueError(f"unknown watchlist_id: {wid}")
+        self.active_watchlist_id = wid
+
+    def add_symbol(self, symbol: str) -> None:
+        sym = symbol.strip().upper()
+        if not sym:
+            raise ValueError("symbol is required")
+        wl = self.active_watchlist()
+        if sym not in wl.symbols:
+            wl.symbols.append(sym)
+
+    def remove_symbol(self, symbol: str) -> None:
+        sym = symbol.strip().upper()
+        if not sym:
+            raise ValueError("symbol is required")
+        wl = self.active_watchlist()
+        wl.symbols = [s for s in wl.symbols if s != sym]
+
     def to_storage(self) -> dict[str, Any]:
         """Full state for disk (includes inactive layout memory)."""
         return {
@@ -125,10 +230,17 @@ class WorkspaceState:
             "primary": self.primary.to_dict(),
             "dual_top": self.dual_top.to_dict(),
             "dual_bottom": self.dual_bottom.to_dict(),
+            "watchlists": [wl.to_storage() for wl in self.watchlists],
+            "active_watchlist_id": self.active_watchlist_id,
         }
 
     @classmethod
-    def from_storage(cls, data: dict[str, Any]) -> WorkspaceState:
+    def from_storage(
+        cls,
+        data: dict[str, Any],
+        *,
+        include_vix: bool = False,
+    ) -> WorkspaceState:
         layout = data.get("layout_mode", LAYOUT_SINGLE)
         if layout not in VALID_LAYOUTS:
             layout = LAYOUT_SINGLE
@@ -143,35 +255,92 @@ class WorkspaceState:
                 return default
             return ChartSelection(instrument=inst, timeframe=tf)
 
+        watchlists = _watchlists_from_storage(data, include_vix=include_vix)
+        active = str(data.get("active_watchlist_id", "")).strip()
+        if not active or not any(wl.id == active for wl in watchlists):
+            active = watchlists[0].id
+
         return cls(
             layout_mode=layout,  # type: ignore[arg-type]
             primary=_sel("primary", default_single()),
             dual_top=_sel("dual_top", default_dual_top()),
             dual_bottom=_sel("dual_bottom", default_dual_bottom()),
+            watchlists=watchlists,
+            active_watchlist_id=active,
         )
+
+
+def _watchlists_from_storage(
+    data: dict[str, Any],
+    *,
+    include_vix: bool,
+) -> list[Watchlist]:
+    raw = data.get("watchlists")
+    if not isinstance(raw, list) or not raw:
+        return default_watchlists(include_vix=include_vix)
+    parsed: list[Watchlist] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        wl = Watchlist.from_storage(item)
+        if wl is not None:
+            parsed.append(wl)
+    if not parsed:
+        return default_watchlists(include_vix=include_vix)
+    # Ensure at least two lists so the switcher is usable after corrupt trim.
+    if len(parsed) == 1:
+        if parsed[0].id != WATCHLIST_FOCUS_ID:
+            parsed.append(Watchlist(id=WATCHLIST_FOCUS_ID, name="Focus", symbols=[]))
+        else:
+            parsed.insert(
+                0,
+                Watchlist(
+                    id=WATCHLIST_CORE_ID,
+                    name="Core",
+                    symbols=default_core_symbols(include_vix=include_vix),
+                ),
+            )
+    return parsed
 
 
 class WorkspaceStore:
     """Load/save workspace JSON. Missing/corrupt file → product defaults."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        include_vix: bool = False,
+    ) -> None:
         self.path = path
-        self.state = WorkspaceState()
+        self.include_vix = include_vix
+        self.state = WorkspaceState(
+            watchlists=default_watchlists(include_vix=include_vix),
+            active_watchlist_id=WATCHLIST_CORE_ID,
+        )
         if path is not None:
             self.load()
 
     def load(self) -> WorkspaceState:
         if self.path is None or not self.path.is_file():
-            self.state = WorkspaceState()
+            self.state = WorkspaceState(
+                watchlists=default_watchlists(include_vix=self.include_vix),
+            )
             return self.state
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
-                self.state = WorkspaceState()
+                self.state = WorkspaceState(
+                    watchlists=default_watchlists(include_vix=self.include_vix),
+                )
             else:
-                self.state = WorkspaceState.from_storage(raw)
+                self.state = WorkspaceState.from_storage(
+                    raw, include_vix=self.include_vix
+                )
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            self.state = WorkspaceState()
+            self.state = WorkspaceState(
+                watchlists=default_watchlists(include_vix=self.include_vix),
+            )
         return self.state
 
     def save(self) -> None:
@@ -189,3 +358,18 @@ class WorkspaceStore:
     def set_chart(self, chart_id: str, instrument: str, timeframe: str) -> None:
         self.state.set_chart(chart_id, instrument, timeframe)
         self.save()
+
+    def set_active_watchlist(self, watchlist_id: str) -> dict[str, Any]:
+        self.state.set_active_watchlist(watchlist_id)
+        self.save()
+        return self.state.to_public()
+
+    def add_symbol(self, symbol: str) -> dict[str, Any]:
+        self.state.add_symbol(symbol)
+        self.save()
+        return self.state.to_public()
+
+    def remove_symbol(self, symbol: str) -> dict[str, Any]:
+        self.state.remove_symbol(symbol)
+        self.save()
+        return self.state.to_public()

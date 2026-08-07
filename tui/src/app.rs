@@ -1,7 +1,10 @@
 //! Application state: Welcome → workspace with single or dual-vertical charts.
 
+use std::collections::HashMap;
+
 use crate::ipc::{
-    BarUpdateEvent, ChartInterestResponse, FeedSnapshot, IpcEvent, OhlcvBar, WorkspaceSnapshot,
+    BarUpdateEvent, ChartInterestResponse, FeedSnapshot, IpcEvent, OhlcvBar, QuoteRow,
+    QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
 };
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
@@ -56,11 +59,20 @@ impl LayoutMode {
     }
 }
 
-/// Modal input for instrument selection (and future prompts).
+/// Modal input for instrument selection and watchlist add.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     InstrumentPrompt { buffer: String },
+    WatchlistAddPrompt { buffer: String },
+}
+
+/// Pending HTTP mutation against the engine watchlist API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingWatchlistOp {
+    SetActive { watchlist_id: String },
+    Add { symbol: String },
+    Remove { symbol: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,11 +149,23 @@ pub struct App {
     pub feed: Option<FeedSnapshot>,
     /// Last workspace from engine snapshot (applied on Welcome → Workspace).
     pub pending_workspace: Option<WorkspaceSnapshot>,
+    /// Quotes stashed with the deferred Welcome snapshot.
+    pub pending_quotes: Vec<QuoteRow>,
     pub last_heartbeat_ts: Option<f64>,
     /// When true, the main loop should POST chart interest for every chart.
     pub needs_chart_load: bool,
     /// When Some, the main loop should POST layout change to the engine.
     pub pending_layout: Option<LayoutMode>,
+    /// Right watchlist sidebar visible (local UI; not persisted).
+    pub watchlist_visible: bool,
+    pub watchlists: Vec<WatchlistSnapshot>,
+    pub active_watchlist_id: String,
+    /// Latest quote fields keyed by symbol (from snapshot + live WS).
+    pub quotes: HashMap<String, QuoteRow>,
+    /// Selected row index within the active watchlist symbols.
+    pub watchlist_selected: usize,
+    /// When Some, main loop issues the matching watchlist HTTP mutation.
+    pub pending_watchlist: Option<PendingWatchlistOp>,
     pub input_mode: InputMode,
     pub should_quit: bool,
 }
@@ -156,9 +180,16 @@ impl Default for App {
             connection: ConnectionStatus::Connecting,
             feed: None,
             pending_workspace: None,
+            pending_quotes: Vec::new(),
             last_heartbeat_ts: None,
             needs_chart_load: false,
             pending_layout: None,
+            watchlist_visible: true,
+            watchlists: Vec::new(),
+            active_watchlist_id: String::new(),
+            quotes: HashMap::new(),
+            watchlist_selected: 0,
+            pending_watchlist: None,
             input_mode: InputMode::Normal,
             should_quit: false,
         }
@@ -186,7 +217,161 @@ impl App {
             if let Some(ws) = self.pending_workspace.take() {
                 self.apply_workspace(ws);
             }
+            let quotes = std::mem::take(&mut self.pending_quotes);
+            if !quotes.is_empty() {
+                self.apply_quotes(quotes);
+            }
             self.request_chart_load();
+        }
+    }
+
+    pub fn toggle_watchlist_sidebar(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        self.watchlist_visible = !self.watchlist_visible;
+    }
+
+    pub fn active_watchlist(&self) -> Option<&WatchlistSnapshot> {
+        self.watchlists
+            .iter()
+            .find(|wl| wl.id == self.active_watchlist_id)
+            .or_else(|| self.watchlists.first())
+    }
+
+    pub fn active_symbols(&self) -> &[String] {
+        self.active_watchlist()
+            .map(|wl| wl.symbols.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Quote row for a symbol, if known.
+    pub fn quote_for(&self, symbol: &str) -> Option<&QuoteRow> {
+        self.quotes.get(symbol)
+    }
+
+    /// Cycle active watchlist by `delta` steps (wraps). Arms engine mutation.
+    pub fn cycle_watchlist(&mut self, delta: i32) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        if self.watchlists.len() < 2 {
+            return;
+        }
+        let idx = self
+            .watchlists
+            .iter()
+            .position(|wl| wl.id == self.active_watchlist_id)
+            .unwrap_or(0);
+        let n = self.watchlists.len() as i32;
+        let next = (idx as i32 + delta).rem_euclid(n) as usize;
+        let id = self.watchlists[next].id.clone();
+        if id == self.active_watchlist_id {
+            return;
+        }
+        self.pending_watchlist = Some(PendingWatchlistOp::SetActive {
+            watchlist_id: id,
+        });
+    }
+
+    pub fn begin_watchlist_add_prompt(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !self.watchlist_visible {
+            return;
+        }
+        self.input_mode = InputMode::WatchlistAddPrompt {
+            buffer: String::new(),
+        };
+    }
+
+    pub fn apply_watchlist_add_prompt(&mut self) -> bool {
+        let InputMode::WatchlistAddPrompt { buffer } = &self.input_mode else {
+            return false;
+        };
+        let symbol = normalize_instrument(buffer);
+        self.input_mode = InputMode::Normal;
+        if symbol.is_empty() {
+            return false;
+        }
+        self.pending_watchlist = Some(PendingWatchlistOp::Add { symbol });
+        true
+    }
+
+    pub fn remove_selected_watchlist_symbol(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        if !self.watchlist_visible {
+            return;
+        }
+        let symbols = self.active_symbols();
+        if symbols.is_empty() {
+            return;
+        }
+        let idx = self.watchlist_selected.min(symbols.len() - 1);
+        let symbol = symbols[idx].clone();
+        self.pending_watchlist = Some(PendingWatchlistOp::Remove { symbol });
+    }
+
+    pub fn watchlist_select_delta(&mut self, delta: i32) {
+        if self.screen != Screen::Workspace || !self.watchlist_visible {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        let n = self.active_symbols().len();
+        if n == 0 {
+            self.watchlist_selected = 0;
+            return;
+        }
+        let cur = self.watchlist_selected.min(n - 1) as i32;
+        self.watchlist_selected = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    pub fn watchlist_request_started(&mut self) {
+        self.pending_watchlist = None;
+    }
+
+    pub fn apply_quotes(&mut self, quotes: Vec<QuoteRow>) {
+        for q in quotes {
+            self.quotes.insert(q.symbol.clone(), q);
+        }
+    }
+
+    pub fn apply_quote_update(&mut self, update: QuoteUpdateEvent) {
+        self.quotes
+            .insert(update.symbol.clone(), update.to_row());
+    }
+
+    pub fn apply_watchlist_state(
+        &mut self,
+        workspace: WorkspaceSnapshot,
+        quotes: Vec<QuoteRow>,
+    ) {
+        self.apply_workspace(workspace);
+        // Replace quote map for symbols we still care about; keep others for dual-list cache.
+        self.apply_quotes(quotes);
+        self.clamp_watchlist_selection();
+    }
+
+    fn clamp_watchlist_selection(&mut self) {
+        let n = self.active_symbols().len();
+        if n == 0 {
+            self.watchlist_selected = 0;
+        } else if self.watchlist_selected >= n {
+            self.watchlist_selected = n - 1;
         }
     }
 
@@ -234,7 +419,7 @@ impl App {
         self.focused = (self.focused + 1) % self.charts.len();
     }
 
-    /// Apply engine workspace public shape (layout + charts).
+    /// Apply engine workspace public shape (layout + charts + watchlists).
     pub fn apply_workspace(&mut self, ws: WorkspaceSnapshot) {
         self.layout = LayoutMode::from_engine(&ws.layout_mode);
         if ws.charts.is_empty() {
@@ -253,6 +438,20 @@ impl App {
         }
         if self.focused >= self.charts.len() {
             self.focused = 0;
+        }
+        if !ws.watchlists.is_empty() {
+            self.watchlists = ws.watchlists;
+            self.active_watchlist_id = if !ws.active_watchlist_id.is_empty()
+                && self
+                    .watchlists
+                    .iter()
+                    .any(|wl| wl.id == ws.active_watchlist_id)
+            {
+                ws.active_watchlist_id
+            } else {
+                self.watchlists[0].id.clone()
+            };
+            self.clamp_watchlist_selection();
         }
     }
 
@@ -310,24 +509,37 @@ impl App {
         };
     }
 
-    pub fn cancel_instrument_prompt(&mut self) {
+    pub fn cancel_prompt(&mut self) {
         self.input_mode = InputMode::Normal;
     }
 
+    /// Back-compat alias used by older call sites/tests.
+    pub fn cancel_instrument_prompt(&mut self) {
+        self.cancel_prompt();
+    }
+
     pub fn prompt_push_char(&mut self, c: char) {
-        if let InputMode::InstrumentPrompt { buffer } = &mut self.input_mode {
-            // Instruments are alnum; allow `.` and `-` for future vendor symbols.
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                if buffer.len() < 16 {
-                    buffer.push(c.to_ascii_uppercase());
+        match &mut self.input_mode {
+            InputMode::InstrumentPrompt { buffer }
+            | InputMode::WatchlistAddPrompt { buffer } => {
+                // Instruments are alnum; allow `.` and `-` for future vendor symbols.
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    if buffer.len() < 16 {
+                        buffer.push(c.to_ascii_uppercase());
+                    }
                 }
             }
+            InputMode::Normal => {}
         }
     }
 
     pub fn prompt_pop_char(&mut self) {
-        if let InputMode::InstrumentPrompt { buffer } = &mut self.input_mode {
-            buffer.pop();
+        match &mut self.input_mode {
+            InputMode::InstrumentPrompt { buffer }
+            | InputMode::WatchlistAddPrompt { buffer } => {
+                buffer.pop();
+            }
+            InputMode::Normal => {}
         }
     }
 
@@ -343,18 +555,33 @@ impl App {
 
     pub fn apply_ipc(&mut self, event: IpcEvent) {
         match event {
-            IpcEvent::Snapshot { feed, workspace } => {
+            IpcEvent::Snapshot {
+                feed,
+                workspace,
+                quotes,
+            } => {
                 self.set_feed(feed);
                 if let Some(ws) = workspace {
                     if self.screen == Screen::Welcome {
                         // Defer until Enter so Welcome stays clean; still stash for restore.
                         self.pending_workspace = Some(ws);
+                        self.pending_quotes = quotes;
                     } else {
                         self.apply_workspace(ws);
+                        self.apply_quotes(quotes);
                         self.request_chart_load();
                     }
-                } else if self.screen == Screen::Workspace {
-                    self.request_chart_load();
+                } else {
+                    if !quotes.is_empty() {
+                        if self.screen == Screen::Welcome {
+                            self.pending_quotes = quotes;
+                        } else {
+                            self.apply_quotes(quotes);
+                        }
+                    }
+                    if self.screen == Screen::Workspace {
+                        self.request_chart_load();
+                    }
                 }
             }
             IpcEvent::FeedStatus {
@@ -384,9 +611,15 @@ impl App {
             IpcEvent::BarUpdate(update) => {
                 self.apply_bar_update(update);
             }
+            IpcEvent::QuoteUpdate(update) => {
+                self.apply_quote_update(update);
+            }
             IpcEvent::Workspace(ws) => {
                 self.apply_workspace(ws);
                 self.request_chart_load();
+            }
+            IpcEvent::WatchlistState { workspace, quotes } => {
+                self.apply_watchlist_state(workspace, quotes);
             }
             IpcEvent::ChartLoadFailed {
                 chart_id,
@@ -398,6 +631,9 @@ impl App {
             }
             IpcEvent::WorkspaceFailed { message: _ } => {
                 // Leave layout unchanged; trader can retry toggle.
+            }
+            IpcEvent::WatchlistFailed { message: _ } => {
+                // Leave membership unchanged; trader can retry.
             }
             IpcEvent::Disconnected { reason } => {
                 self.connection = ConnectionStatus::Disconnected { reason };
@@ -569,6 +805,7 @@ mod tests {
                 engine: "up".into(),
             },
             workspace: None,
+            quotes: vec![],
         });
         assert_eq!(app.connection, ConnectionStatus::Connected);
         assert_eq!(app.vendor_mode_label(), "fake");
@@ -959,7 +1196,28 @@ mod tests {
                         timeframe: "1h".into(),
                     },
                 ],
+                watchlists: vec![
+                    WatchlistSnapshot {
+                        id: "core".into(),
+                        name: "Core".into(),
+                        symbols: vec!["SPY".into(), "QQQ".into()],
+                    },
+                    WatchlistSnapshot {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        symbols: vec![],
+                    },
+                ],
+                active_watchlist_id: "core".into(),
             }),
+            quotes: vec![QuoteRow {
+                symbol: "SPY".into(),
+                status: "ok".into(),
+                last: Some(548.0),
+                previous_close: Some(546.25),
+                change: Some(1.75),
+                change_pct: Some(1.75 / 546.25),
+            }],
         });
         // Still on Welcome with defaults until Enter.
         assert_eq!(app.screen, Screen::Welcome);
@@ -975,6 +1233,9 @@ mod tests {
         assert_eq!(app.charts[1].instrument, "QQQ");
         assert_eq!(app.charts[1].timeframe, "1h");
         assert!(app.needs_chart_load);
+        assert_eq!(app.active_watchlist_id, "core");
+        assert_eq!(app.active_symbols(), &["SPY".to_string(), "QQQ".to_string()]);
+        assert_eq!(app.quote_for("SPY").map(|q| q.last), Some(Some(548.0)));
     }
 
     #[test]
@@ -993,21 +1254,7 @@ mod tests {
         let mut app = App::default();
         app.enter_workspace();
         app.chart_load_started();
-        app.apply_ipc(IpcEvent::Workspace(WorkspaceSnapshot {
-            layout_mode: "dual-vertical".into(),
-            charts: vec![
-                WorkspaceChartSnapshot {
-                    id: "top".into(),
-                    instrument: "QQQ".into(),
-                    timeframe: "1D".into(),
-                },
-                WorkspaceChartSnapshot {
-                    id: "bottom".into(),
-                    instrument: "SPY".into(),
-                    timeframe: "1D".into(),
-                },
-            ],
-        }));
+        app.apply_ipc(IpcEvent::Workspace(dual_workspace()));
         assert_eq!(app.layout, LayoutMode::DualVertical);
         assert_eq!(app.charts[0].instrument, "QQQ");
         assert_eq!(app.charts[1].instrument, "SPY");
@@ -1018,21 +1265,7 @@ mod tests {
     fn focus_next_cycles_dual_charts() {
         let mut app = App::default();
         app.enter_workspace();
-        app.apply_workspace(WorkspaceSnapshot {
-            layout_mode: "dual-vertical".into(),
-            charts: vec![
-                WorkspaceChartSnapshot {
-                    id: "top".into(),
-                    instrument: "QQQ".into(),
-                    timeframe: "1D".into(),
-                },
-                WorkspaceChartSnapshot {
-                    id: "bottom".into(),
-                    instrument: "SPY".into(),
-                    timeframe: "1D".into(),
-                },
-            ],
-        });
+        app.apply_workspace(dual_workspace());
         assert_eq!(app.focused, 0);
         app.focus_next();
         assert_eq!(app.focused, 1);
@@ -1045,21 +1278,7 @@ mod tests {
     fn set_instrument_only_changes_focused_dual_chart() {
         let mut app = App::default();
         app.enter_workspace();
-        app.apply_workspace(WorkspaceSnapshot {
-            layout_mode: "dual-vertical".into(),
-            charts: vec![
-                WorkspaceChartSnapshot {
-                    id: "top".into(),
-                    instrument: "QQQ".into(),
-                    timeframe: "1D".into(),
-                },
-                WorkspaceChartSnapshot {
-                    id: "bottom".into(),
-                    instrument: "SPY".into(),
-                    timeframe: "1D".into(),
-                },
-            ],
-        });
+        app.apply_workspace(dual_workspace());
         app.chart_load_started();
         app.focus_next(); // bottom
         assert!(app.set_instrument("ES"));
@@ -1071,21 +1290,7 @@ mod tests {
     fn dual_bar_update_routes_to_matching_chart_only() {
         let mut app = App::default();
         app.enter_workspace();
-        app.apply_workspace(WorkspaceSnapshot {
-            layout_mode: "dual-vertical".into(),
-            charts: vec![
-                WorkspaceChartSnapshot {
-                    id: "top".into(),
-                    instrument: "QQQ".into(),
-                    timeframe: "1D".into(),
-                },
-                WorkspaceChartSnapshot {
-                    id: "bottom".into(),
-                    instrument: "SPY".into(),
-                    timeframe: "1D".into(),
-                },
-            ],
-        });
+        app.apply_workspace(dual_workspace());
         app.apply_chart_series(ChartInterestResponse {
             instrument: "QQQ".into(),
             timeframe: "1D".into(),
@@ -1134,6 +1339,125 @@ mod tests {
         match &app.charts[1].series {
             ChartSeriesState::Available { bars } => assert_eq!(bars[0].close, 2.0),
             other => panic!("bottom expected Available, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_watchlist_sidebar() {
+        let mut app = App::default();
+        app.enter_workspace();
+        assert!(app.watchlist_visible);
+        app.toggle_watchlist_sidebar();
+        assert!(!app.watchlist_visible);
+        app.toggle_watchlist_sidebar();
+        assert!(app.watchlist_visible);
+    }
+
+    #[test]
+    fn cycle_watchlist_arms_set_active() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+            }],
+            watchlists: vec![
+                WatchlistSnapshot {
+                    id: "core".into(),
+                    name: "Core".into(),
+                    symbols: vec!["SPY".into()],
+                },
+                WatchlistSnapshot {
+                    id: "focus".into(),
+                    name: "Focus".into(),
+                    symbols: vec!["QQQ".into()],
+                },
+            ],
+            active_watchlist_id: "core".into(),
+        });
+        app.cycle_watchlist(1);
+        assert_eq!(
+            app.pending_watchlist,
+            Some(PendingWatchlistOp::SetActive {
+                watchlist_id: "focus".into()
+            })
+        );
+    }
+
+    #[test]
+    fn quote_update_mutates_last_and_change() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_quotes(vec![QuoteRow {
+            symbol: "SPY".into(),
+            status: "ok".into(),
+            last: Some(548.0),
+            previous_close: Some(546.25),
+            change: Some(1.75),
+            change_pct: Some(1.75 / 546.25),
+        }]);
+        app.apply_quote_update(QuoteUpdateEvent {
+            symbol: "SPY".into(),
+            status: "ok".into(),
+            last: Some(550.0),
+            previous_close: Some(546.25),
+            change: Some(3.75),
+            change_pct: Some(3.75 / 546.25),
+        });
+        let q = app.quote_for("SPY").expect("spy quote");
+        assert_eq!(q.last, Some(550.0));
+        assert_eq!(q.change, Some(3.75));
+        assert!(q.change.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn remove_selected_arms_remove_op() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+            }],
+            watchlists: vec![WatchlistSnapshot {
+                id: "core".into(),
+                name: "Core".into(),
+                symbols: vec!["ES".into(), "SPY".into()],
+            }],
+            active_watchlist_id: "core".into(),
+        });
+        app.watchlist_selected = 1;
+        app.remove_selected_watchlist_symbol();
+        assert_eq!(
+            app.pending_watchlist,
+            Some(PendingWatchlistOp::Remove {
+                symbol: "SPY".into()
+            })
+        );
+    }
+
+    fn dual_workspace() -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            layout_mode: "dual-vertical".into(),
+            charts: vec![
+                WorkspaceChartSnapshot {
+                    id: "top".into(),
+                    instrument: "QQQ".into(),
+                    timeframe: "1D".into(),
+                },
+                WorkspaceChartSnapshot {
+                    id: "bottom".into(),
+                    instrument: "SPY".into(),
+                    timeframe: "1D".into(),
+                },
+            ],
+            watchlists: vec![],
+            active_watchlist_id: String::new(),
         }
     }
 }
