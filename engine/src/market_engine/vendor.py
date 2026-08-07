@@ -127,13 +127,25 @@ DOMAIN_TO_LSE_TIMEFRAME: dict[str, str] = {
     "1W": "1w",
 }
 
+# Domain instrument (IPC / TUI) → LSE vault wire symbol.
+# Bare "ES" is NYSE equity Eversource (~$70s); CME E-mini S&P is "ES.F" (~index level).
+# Same pattern for NQ → "NQ.F". ETFs/stocks stay identity.
+DOMAIN_TO_LSE_INSTRUMENT: dict[str, str] = {
+    "ES": "ES.F",
+    "NQ": "NQ.F",
+    # Micro roots (MES/MNQ) are not in the LSE futures catalog today.
+}
+
+
 def domain_to_lse_instrument(instrument: str) -> str:
-    """Map domain instrument id to LSE wire symbol (identity for v1 product names).
+    """Map domain instrument id to LSE wire symbol.
 
     Mapping stays inside the adapter; IPC always uses canonical ids (SPY, ES, …).
-    Override here if a future domain name diverges from the LSE catalog symbol.
+    Futures use the vault ``*.F`` continuous symbols so we never collide with
+    equity tickers that share the root (e.g. ES stock vs ES.F E-mini).
     """
-    return instrument.strip().upper()
+    key = instrument.strip().upper()
+    return DOMAIN_TO_LSE_INSTRUMENT.get(key, key)
 
 
 def parse_lse_timestamp(value: Any) -> int | None:

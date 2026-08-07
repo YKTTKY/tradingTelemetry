@@ -32,6 +32,8 @@ uv run market-engine --vendor lse
 
 Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution mapping lives only in the adapter.
 
+**Futures wire symbols:** domain `ES` / `NQ` map to LSE continuous futures `ES.F` / `NQ.F`. Bare `ES` on LSE is the **equity** ticker (Eversource), not E-mini S&P — without this map, watchlist/chart quotes sit around ~$70 instead of index levels (~7700).
+
 ## IPC (v1)
 
 | Endpoint | Purpose |

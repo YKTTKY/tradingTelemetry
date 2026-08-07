@@ -213,6 +213,114 @@ def test_cli_vendor_env_override(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_domain_to_lse_maps_futures_roots_to_continuous_f_suffix():
+    """Bare ES/NQ are equity/other on LSE; CME continuous futures are *.F."""
+    from market_engine.vendor import domain_to_lse_instrument
+
+    assert domain_to_lse_instrument("ES") == "ES.F"
+    assert domain_to_lse_instrument("nq") == "NQ.F"
+    assert domain_to_lse_instrument("SPY") == "SPY"
+    assert domain_to_lse_instrument("QQQ") == "QQQ"
+
+
+def test_lse_fetch_history_maps_es_to_es_f_not_equity_ticker():
+    """Regression: domain ES must not load NYSE ES (~$70); use ES.F (~index)."""
+    from market_engine.vendor import LseVendor
+
+    equity_es = [
+        {
+            "timestamp": "2024-07-03T00:00:00Z",
+            "open": 72.0,
+            "high": 73.0,
+            "low": 71.0,
+            "close": 72.67,
+            "volume": 1_000.0,
+        },
+    ]
+    emini_es = [
+        {
+            "timestamp": "2024-07-01T00:00:00Z",
+            "open": 5500.0,
+            "high": 5520.0,
+            "low": 5490.0,
+            "close": 5510.0,
+            "volume": 100_000.0,
+        },
+        {
+            "timestamp": "2024-07-02T00:00:00Z",
+            "open": 5510.0,
+            "high": 5550.0,
+            "low": 5500.0,
+            "close": 5540.0,
+            "volume": 110_000.0,
+        },
+    ]
+    stub = StubLseClient(
+        candles_by_key={
+            ("ES", "1d"): equity_es,
+            ("ES.F", "1d"): emini_es,
+        },
+    )
+    vendor = LseVendor(client=stub)
+
+    result = vendor.fetch_history("ES", "1D")
+
+    assert result.available is True
+    # Domain id stays ES on the IPC boundary.
+    assert result.instrument == "ES"
+    assert result.bars[-1].close == 5540.0
+    assert result.bars[-1].close != 72.67
+    assert stub.candles_calls == [("ES.F", "1d", "desc")]
+
+
+def test_lse_fetch_history_maps_nq_to_nq_f():
+    from market_engine.vendor import LseVendor
+
+    stub = StubLseClient(
+        candles_by_key={
+            ("NQ.F", "1d"): [
+                {
+                    "timestamp": "2024-07-02T00:00:00Z",
+                    "open": 19000.0,
+                    "high": 19100.0,
+                    "low": 18900.0,
+                    "close": 19050.0,
+                    "volume": 50_000.0,
+                },
+                {
+                    "timestamp": "2024-07-03T00:00:00Z",
+                    "open": 19050.0,
+                    "high": 19200.0,
+                    "low": 19000.0,
+                    "close": 19150.0,
+                    "volume": 55_000.0,
+                },
+            ],
+        },
+    )
+    vendor = LseVendor(client=stub)
+    result = vendor.fetch_history("NQ", "1D")
+    assert result.available is True
+    assert result.instrument == "NQ"
+    assert result.bars[-1].close == 19150.0
+    assert stub.candles_calls == [("NQ.F", "1d", "desc")]
+
+
+def test_lse_subscribe_uses_wire_symbol_es_f_for_domain_es():
+    from market_engine.vendor import LseVendor
+
+    stub = StubLseClient()
+    vendor = LseVendor(client=stub, start_stream=False)
+    seen: list[Tick] = []
+    vendor.subscribe("ES", seen.append)
+    assert stub.subscribed == ["ES.F"]
+    # Live ticks arrive on the wire symbol; domain handler still receives ES.
+    stub.emit_tick("ES.F", price=5548.25, volume=10.0)
+    assert len(seen) == 1
+    assert seen[0].instrument == "ES"
+    assert seen[0].price == 5548.25
+
+
 def test_lse_fetch_history_maps_domain_tf_and_returns_bars():
     from market_engine.vendor import LseVendor
 
