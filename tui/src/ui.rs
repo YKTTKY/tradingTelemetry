@@ -379,7 +379,8 @@ fn draw_price_and_volume(frame: &mut Frame, area: Rect, title: &str, chart: &Cha
     }
 }
 
-const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::Magenta];
+// Distinct but calm MA colors (read as thin lines over green/red candles).
+const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::LightMagenta];
 
 fn draw_candles(
     frame: &mut Frame,
@@ -388,48 +389,49 @@ fn draw_candles(
     chart: &Chart,
     bars: &[OhlcvBar],
 ) {
-    // Fit roughly one candle per terminal column (inner width minus borders).
-    // Drawing 500 sub-pixel bodies makes the series unreadable even with good data.
+    // One candle column ≈ one terminal cell. Cap density so wicks stay legible.
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
-    let start = if bars.len() <= inner_w {
+    // Prefer fewer bars than full width so each candle has room for a body + gap.
+    let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
+    let start = if bars.len() <= max_bars {
         0
     } else {
-        bars.len() - inner_w
+        bars.len() - max_bars
     };
     let visible = &bars[start..];
     let n = visible.len() as f64;
 
+    // Scale primarily from candle range so MAs don't crush price action.
     let mut min_p = visible[0].low;
     let mut max_p = visible[0].high;
     for b in visible {
         min_p = min_p.min(b.low);
         max_p = max_p.max(b.high);
     }
-    // Include MA values in price scale when present.
+    let candle_span = (max_p - min_p).max(f64::EPSILON);
     let ma_lines = chart.enabled_ma_lines();
+    // Only expand the scale a little for MAs that sit near price (ignore wild outliers).
     for (_, series) in &ma_lines {
         for val in series.values.iter().skip(start).take(visible.len()) {
-            if let Some(v) = val {
-                min_p = min_p.min(*v);
-                max_p = max_p.max(*v);
+            if let Some(v) = *val {
+                if v >= min_p - candle_span && v <= max_p + candle_span {
+                    min_p = min_p.min(v);
+                    max_p = max_p.max(v);
+                }
             }
         }
     }
-    // Flat series (or single print) still needs a non-zero y span for Canvas.
     if (max_p - min_p).abs() < f64::EPSILON {
         min_p -= 1.0;
         max_p += 1.0;
     }
-    let pad = ((max_p - min_p) * 0.05).max(0.01);
+    let pad = ((max_p - min_p) * 0.06).max(0.01);
     min_p -= pad;
     max_p += pad;
+    let y_span = max_p - min_p;
 
     let last = bars.last().expect("non-empty");
-    let ma_hint = if ma_lines.is_empty() {
-        String::new()
-    } else {
-        format!("  MA×{}", ma_lines.len())
-    };
+    let ma_hint = ma_legend(&ma_lines);
     let subtitle = format!(
         " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}",
         last.open,
@@ -453,11 +455,12 @@ fn draw_candles(
             Style::default().fg(Color::DarkGray),
         )));
 
-    // Body width in data units: leave a small gap between neighbors.
-    let body_w = 0.7_f64;
+    // Narrow bodies leave gaps; Braille gives sub-cell resolution for wicks + MA.
+    let body_w = 0.35_f64;
     let half_w = body_w / 2.0;
+    // Minimum body height ≈ ~1 braille row in price units.
+    let min_body = y_span * 0.012;
 
-    // Pre-extract MA segments for the paint closure (owned values).
     let mut ma_segments: Vec<(Color, Vec<(f64, f64)>)> = Vec::new();
     for (mi, (_cfg, series)) in ma_lines.iter().enumerate() {
         let color = MA_COLORS[mi % MA_COLORS.len()];
@@ -472,16 +475,17 @@ fn draw_candles(
 
     let canvas = Canvas::default()
         .block(block)
-        .marker(symbols::Marker::Block)
+        // Braille: 2×4 subpixels per cell — far thinner than Marker::Block slabs.
+        .marker(symbols::Marker::Braille)
         .x_bounds([0.0, n])
         .y_bounds([min_p, max_p])
         .paint(move |ctx| {
+            // Candles first (underlays).
             for (i, bar) in visible.iter().enumerate() {
                 let x = i as f64 + 0.5;
                 let up = bar.close >= bar.open;
                 let color = if up { Color::Green } else { Color::Red };
 
-                // High–low wick
                 ctx.draw(&CanvasLine {
                     x1: x,
                     y1: bar.low,
@@ -490,10 +494,9 @@ fn draw_candles(
                     color,
                 });
 
-                // Open–close body
                 let top = bar.open.max(bar.close);
                 let bottom = bar.open.min(bar.close);
-                let height = (top - bottom).max((max_p - min_p) * 0.004);
+                let height = (top - bottom).max(min_body);
                 ctx.draw(&Rectangle {
                     x: x - half_w,
                     y: bottom,
@@ -502,11 +505,11 @@ fn draw_candles(
                     color,
                 });
             }
+            // MA as connected segments (thin braille strokes over candles).
             for (color, pts) in &ma_segments {
                 for w in pts.windows(2) {
                     let (x1, y1) = w[0];
                     let (x2, y2) = w[1];
-                    // Only connect consecutive defined samples (skip warm-up gaps).
                     if (x2 - x1).abs() <= 1.0 + f64::EPSILON {
                         ctx.draw(&CanvasLine {
                             x1,
@@ -523,15 +526,36 @@ fn draw_candles(
     frame.render_widget(canvas, area);
 }
 
+fn ma_legend(ma_lines: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)]) -> String {
+    if ma_lines.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = ma_lines
+        .iter()
+        .enumerate()
+        .map(|(i, (cfg, _))| {
+            let len = cfg.length.unwrap_or(0);
+            let tag = match i % 3 {
+                0 => "c", // cyan
+                1 => "y", // yellow
+                _ => "m", // magenta
+            };
+            format!("{tag}{len}")
+        })
+        .collect();
+    format!("  MA[{}]", parts.join(" "))
+}
+
 fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvBar]) {
     let Some(vol_series) = chart.volume_series() else {
         return;
     };
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
-    let start = if bars.len() <= inner_w {
+    let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
+    let start = if bars.len() <= max_bars {
         0
     } else {
-        bars.len() - inner_w
+        bars.len() - max_bars
     };
     let visible_bars = &bars[start..];
     let n = visible_bars.len() as f64;
@@ -548,19 +572,25 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
         .borders(Borders::ALL)
         .title(" Volume ");
 
-    let body_w = 0.7_f64;
+    // Thin stems read better than full-width Block slabs in a short pane.
+    let body_w = 0.45_f64;
     let half_w = body_w / 2.0;
     let canvas = Canvas::default()
         .block(block)
-        .marker(symbols::Marker::Block)
+        .marker(symbols::Marker::Braille)
         .x_bounds([0.0, n])
         .y_bounds([0.0, max_v * 1.05])
         .paint(move |ctx| {
             for (i, (bar, &vol)) in visible_bars.iter().zip(values.iter()).enumerate() {
                 let x = i as f64 + 0.5;
                 let up = bar.close >= bar.open;
-                let color = if up { Color::Green } else { Color::Red };
-                let height = vol.max(max_v * 0.01);
+                // Soft directional tint — thinner stems so volume stays secondary.
+                let color = if up {
+                    Color::Rgb(0, 120, 60)
+                } else {
+                    Color::Rgb(140, 40, 40)
+                };
+                let height = vol.max(max_v * 0.02);
                 ctx.draw(&Rectangle {
                     x: x - half_w,
                     y: 0.0,
