@@ -165,6 +165,22 @@ async fn run_loop(
 }
 
 fn handle_key(app: &mut App, code: KeyCode) {
+    // Help overlay eats keys so underlying panels stay put.
+    if app.help_open {
+        match code {
+            KeyCode::Esc
+            | KeyCode::Enter
+            | KeyCode::Char('?')
+            | KeyCode::Char('h')
+            | KeyCode::Char('H') => {
+                app.close_help();
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => app.quit(),
+            _ => {}
+        }
+        return;
+    }
+
     match &app.input_mode {
         InputMode::InstrumentPrompt { .. } => match code {
             KeyCode::Esc => app.cancel_prompt(),
@@ -185,6 +201,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
             _ => {}
         },
         InputMode::IndicatorPanel => match code {
+            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
             KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
                 app.close_indicator_panel();
             }
@@ -208,6 +225,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
             _ => {}
         },
         InputMode::Normal => match code {
+            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
             KeyCode::Char('q') => app.quit(),
             KeyCode::Esc => {
                 if app.screen == Screen::Welcome {

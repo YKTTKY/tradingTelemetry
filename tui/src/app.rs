@@ -224,6 +224,8 @@ pub struct App {
     /// Selected row in the indicator panel list.
     pub indicator_selected: usize,
     pub input_mode: InputMode,
+    /// Floating keyboard-shortcut help overlay (does not replace input_mode).
+    pub help_open: bool,
     pub should_quit: bool,
 }
 
@@ -250,6 +252,7 @@ impl Default for App {
             pending_indicators: None,
             indicator_selected: 0,
             input_mode: InputMode::Normal,
+            help_open: false,
             should_quit: false,
         }
     }
@@ -542,7 +545,19 @@ impl App {
         }
     }
 
+    /// Toggle the floating keyboard-shortcut help without replacing input_mode.
+    pub fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+    }
+
+    pub fn close_help(&mut self) {
+        self.help_open = false;
+    }
+
     pub fn toggle_indicator_panel(&mut self) {
+        if self.help_open {
+            return;
+        }
         if self.screen != Screen::Workspace {
             return;
         }
@@ -1216,6 +1231,20 @@ mod tests {
         assert_eq!(app.screen, Screen::Workspace);
         assert!(app.needs_chart_load);
         assert_eq!(app.chart().series, ChartSeriesState::Loading);
+    }
+
+    #[test]
+    fn help_overlay_toggles_without_changing_input_mode() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        assert!(!app.help_open);
+        app.toggle_help();
+        assert!(app.help_open);
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+        app.close_help();
+        assert!(!app.help_open);
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
     }
 
     #[test]

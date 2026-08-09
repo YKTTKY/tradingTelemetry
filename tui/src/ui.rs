@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         canvas::{Canvas, Line as CanvasLine, Rectangle},
-        Block, Borders, Paragraph, Wrap,
+        Block, Borders, Clear, Paragraph, Wrap,
     },
     Frame,
 };
@@ -21,6 +21,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Welcome => draw_welcome(frame, app),
         Screen::Workspace => draw_workspace(frame, app),
+    }
+    if app.help_open {
+        draw_help_popup(frame);
     }
 }
 
@@ -48,7 +51,7 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
         Line::from(feed_line(app)),
         Line::from(""),
         Line::from(Span::styled(
-            "Press Enter to open workspace  ·  q to quit",
+            "Press Enter to open workspace  ·  ? help  ·  q to quit",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -56,6 +59,102 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).title(" Welcome "));
 
     frame.render_widget(title, chunks[1]);
+}
+
+/// Centered floating panel listing keyboard shortcuts.
+fn draw_help_popup(frame: &mut Frame) {
+    let area = frame.area();
+    // Tall enough for the full menu; shrink on small terminals (content clips).
+    let popup_h = area.height.saturating_sub(2).clamp(16, 38);
+    let popup = centered_rect(area, 74, popup_h);
+    frame.render_widget(Clear, popup);
+
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let row = |keys: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {keys:<14}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(desc.to_string()),
+        ])
+    };
+
+    let lines = vec![
+        section("Global"),
+        row("? / h", "Open or close this help"),
+        row("q", "Quit the app"),
+        row("Esc", "Close help, prompt, or panel (Welcome: quit)"),
+        section("Welcome"),
+        row("Enter", "Open workspace"),
+        section("Chart & layout"),
+        row("l", "Toggle single ↔ dual-vertical"),
+        row("Tab", "Focus next chart (dual)"),
+        row("[ / ]", "Previous / next timeframe"),
+        row("i", "Change instrument (focused chart)"),
+        row("o", "Open / close indicator panel"),
+        section("Watchlist"),
+        row("w", "Show / hide sidebar"),
+        row("n / p", "Next / previous watchlist sheet"),
+        row("↑ / ↓", "Move selection in active list"),
+        row("a", "Add symbol to active list"),
+        row("x / d", "Remove selected symbol"),
+        section("Indicator panel"),
+        row("↑ / ↓", "Select indicator row"),
+        row("Space", "Enable / disable selected"),
+        row("m", "Add MA stack (SMA 10 / 60 / 200)"),
+        row("v", "Add Volume (max 1)"),
+        row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
+        row("s", "MA: SMA↔EMA · Session VP: left↔right place"),
+        row("+ / -", "MA: length · Session VP: box width %"),
+        row("1 2 3", "Session VP: toggle POC / VAH / VAL"),
+        row("x", "Remove selected indicator"),
+        row("o / Esc", "Close indicator panel"),
+        section("Text prompts"),
+        row("Enter", "Apply instrument or watchlist add"),
+        row("Esc", "Cancel prompt"),
+        Line::from(Span::styled(
+            "  Close help with Esc, ?, h, or Enter",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let body = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Keyboard shortcuts ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, popup);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2).max(20));
+    let height = height.min(area.height.saturating_sub(2).max(10));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn draw_workspace(frame: &mut Frame, app: &App) {
@@ -130,13 +229,13 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .unwrap_or("—");
     let help = if panel_open {
         Paragraph::new(format!(
-            "Indicators · {}  ·  m MA  ·  v Vol  ·  p SVP  ·  Space  ·  s type/place  ·  +/- len/width  ·  1/2/3 POC/VAH/VAL  ·  x rem  ·  o/Esc",
+            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  Space  ·  s type/place  ·  +/-  ·  1/2/3 levels  ·  x rem  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
     } else {
         Paragraph::new(format!(
-            "{} · {} · {}  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w watchlist  ·  n/p list  ·  a add  ·  x rem  ·  ↑↓  ·  q  [{}]",
+            "{} · {} · {}  ·  ? help  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w list  ·  n/p sheet  ·  a add  ·  x rem  ·  q  [{}]",
             app.layout.as_str(),
             focused.instrument,
             focused.timeframe,
