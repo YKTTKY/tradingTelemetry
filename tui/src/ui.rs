@@ -13,7 +13,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, Chart, ChartSeriesState, ConnectionStatus, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
+    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, InputMode, LayoutMode, Screen,
+    UNAVAILABLE_COPY,
 };
 use crate::ipc::{OhlcvBar, QuoteRow};
 
@@ -114,15 +115,19 @@ fn draw_help_popup(frame: &mut Frame) {
         row("m", "Add MA stack (SMA 10 / 60 / 200)"),
         row("v", "Add Volume (max 1)"),
         row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
-        row("f", "Add Fixed Range VP (max 4; anchors = first/last bar)"),
+        row("f", "Add Fixed Range VP (max 4) → pin placement on chart"),
+        row("r / Enter", "Re-place Fixed Range pins (when FRVP selected)"),
         row("e", "Fixed Range: toggle extend-to-right"),
-        row(", / .", "Fixed Range: nudge start earlier / later (one bar)"),
-        row("< / >", "Fixed Range: nudge end earlier / later (one bar)"),
         row("s", "MA: SMA↔EMA · VP: left↔right place"),
         row("+ / -", "MA: length · VP: box width %"),
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
         row("x", "Remove selected indicator"),
         row("o / Esc", "Close indicator panel"),
+        section("Fixed Range pin placement"),
+        row("← / →", "Move pin cursor bar-by-bar (h/l also)"),
+        row("[ / ]", "Jump pin cursor 10 bars"),
+        row("Enter", "Lock start pin, then lock end pin"),
+        row("Esc", "Cancel placement (drops new FRVP)"),
         section("Text prompts"),
         row("Enter", "Apply instrument or watchlist add"),
         row("Esc", "Cancel prompt"),
@@ -164,9 +169,11 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let panel_open = matches!(app.input_mode, InputMode::IndicatorPanel);
+    let placing = matches!(app.input_mode, InputMode::FrvpPlacing);
     let prompt_h = match &app.input_mode {
         InputMode::InstrumentPrompt { .. } | InputMode::WatchlistAddPrompt { .. } => 3,
         InputMode::IndicatorPanel => 10,
+        InputMode::FrvpPlacing => 3,
         InputMode::Normal => 0,
     };
     let chunks = Layout::default()
@@ -218,6 +225,33 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         InputMode::IndicatorPanel => {
             draw_indicator_panel(frame, chunks[2], app);
         }
+        InputMode::FrvpPlacing => {
+            let (phase_label, pin_label) = match app.frvp_place.as_ref().map(|p| p.phase) {
+                Some(FrvpPinPhase::End) => (
+                    "PIN 2 / 2 — END of range",
+                    "Yellow ▼ is the live end pin · cyan ▲ is locked start",
+                ),
+                _ => (
+                    "PIN 1 / 2 — START of range",
+                    "Yellow ▼ sits on the candle under the cursor",
+                ),
+            };
+            let prompt = Paragraph::new(format!(
+                "{phase_label}  ·  {pin_label}\n←/→ move bar  ·  [/] ±10  ·  Enter lock pin  ·  Esc cancel"
+            ))
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Fixed Range · place pins on chart "),
+            );
+            frame.render_widget(prompt, chunks[2]);
+        }
         InputMode::Normal => {}
     }
 
@@ -231,9 +265,14 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .active_watchlist()
         .map(|w| w.name.as_str())
         .unwrap_or("—");
-    let help = if panel_open {
+    let help = if placing {
+        Paragraph::new(
+            "Fixed Range pins  ·  ←/→ bar  ·  [/] jump  ·  Enter lock  ·  Esc cancel  ·  ? help",
+        )
+        .style(Style::default().fg(Color::Yellow))
+    } else if panel_open {
         Paragraph::new(format!(
-            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  Space  ·  s type/place  ·  +/-  ·  1/2/3 levels  ·  x rem  ·  o/Esc",
+            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  r/Enter re-pin  ·  Space  ·  s place  ·  +/-  ·  1/2/3  ·  x  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
@@ -309,8 +348,17 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     } else {
                         "ext-"
                     };
+                    let pins = if !ind.enabled
+                        && (ind.start.is_none()
+                            || ind.end.is_none()
+                            || ind.start == ind.end)
+                    {
+                        "pins?"
+                    } else {
+                        "pins✓"
+                    };
                     format!(
-                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {}",
+                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins} {}  (Enter/r re-pin)",
                         vp_levels(ind)
                     )
                 }
@@ -498,12 +546,19 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App, chart: &Chart, focused: 
             frame.render_widget(body, area);
         }
         ChartSeriesState::Available { bars } => {
-            draw_price_and_volume(frame, area, &title, chart, bars);
+            draw_price_and_volume(frame, area, app, &title, chart, bars);
         }
     }
 }
 
-fn draw_price_and_volume(frame: &mut Frame, area: Rect, title: &str, chart: &Chart, bars: &[OhlcvBar]) {
+fn draw_price_and_volume(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    title: &str,
+    chart: &Chart,
+    bars: &[OhlcvBar],
+) {
     if bars.is_empty() {
         let body = Paragraph::new(UNAVAILABLE_COPY)
             .alignment(Alignment::Center)
@@ -518,10 +573,10 @@ fn draw_price_and_volume(frame: &mut Frame, area: Rect, title: &str, chart: &Cha
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
             .split(area);
-        draw_candles(frame, rows[0], title, chart, bars);
+        draw_candles(frame, rows[0], app, title, chart, bars);
         draw_volume_pane(frame, rows[1], chart, bars);
     } else {
-        draw_candles(frame, area, title, chart, bars);
+        draw_candles(frame, area, app, title, chart, bars);
     }
 }
 
@@ -531,6 +586,7 @@ const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::LightMagenta];
 fn draw_candles(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     title: &str,
     chart: &Chart,
     bars: &[OhlcvBar],
@@ -539,12 +595,24 @@ fn draw_candles(
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
     // Prefer fewer bars than full width so each candle has room for a body + gap.
     let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
+    // Keep the live FRVP pin cursor in view while scrubbing history.
+    let place_cursor = app.frvp_place.as_ref().and_then(|p| {
+        if p.chart_id == chart.id {
+            Some(p.cursor_bar.min(bars.len().saturating_sub(1)))
+        } else {
+            None
+        }
+    });
     let start = if bars.len() <= max_bars {
         0
+    } else if let Some(cur) = place_cursor {
+        let half = max_bars / 2;
+        let max_start = bars.len() - max_bars;
+        cur.saturating_sub(half).min(max_start)
     } else {
         bars.len() - max_bars
     };
-    let visible = &bars[start..];
+    let visible = &bars[start..start + max_bars.min(bars.len() - start)];
     let n = visible.len() as f64;
 
     // Scale primarily from candle range so MAs don't crush price action.
@@ -634,6 +702,17 @@ fn draw_candles(
     vp_draw.hist_rects.extend(fr_draw.hist_rects);
     vp_draw.levels.extend(fr_draw.levels);
 
+    // Pin markers: placement cursor + locked start + set range anchors on enabled FRVPs.
+    let pin_labels = collect_frvp_pin_labels(
+        app,
+        chart,
+        bars,
+        start,
+        visible,
+        max_p,
+        y_span,
+    );
+
     let canvas = Canvas::default()
         .block(block)
         // Braille: 2×4 subpixels per cell — far thinner than Marker::Block slabs.
@@ -701,9 +780,114 @@ fn draw_candles(
                     }
                 }
             }
+            // FRVP pin markers (drawn last so they sit on top of candles).
+            for (x, y, glyph, color) in &pin_labels {
+                // Small vertical stem so the marker reads above the wick.
+                ctx.draw(&CanvasLine {
+                    x1: *x,
+                    y1: *y - y_span * 0.01,
+                    x2: *x,
+                    y2: *y,
+                    color: *color,
+                });
+                ctx.print(
+                    *x,
+                    *y,
+                    Span::styled(
+                        glyph.clone(),
+                        Style::default()
+                            .fg(*color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                );
+            }
         });
 
     frame.render_widget(canvas, area);
+}
+
+/// Labels painted above candles for FRVP anchors / live placement cursor.
+/// (x, y, glyph, color)
+fn collect_frvp_pin_labels(
+    app: &App,
+    chart: &Chart,
+    bars: &[OhlcvBar],
+    view_start: usize,
+    visible: &[OhlcvBar],
+    max_p: f64,
+    y_span: f64,
+) -> Vec<(f64, f64, String, Color)> {
+    let mut out: Vec<(f64, f64, String, Color)> = Vec::new();
+    let pin_y = |bar: &OhlcvBar| -> f64 {
+        (bar.high + y_span * 0.04).min(max_p - y_span * 0.01)
+    };
+    let bar_x = |global_i: usize| -> Option<(f64, &OhlcvBar)> {
+        if global_i < view_start || global_i >= view_start + visible.len() {
+            return None;
+        }
+        let local = global_i - view_start;
+        Some((local as f64 + 0.5, &visible[local]))
+    };
+    let nearest_idx = |ts: i64| -> Option<usize> {
+        if bars.is_empty() {
+            return None;
+        }
+        Some(
+            bars.iter()
+                .enumerate()
+                .min_by_key(|(_, b)| (b.ts - ts).abs())
+                .map(|(i, _)| i)
+                .unwrap_or(0),
+        )
+    };
+
+    // Locked anchors for enabled Fixed Range instances.
+    for cfg in chart
+        .indicators
+        .iter()
+        .filter(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
+    {
+        if let Some(ts) = cfg.start {
+            if let Some(i) = nearest_idx(ts) {
+                if let Some((x, bar)) = bar_x(i) {
+                    out.push((x, pin_y(bar), "▲".into(), Color::Cyan));
+                }
+            }
+        }
+        if let Some(ts) = cfg.end {
+            if let Some(i) = nearest_idx(ts) {
+                if let Some((x, bar)) = bar_x(i) {
+                    out.push((x, pin_y(bar), "▲".into(), Color::Magenta));
+                }
+            }
+        }
+    }
+
+    // Live placement session for this chart.
+    if let Some(place) = app.frvp_place.as_ref() {
+        if place.chart_id == chart.id {
+            if let Some(start_i) = place.start_bar {
+                if let Some((x, bar)) = bar_x(start_i) {
+                    out.push((x, pin_y(bar), "▲".into(), Color::Cyan));
+                }
+            }
+            if let Some((x, bar)) = bar_x(place.cursor_bar.min(bars.len().saturating_sub(1))) {
+                let glyph = match place.phase {
+                    FrvpPinPhase::Start => "▼",
+                    FrvpPinPhase::End => "▼",
+                };
+                out.push((x, pin_y(bar), glyph.into(), Color::Yellow));
+                // Extra bright stem down the wick so the pin is hard to miss.
+                out.push((
+                    x,
+                    bar.high,
+                    "●".into(),
+                    Color::Yellow,
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Precomputed VP geometry in candle-index / price coordinates.
@@ -1107,10 +1291,16 @@ fn feed_line(app: &App) -> Line<'static> {
         .last_heartbeat_ts
         .map(|ts| format!("  heartbeat={ts:.0}"))
         .unwrap_or_default();
+    let err = app
+        .last_indicator_error
+        .as_ref()
+        .map(|m| format!("  ind-err={m}"))
+        .unwrap_or_default();
 
     Line::from(vec![
         Span::raw("feed: "),
         Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::raw(format!("  vendor={vendor}{hb}")),
+        Span::styled(err, Style::default().fg(Color::Red)),
     ])
 }

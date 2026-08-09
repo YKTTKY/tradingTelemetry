@@ -549,6 +549,8 @@ pub enum IpcEvent {
 pub enum IpcError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("{0}")]
+    Status(String),
     #[error("WebSocket error: {0}")]
     Ws(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("JSON error: {0}")]
@@ -593,14 +595,25 @@ pub async fn post_indicators(
         chart_id: chart_id.to_string(),
         indicators: indicators.to_vec(),
     };
-    let response: IndicatorsApplyResponse = client
+    let resp = client
         .post(endpoint.indicators_url())
         .json(&body)
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // Prefer FastAPI `{"detail": "..."}` so the trader sees the real reason.
+        let detail = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("detail")
+                    .map(|d| d.as_str().map(|s| s.to_string()).unwrap_or_else(|| d.to_string()))
+            })
+            .unwrap_or(text);
+        return Err(IpcError::Status(format!("{status}: {detail}")));
+    }
+    let response: IndicatorsApplyResponse = resp.json().await?;
     Ok(response)
 }
 

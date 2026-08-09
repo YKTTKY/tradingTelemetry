@@ -60,6 +60,29 @@ impl LayoutMode {
     }
 }
 
+/// Which pin the trader is setting for Fixed Range VP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrvpPinPhase {
+    /// Bright cursor over a bar — Enter locks the range start.
+    Start,
+    /// Start is locked; cursor moves for the range end.
+    End,
+}
+
+/// Interactive two-pin range placement on the price chart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrvpPlaceState {
+    pub chart_id: String,
+    pub indicator_id: String,
+    pub phase: FrvpPinPhase,
+    /// Index into the chart's full bar series.
+    pub cursor_bar: usize,
+    /// Locked start bar index once phase is End (and after completion until cleared).
+    pub start_bar: Option<usize>,
+    /// If true, Esc removes the indicator (new add cancelled mid-place).
+    pub is_new: bool,
+}
+
 /// Modal input for instrument selection and watchlist add.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
@@ -68,6 +91,8 @@ pub enum InputMode {
     WatchlistAddPrompt { buffer: String },
     /// Indicator panel for the focused chart (add / toggle / configure).
     IndicatorPanel,
+    /// Two-pin Fixed Range VP placement on the focused chart.
+    FrvpPlacing,
 }
 
 /// Pending HTTP mutation against the engine watchlist API.
@@ -238,6 +263,10 @@ pub struct App {
     /// Selected row in the indicator panel list.
     pub indicator_selected: usize,
     pub input_mode: InputMode,
+    /// Active Fixed Range two-pin placement (when `input_mode == FrvpPlacing`).
+    pub frvp_place: Option<FrvpPlaceState>,
+    /// Last engine error from indicator apply (shown in chrome).
+    pub last_indicator_error: Option<String>,
     /// Floating keyboard-shortcut help overlay (does not replace input_mode).
     pub help_open: bool,
     pub should_quit: bool,
@@ -266,6 +295,8 @@ impl Default for App {
             pending_indicators: None,
             indicator_selected: 0,
             input_mode: InputMode::Normal,
+            frvp_place: None,
+            last_indicator_error: None,
             help_open: false,
             should_quit: false,
         }
@@ -722,9 +753,23 @@ impl App {
         self.arm_indicators_apply();
     }
 
-    /// Add Fixed Range Volume Profile (max 4). Anchors default to first/last bar ts.
+    /// Add Fixed Range VP (max 4) and enter two-pin placement on the chart.
+    ///
+    /// Does **not** POST to the engine until both pins are confirmed with Enter.
     pub fn indicator_add_fixed_range_vp(&mut self) {
-        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel | InputMode::Normal) {
+            return;
+        }
+        if matches!(self.input_mode, InputMode::FrvpPlacing) {
+            return;
+        }
+        let bar_count = match &self.focused_chart().series {
+            ChartSeriesState::Available { bars } => bars.len(),
+            _ => 0,
+        };
+        if bar_count == 0 {
+            self.last_indicator_error =
+                Some("Fixed Range VP needs bars on the chart before placing pins".into());
             return;
         }
         let chart = self.focused_chart_mut();
@@ -734,25 +779,189 @@ impl App {
             .filter(|i| i.indicator_type == "fixed_range_vp")
             .count();
         if count >= MAX_FIXED_RANGE_VP {
+            self.last_indicator_error = Some(format!(
+                "Fixed Range VP limit is {MAX_FIXED_RANGE_VP} per chart"
+            ));
             return;
         }
-        let (start, end, has_bars) = match &chart.series {
-            ChartSeriesState::Available { bars } if !bars.is_empty() => {
-                let start = bars.first().map(|b| b.ts).unwrap_or(0);
-                let end = bars.last().map(|b| b.ts).unwrap_or(start);
-                (start, end.max(start), true)
-            }
-            // Placeholder until bars arrive; apply_chart_series backfills anchors.
-            _ => (0, 0, false),
-        };
+        // Provisional equal anchors; replaced when both pins lock.
         let id = format!("frvp{}", count + 1);
-        chart
-            .indicators
-            .push(IndicatorConfig::fixed_range_vp_default(id, start, end));
-        self.indicator_selected = chart.indicators.len().saturating_sub(1);
-        if has_bars {
-            self.arm_indicators_apply();
+        let provisional_ts = match &chart.series {
+            ChartSeriesState::Available { bars } => bars.last().map(|b| b.ts).unwrap_or(0),
+            _ => 0,
+        };
+        let chart_id = chart.id.clone();
+        chart.indicators.push(IndicatorConfig::fixed_range_vp_default(
+            id.clone(),
+            provisional_ts,
+            provisional_ts,
+        ));
+        // Disable until placed so we don't draw a junk full-width profile.
+        if let Some(last) = chart.indicators.last_mut() {
+            last.enabled = false;
         }
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        let cursor = bar_count.saturating_sub(1);
+        self.frvp_place = Some(FrvpPlaceState {
+            chart_id,
+            indicator_id: id,
+            phase: FrvpPinPhase::Start,
+            cursor_bar: cursor,
+            start_bar: None,
+            is_new: true,
+        });
+        self.input_mode = InputMode::FrvpPlacing;
+        self.last_indicator_error = None;
+    }
+
+    /// Re-place pins for the selected Fixed Range VP (`r` in the indicator panel).
+    pub fn indicator_replace_frvp_pins(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let (id, chart_id) = {
+            let chart = self.focused_chart();
+            let cfg = &chart.indicators[idx];
+            if cfg.indicator_type != "fixed_range_vp" {
+                return;
+            }
+            (cfg.id.clone(), chart.id.clone())
+        };
+        let bar_count = match &self.focused_chart().series {
+            ChartSeriesState::Available { bars } => bars.len(),
+            _ => 0,
+        };
+        if bar_count == 0 {
+            self.last_indicator_error =
+                Some("Fixed Range VP needs bars on the chart before placing pins".into());
+            return;
+        }
+        // Seed cursor near existing start anchor when possible.
+        let cursor = {
+            let chart = self.focused_chart();
+            let start_ts = chart.indicators[idx].start.unwrap_or(0);
+            match &chart.series {
+                ChartSeriesState::Available { bars } => bars
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| (b.ts - start_ts).abs())
+                    .map(|(i, _)| i)
+                    .unwrap_or(bar_count.saturating_sub(1)),
+                _ => bar_count.saturating_sub(1),
+            }
+        };
+        self.frvp_place = Some(FrvpPlaceState {
+            chart_id,
+            indicator_id: id,
+            phase: FrvpPinPhase::Start,
+            cursor_bar: cursor,
+            start_bar: None,
+            is_new: false,
+        });
+        self.input_mode = InputMode::FrvpPlacing;
+        self.last_indicator_error = None;
+    }
+
+    pub fn frvp_place_move(&mut self, delta: i32) {
+        let Some(place) = self.frvp_place.as_mut() else {
+            return;
+        };
+        let bar_count = self
+            .charts
+            .iter()
+            .find(|c| c.id == place.chart_id)
+            .and_then(|c| match &c.series {
+                ChartSeriesState::Available { bars } => Some(bars.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if bar_count == 0 {
+            return;
+        }
+        let next = (place.cursor_bar as i32 + delta).clamp(0, bar_count as i32 - 1) as usize;
+        place.cursor_bar = next;
+    }
+
+    /// Enter locks the current pin; after end pin, enables the FRVP and applies.
+    pub fn frvp_place_confirm(&mut self) {
+        let Some(place) = self.frvp_place.clone() else {
+            return;
+        };
+        let chart_idx = match self.charts.iter().position(|c| c.id == place.chart_id) {
+            Some(i) => i,
+            None => {
+                self.frvp_place = None;
+                self.input_mode = InputMode::Normal;
+                return;
+            }
+        };
+        let bars: Vec<OhlcvBar> = match &self.charts[chart_idx].series {
+            ChartSeriesState::Available { bars } => bars.clone(),
+            _ => {
+                self.last_indicator_error = Some("no bars for pin placement".into());
+                return;
+            }
+        };
+        if bars.is_empty() || place.cursor_bar >= bars.len() {
+            return;
+        }
+
+        match place.phase {
+            FrvpPinPhase::Start => {
+                self.frvp_place = Some(FrvpPlaceState {
+                    phase: FrvpPinPhase::End,
+                    start_bar: Some(place.cursor_bar),
+                    // Nudge cursor one bar right for the end pin when possible.
+                    cursor_bar: (place.cursor_bar + 1).min(bars.len() - 1),
+                    ..place
+                });
+            }
+            FrvpPinPhase::End => {
+                let start_i = place.start_bar.unwrap_or(place.cursor_bar);
+                let end_i = place.cursor_bar;
+                let (lo, hi) = if start_i <= end_i {
+                    (start_i, end_i)
+                } else {
+                    (end_i, start_i)
+                };
+                let start_ts = bars[lo].ts;
+                let end_ts = bars[hi].ts;
+                let ind_id = place.indicator_id.clone();
+                if let Some(cfg) = self.charts[chart_idx]
+                    .indicators
+                    .iter_mut()
+                    .find(|c| c.id == ind_id)
+                {
+                    cfg.start = Some(start_ts);
+                    cfg.end = Some(end_ts);
+                    cfg.enabled = true;
+                }
+                self.frvp_place = None;
+                self.input_mode = InputMode::Normal;
+                self.focused = chart_idx;
+                self.arm_indicators_apply();
+            }
+        }
+    }
+
+    pub fn frvp_place_cancel(&mut self) {
+        let Some(place) = self.frvp_place.take() else {
+            self.input_mode = InputMode::Normal;
+            return;
+        };
+        if place.is_new {
+            if let Some(chart) = self.charts.iter_mut().find(|c| c.id == place.chart_id) {
+                chart.indicators.retain(|c| c.id != place.indicator_id);
+                chart.indicator_series.remove(&place.indicator_id);
+            }
+            self.clamp_indicator_selection();
+        }
+        self.input_mode = InputMode::Normal;
     }
 
     pub fn indicator_toggle_selected(&mut self) {
@@ -983,6 +1192,7 @@ impl App {
             chart.indicators = body.indicators;
             chart.indicator_series = body.series;
         }
+        self.last_indicator_error = None;
         self.clamp_indicator_selection();
     }
 
@@ -1082,7 +1292,7 @@ impl App {
                     }
                 }
             }
-            InputMode::Normal | InputMode::IndicatorPanel => {}
+            InputMode::Normal | InputMode::IndicatorPanel | InputMode::FrvpPlacing => {}
         }
     }
 
@@ -1092,7 +1302,7 @@ impl App {
             | InputMode::WatchlistAddPrompt { buffer } => {
                 buffer.pop();
             }
-            InputMode::Normal | InputMode::IndicatorPanel => {}
+            InputMode::Normal | InputMode::IndicatorPanel | InputMode::FrvpPlacing => {}
         }
     }
 
@@ -1197,8 +1407,9 @@ impl App {
             IpcEvent::WatchlistFailed { message: _ } => {
                 // Leave membership unchanged; trader can retry.
             }
-            IpcEvent::IndicatorsFailed { message: _ } => {
-                // Leave local indicator draft; trader can retry panel action.
+            IpcEvent::IndicatorsFailed { message } => {
+                // Leave local indicator draft; surface engine reason (often 422 detail).
+                self.last_indicator_error = Some(message);
             }
             IpcEvent::Disconnected { reason } => {
                 self.connection = ConnectionStatus::Disconnected { reason };
@@ -1220,8 +1431,8 @@ impl App {
         if series.instrument != chart.instrument || series.timeframe != chart.timeframe {
             return;
         }
-        // Interest always carries the engine's config list (may be empty = naked).
-        // Keep local draft Fixed Range rows that were not yet applied (e.g. added before bars).
+        // Interest carries the engine config list. Keep local drafts still being placed
+        // (not yet POSTed) so a chart reload does not wipe an in-progress FRVP pin session.
         let local_pending_frvp: Vec<IndicatorConfig> = chart
             .indicators
             .iter()
@@ -1237,34 +1448,6 @@ impl App {
         match series.status.as_str() {
             "ok" => {
                 chart.series = ChartSeriesState::Available { bars: series.bars };
-                // Backfill placeholder (0,0) anchors to first/last bar and persist.
-                let (first_ts, last_ts) = match &chart.series {
-                    ChartSeriesState::Available { bars } if !bars.is_empty() => {
-                        let s = bars.first().map(|b| b.ts).unwrap_or(0);
-                        let e = bars.last().map(|b| b.ts).unwrap_or(s).max(s);
-                        (s, e)
-                    }
-                    _ => return,
-                };
-                let mut need_apply = false;
-                for ind in &mut chart.indicators {
-                    if ind.indicator_type == "fixed_range_vp"
-                        && ind.start.unwrap_or(0) == 0
-                        && ind.end.unwrap_or(0) == 0
-                    {
-                        ind.start = Some(first_ts);
-                        ind.end = Some(last_ts);
-                        need_apply = true;
-                    }
-                }
-                if need_apply {
-                    let chart_id = chart.id.clone();
-                    let indicators = chart.indicators.clone();
-                    self.pending_indicators = Some(PendingIndicatorsApply {
-                        chart_id,
-                        indicators,
-                    });
-                }
             }
             "unavailable" => {
                 chart.series = ChartSeriesState::Unavailable;
@@ -2089,6 +2272,100 @@ mod tests {
                 symbol: "SPY".into()
             })
         );
+    }
+
+    #[test]
+    fn fixed_range_vp_two_pin_placement_locks_start_then_end() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        let bars: Vec<OhlcvBar> = (0..5)
+            .map(|i| OhlcvBar {
+                ts: 1_700_000_000 + i * 60,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+            })
+            .collect();
+        app.apply_chart_series(ChartInterestResponse {
+            status: "ok".into(),
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            chart_id: Some("primary".into()),
+            bars: bars.clone(),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_add_fixed_range_vp();
+        assert_eq!(app.input_mode, InputMode::FrvpPlacing);
+        assert!(app.frvp_place.is_some());
+        // New FRVP is disabled until both pins lock.
+        let fr = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .find(|i| i.indicator_type == "fixed_range_vp")
+            .expect("frvp added");
+        assert!(!fr.enabled);
+        assert!(app.pending_indicators.is_none());
+
+        // Move to bar 1 and lock start.
+        app.frvp_place_move(-100); // clamp to 0
+        app.frvp_place_move(1);
+        app.frvp_place_confirm();
+        assert_eq!(
+            app.frvp_place.as_ref().map(|p| p.phase),
+            Some(FrvpPinPhase::End)
+        );
+        assert_eq!(app.frvp_place.as_ref().and_then(|p| p.start_bar), Some(1));
+
+        // After start lock, cursor auto-advances one bar (to index 2); nudge once to 3.
+        app.frvp_place_move(1);
+        app.frvp_place_confirm();
+        assert!(app.frvp_place.is_none());
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let fr = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .find(|i| i.indicator_type == "fixed_range_vp")
+            .expect("frvp still present");
+        assert!(fr.enabled);
+        assert_eq!(fr.start, Some(bars[1].ts));
+        assert_eq!(fr.end, Some(bars[3].ts));
+        assert!(app.pending_indicators.is_some());
+    }
+
+    #[test]
+    fn fixed_range_vp_cancel_drops_new_draft() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        app.apply_chart_series(ChartInterestResponse {
+            status: "ok".into(),
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            chart_id: Some("primary".into()),
+            bars: vec![OhlcvBar {
+                ts: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_add_fixed_range_vp();
+        assert_eq!(app.focused_chart().indicators.len(), 1);
+        app.frvp_place_cancel();
+        assert!(app.focused_chart().indicators.is_empty());
+        assert_eq!(app.input_mode, InputMode::Normal);
     }
 
     fn dual_workspace() -> WorkspaceSnapshot {

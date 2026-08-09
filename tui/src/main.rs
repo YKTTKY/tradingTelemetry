@@ -207,11 +207,26 @@ fn handle_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Up => app.indicator_select_delta(-1),
             KeyCode::Down => app.indicator_select_delta(1),
-            KeyCode::Char(' ') | KeyCode::Enter => app.indicator_toggle_selected(),
+            KeyCode::Char(' ') => app.indicator_toggle_selected(),
+            KeyCode::Enter => {
+                // Enter on FRVP re-places pins; otherwise toggles enabled.
+                let is_frvp = app
+                    .focused_chart()
+                    .indicators
+                    .get(app.indicator_selected)
+                    .map(|i| i.indicator_type == "fixed_range_vp")
+                    .unwrap_or(false);
+                if is_frvp {
+                    app.indicator_replace_frvp_pins();
+                } else {
+                    app.indicator_toggle_selected();
+                }
+            }
             KeyCode::Char('m') | KeyCode::Char('M') => app.indicator_add_default_ma_stack(),
             KeyCode::Char('v') | KeyCode::Char('V') => app.indicator_add_volume(),
             KeyCode::Char('p') | KeyCode::Char('P') => app.indicator_add_session_vp(),
             KeyCode::Char('f') | KeyCode::Char('F') => app.indicator_add_fixed_range_vp(),
+            KeyCode::Char('r') | KeyCode::Char('R') => app.indicator_replace_frvp_pins(),
             KeyCode::Char('e') | KeyCode::Char('E') => app.indicator_toggle_frvp_extend(),
             KeyCode::Char(',') => app.indicator_nudge_frvp_anchor(0, -1),
             KeyCode::Char('.') => app.indicator_nudge_frvp_anchor(0, 1),
@@ -227,6 +242,19 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('2') => app.indicator_toggle_vp_level(1),
             KeyCode::Char('3') => app.indicator_toggle_vp_level(2),
             KeyCode::Tab => app.focus_next(),
+            KeyCode::Char('q') => app.quit(),
+            _ => {}
+        },
+        InputMode::FrvpPlacing => match code {
+            // `?` only for help — h/l are vim-style pin nudges here.
+            KeyCode::Char('?') => app.toggle_help(),
+            KeyCode::Esc => app.frvp_place_cancel(),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => app.frvp_place_move(-1),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => app.frvp_place_move(1),
+            // Faster scrub across long histories.
+            KeyCode::Char('[') => app.frvp_place_move(-10),
+            KeyCode::Char(']') => app.frvp_place_move(10),
+            KeyCode::Enter | KeyCode::Char(' ') => app.frvp_place_confirm(),
             KeyCode::Char('q') => app.quit(),
             _ => {}
         },

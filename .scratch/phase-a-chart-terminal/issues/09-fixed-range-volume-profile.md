@@ -19,4 +19,5 @@
 - Parent spec: `.scratch/phase-a-chart-terminal/spec.md`
 - Can proceed in parallel with 08 and 10 after 07
 - Engine type: `fixed_range_vp`. Series profile fields: `range_start`, `range_end`, `anchor_end`, `levels_end`, `extend_to_right`.
-- TUI: `f` add · `e` toggle extend · `,`/`.` nudge start · `</>` nudge end · `s` placement · `1`/`2`/`3` POC/VAH/VAL
+- TUI two-pin placement: `f` add → yellow **▼** cursor on candle · `←`/`→` move · **Enter** lock start then end · cyan **▲** start / magenta **▲** end. `r`/Enter re-pin. `e` extend · `s` placement · `1`/`2`/`3` levels.
+- Restart **both** engine and TUI after pulling this so the engine accepts `fixed_range_vp` (old engines 422 the type).
