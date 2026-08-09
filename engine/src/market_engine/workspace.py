@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from market_engine.indicators import IndicatorConfig, indicators_from_storage
+
 LayoutMode = Literal["single", "dual-vertical"]
 
 LAYOUT_SINGLE: LayoutMode = "single"
@@ -107,17 +109,34 @@ class WorkspaceState:
     primary: ChartSelection = field(default_factory=default_single)
     dual_top: ChartSelection = field(default_factory=default_dual_top)
     dual_bottom: ChartSelection = field(default_factory=default_dual_bottom)
+    primary_indicators: list[IndicatorConfig] = field(default_factory=list)
+    dual_top_indicators: list[IndicatorConfig] = field(default_factory=list)
+    dual_bottom_indicators: list[IndicatorConfig] = field(default_factory=list)
     watchlists: list[Watchlist] = field(default_factory=lambda: default_watchlists())
     active_watchlist_id: str = WATCHLIST_CORE_ID
 
-    def active_charts(self) -> list[dict[str, str]]:
+    def active_charts(self) -> list[dict[str, Any]]:
         """Charts visible for the current layout (for snapshot / TUI restore)."""
         if self.layout_mode == LAYOUT_DUAL:
             return [
-                {"id": CHART_TOP, **self.dual_top.to_dict()},
-                {"id": CHART_BOTTOM, **self.dual_bottom.to_dict()},
+                {
+                    "id": CHART_TOP,
+                    **self.dual_top.to_dict(),
+                    "indicators": [c.to_public() for c in self.dual_top_indicators],
+                },
+                {
+                    "id": CHART_BOTTOM,
+                    **self.dual_bottom.to_dict(),
+                    "indicators": [c.to_public() for c in self.dual_bottom_indicators],
+                },
             ]
-        return [{"id": CHART_PRIMARY, **self.primary.to_dict()}]
+        return [
+            {
+                "id": CHART_PRIMARY,
+                **self.primary.to_dict(),
+                "indicators": [c.to_public() for c in self.primary_indicators],
+            }
+        ]
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -182,6 +201,33 @@ class WorkspaceState:
             return self.dual_bottom
         raise ValueError(f"unknown chart_id: {chart_id}")
 
+    def indicators_for(self, chart_id: str) -> list[IndicatorConfig]:
+        if chart_id == CHART_PRIMARY:
+            return list(self.primary_indicators)
+        if chart_id == CHART_TOP:
+            return list(self.dual_top_indicators)
+        if chart_id == CHART_BOTTOM:
+            return list(self.dual_bottom_indicators)
+        raise ValueError(f"unknown chart_id: {chart_id}")
+
+    def set_indicators(self, chart_id: str, configs: list[IndicatorConfig]) -> None:
+        if chart_id == CHART_PRIMARY:
+            self.primary_indicators = list(configs)
+        elif chart_id == CHART_TOP:
+            self.dual_top_indicators = list(configs)
+        elif chart_id == CHART_BOTTOM:
+            self.dual_bottom_indicators = list(configs)
+        else:
+            raise ValueError(f"unknown chart_id: {chart_id}")
+
+    def all_chart_indicator_slots(self) -> list[tuple[str, list[IndicatorConfig]]]:
+        """Every persisted chart slot (including inactive layout memory)."""
+        return [
+            (CHART_PRIMARY, list(self.primary_indicators)),
+            (CHART_TOP, list(self.dual_top_indicators)),
+            (CHART_BOTTOM, list(self.dual_bottom_indicators)),
+        ]
+
     def active_watchlist(self) -> Watchlist:
         for wl in self.watchlists:
             if wl.id == self.active_watchlist_id:
@@ -230,6 +276,11 @@ class WorkspaceState:
             "primary": self.primary.to_dict(),
             "dual_top": self.dual_top.to_dict(),
             "dual_bottom": self.dual_bottom.to_dict(),
+            "primary_indicators": [c.to_storage() for c in self.primary_indicators],
+            "dual_top_indicators": [c.to_storage() for c in self.dual_top_indicators],
+            "dual_bottom_indicators": [
+                c.to_storage() for c in self.dual_bottom_indicators
+            ],
             "watchlists": [wl.to_storage() for wl in self.watchlists],
             "active_watchlist_id": self.active_watchlist_id,
         }
@@ -265,6 +316,15 @@ class WorkspaceState:
             primary=_sel("primary", default_single()),
             dual_top=_sel("dual_top", default_dual_top()),
             dual_bottom=_sel("dual_bottom", default_dual_bottom()),
+            primary_indicators=indicators_from_storage(
+                data.get("primary_indicators")
+            ),
+            dual_top_indicators=indicators_from_storage(
+                data.get("dual_top_indicators")
+            ),
+            dual_bottom_indicators=indicators_from_storage(
+                data.get("dual_bottom_indicators")
+            ),
             watchlists=watchlists,
             active_watchlist_id=active,
         )
@@ -358,6 +418,13 @@ class WorkspaceStore:
     def set_chart(self, chart_id: str, instrument: str, timeframe: str) -> None:
         self.state.set_chart(chart_id, instrument, timeframe)
         self.save()
+
+    def set_indicators(
+        self, chart_id: str, configs: list[IndicatorConfig]
+    ) -> dict[str, Any]:
+        self.state.set_indicators(chart_id, configs)
+        self.save()
+        return self.state.to_public()
 
     def set_active_watchlist(self, watchlist_id: str) -> dict[str, Any]:
         self.state.set_active_watchlist(watchlist_id)

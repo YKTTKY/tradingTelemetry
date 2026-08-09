@@ -58,6 +58,12 @@ impl EngineEndpoint {
             .expect("watchlist remove path joins base")
     }
 
+    pub fn indicators_url(&self) -> Url {
+        self.base
+            .join("/v1/indicators")
+            .expect("indicators path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -78,10 +84,74 @@ pub struct FeedSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IndicatorConfig {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub indicator_type: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ma_type: Option<String>,
+    #[serde(default)]
+    pub length: Option<i64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IndicatorSeriesData {
+    #[serde(rename = "type")]
+    pub series_type: String,
+    pub values: Vec<Option<f64>>,
+    #[serde(default)]
+    pub ma_type: Option<String>,
+    #[serde(default)]
+    pub length: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ChartIndicatorsPayload {
+    #[serde(default)]
+    pub indicators: Vec<IndicatorConfig>,
+    #[serde(default)]
+    pub series: std::collections::HashMap<String, IndicatorSeriesData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IndicatorsApplyRequest {
+    pub chart_id: String,
+    pub indicators: Vec<IndicatorConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IndicatorsApplyResponse {
+    pub chart_id: String,
+    #[serde(default)]
+    pub indicators: Vec<IndicatorConfig>,
+    #[serde(default)]
+    pub series: std::collections::HashMap<String, IndicatorSeriesData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IndicatorUpdateEvent {
+    pub chart_id: String,
+    pub instrument: String,
+    pub timeframe: String,
+    #[serde(default)]
+    pub indicators: Vec<IndicatorConfig>,
+    #[serde(default)]
+    pub series: std::collections::HashMap<String, IndicatorSeriesData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkspaceChartSnapshot {
     pub id: String,
     pub instrument: String,
     pub timeframe: String,
+    #[serde(default)]
+    pub indicators: Vec<IndicatorConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -122,6 +192,8 @@ struct SnapshotBody {
     workspace: Option<WorkspaceSnapshot>,
     #[serde(default)]
     quotes: Vec<QuoteRow>,
+    #[serde(default)]
+    indicators: std::collections::HashMap<String, ChartIndicatorsPayload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -172,6 +244,10 @@ pub struct ChartInterestResponse {
     pub bars: Vec<OhlcvBar>,
     #[serde(default)]
     pub chart_id: Option<String>,
+    #[serde(default)]
+    pub indicators: Vec<IndicatorConfig>,
+    #[serde(default)]
+    pub series: std::collections::HashMap<String, IndicatorSeriesData>,
 }
 
 /// Live bar tip update from the engine (conflated WebSocket event).
@@ -218,6 +294,7 @@ pub enum IpcEvent {
         feed: FeedSnapshot,
         workspace: Option<WorkspaceSnapshot>,
         quotes: Vec<QuoteRow>,
+        indicators: std::collections::HashMap<String, ChartIndicatorsPayload>,
     },
     FeedStatus {
         status: String,
@@ -229,6 +306,8 @@ pub enum IpcEvent {
     ChartSeries(ChartInterestResponse),
     BarUpdate(BarUpdateEvent),
     QuoteUpdate(QuoteUpdateEvent),
+    IndicatorUpdate(IndicatorUpdateEvent),
+    IndicatorsApplied(IndicatorsApplyResponse),
     Workspace(WorkspaceSnapshot),
     WatchlistState {
         workspace: WorkspaceSnapshot,
@@ -244,6 +323,9 @@ pub enum IpcEvent {
         message: String,
     },
     WatchlistFailed {
+        message: String,
+    },
+    IndicatorsFailed {
         message: String,
     },
     Disconnected {
@@ -265,7 +347,15 @@ pub enum IpcError {
 
 pub async fn fetch_snapshot(
     endpoint: &EngineEndpoint,
-) -> Result<(FeedSnapshot, Option<WorkspaceSnapshot>, Vec<QuoteRow>), IpcError> {
+) -> Result<
+    (
+        FeedSnapshot,
+        Option<WorkspaceSnapshot>,
+        Vec<QuoteRow>,
+        std::collections::HashMap<String, ChartIndicatorsPayload>,
+    ),
+    IpcError,
+> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
@@ -276,7 +366,30 @@ pub async fn fetch_snapshot(
         .error_for_status()?
         .json()
         .await?;
-    Ok((body.feed, body.workspace, body.quotes))
+    Ok((body.feed, body.workspace, body.quotes, body.indicators))
+}
+
+pub async fn post_indicators(
+    endpoint: &EngineEndpoint,
+    chart_id: &str,
+    indicators: &[IndicatorConfig],
+) -> Result<IndicatorsApplyResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = IndicatorsApplyRequest {
+        chart_id: chart_id.to_string(),
+        indicators: indicators.to_vec(),
+    };
+    let response: IndicatorsApplyResponse = client
+        .post(endpoint.indicators_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
 }
 
 pub async fn post_chart_interest(
@@ -411,7 +524,7 @@ async fn connect_session(
     endpoint: &EngineEndpoint,
     tx: &mpsc::UnboundedSender<IpcEvent>,
 ) -> Result<(), String> {
-    let (feed, workspace, quotes) = fetch_snapshot(endpoint)
+    let (feed, workspace, quotes, indicators) = fetch_snapshot(endpoint)
         .await
         .map_err(|e| e.to_string())?;
     if tx
@@ -419,6 +532,7 @@ async fn connect_session(
             feed,
             workspace,
             quotes,
+            indicators,
         })
         .is_err()
     {
@@ -483,6 +597,18 @@ async fn connect_session(
                                 }
                                 Err(_) => {
                                     // Ignore malformed quote_update frames.
+                                }
+                            }
+                        }
+                        Some("indicator_update") => {
+                            match serde_json::from_value::<IndicatorUpdateEvent>(value) {
+                                Ok(update) => {
+                                    if tx.send(IpcEvent::IndicatorUpdate(update)).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                Err(_) => {
+                                    // Ignore malformed indicator_update frames.
                                 }
                             }
                         }

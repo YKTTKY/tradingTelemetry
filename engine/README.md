@@ -38,13 +38,14 @@ Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts + watchlists) + `quotes` |
+| `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts + watchlists + per-chart indicator configs) + `quotes` + hot `indicators` series |
 | `POST /v1/workspace` | Set `layout_mode` (`single` \| `dual-vertical`); persists to disk |
-| `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` (+ optional `chart_id`); arms live updates; persists selection |
+| `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` (+ optional `chart_id`); arms live updates; persists selection; returns indicator series when configured |
+| `POST /v1/indicators` | Full-replace indicator list for one `chart_id` (MA ≤3, Volume ≤1); rejects over-limit; persists; returns configs + series |
 | `POST /v1/watchlist/active` | Switch active watchlist (`watchlist_id`); persists |
 | `POST /v1/watchlist/add` | Add `symbol` to the active watchlist; persists; returns workspace + quotes |
 | `POST /v1/watchlist/remove` | Remove `symbol` from the active watchlist; persists |
-| `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` + `quote_update` |
+| `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` + `quote_update` + `indicator_update` |
 
 **Workspace file:** default `~/.local/share/trading-telemetry/workspace.json` (override with `--workspace` or `MARKET_ENGINE_WORKSPACE`). No Redis/Postgres.
 
@@ -60,7 +61,7 @@ Example snapshot:
   "workspace": {
     "layout_mode": "single",
     "charts": [
-      {"id": "primary", "instrument": "SPY", "timeframe": "1D"}
+      {"id": "primary", "instrument": "SPY", "timeframe": "1D", "indicators": []}
     ],
     "watchlists": [
       {"id": "core", "name": "Core", "symbols": ["ES", "NQ", "SPY", "QQQ", "SOXL"]},
@@ -70,8 +71,22 @@ Example snapshot:
   },
   "quotes": [
     {"symbol": "SPY", "status": "ok", "last": 548.0, "previous_close": 546.25, "change": 1.75, "change_pct": 0.003203}
-  ]
+  ],
+  "indicators": {}
 }
+```
+
+**Indicators:** Charts open **naked** (`indicators: []`) until configured. `POST /v1/indicators` applies a full list for one chart only (dual charts are independent). Limits are **rejected** (HTTP 422), not clamped: **MA ≤ 3** lines, **Volume ≤ 1**. MA lines support `ma_type` `sma`|`ema` and `length`; default stack lengths are **10 / 60 / 200**. Volume is a per-bar histogram series. Configs restore from the workspace file; series recompute on interest and live bar updates (`indicator_update` WS frames).
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/v1/indicators \
+  -H 'Content-Type: application/json' \
+  -d '{"chart_id":"primary","indicators":[
+    {"id":"ma10","type":"ma","enabled":true,"ma_type":"sma","length":10},
+    {"id":"ma60","type":"ma","enabled":true,"ma_type":"sma","length":60},
+    {"id":"ma200","type":"ma","enabled":true,"ma_type":"sma","length":200},
+    {"id":"vol","type":"volume","enabled":true}
+  ]}'
 ```
 
 **Watchlists:** multiple named lists (default **Core** + empty **Focus**). Core first-launch symbols: **ES, NQ, SPY, QQQ, SOXL**, plus **VIX** only when the vendor resolves it. Quote fields: `last`, `previous_close`, `change` (last − previous close), `change_pct` (change / previous close). Unavailable symbols return `status: "unavailable"` without failing the list. Live `quote_update` frames are conflated like bars.

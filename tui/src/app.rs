@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 
 use crate::ipc::{
-    BarUpdateEvent, ChartInterestResponse, FeedSnapshot, IpcEvent, OhlcvBar, QuoteRow,
-    QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
+    BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IpcEvent,
+    IndicatorConfig, IndicatorSeriesData, IndicatorUpdateEvent, IndicatorsApplyResponse, OhlcvBar,
+    QuoteRow, QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
 };
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
@@ -65,6 +66,8 @@ pub enum InputMode {
     Normal,
     InstrumentPrompt { buffer: String },
     WatchlistAddPrompt { buffer: String },
+    /// Indicator panel for the focused chart (add / toggle / configure).
+    IndicatorPanel,
 }
 
 /// Pending HTTP mutation against the engine watchlist API.
@@ -74,6 +77,16 @@ pub enum PendingWatchlistOp {
     Add { symbol: String },
     Remove { symbol: String },
 }
+
+/// Pending full-replace indicator apply for one chart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingIndicatorsApply {
+    pub chart_id: String,
+    pub indicators: Vec<IndicatorConfig>,
+}
+
+pub const MAX_MA_LINES: usize = 3;
+pub const DEFAULT_MA_LENGTHS: [i64; 3] = [10, 60, 200];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -109,6 +122,10 @@ pub struct Chart {
     pub instrument: String,
     pub timeframe: String,
     pub series: ChartSeriesState,
+    /// Indicator configs for this chart (naked when empty).
+    pub indicators: Vec<IndicatorConfig>,
+    /// Computed series keyed by indicator id (aligned to bars by index).
+    pub indicator_series: HashMap<String, IndicatorSeriesData>,
 }
 
 impl Chart {
@@ -118,6 +135,8 @@ impl Chart {
             instrument: instrument.into(),
             timeframe: timeframe.into(),
             series: ChartSeriesState::Idle,
+            indicators: Vec::new(),
+            indicator_series: HashMap::new(),
         }
     }
 
@@ -135,6 +154,31 @@ impl Chart {
 
     pub fn title(&self) -> String {
         format!("{} · {}", self.instrument, self.timeframe)
+    }
+
+    pub fn has_volume(&self) -> bool {
+        self.indicators
+            .iter()
+            .any(|i| i.indicator_type == "volume" && i.enabled)
+    }
+
+    pub fn enabled_ma_lines(&self) -> Vec<(&IndicatorConfig, &IndicatorSeriesData)> {
+        self.indicators
+            .iter()
+            .filter(|i| i.indicator_type == "ma" && i.enabled)
+            .filter_map(|cfg| {
+                self.indicator_series
+                    .get(&cfg.id)
+                    .map(|series| (cfg, series))
+            })
+            .collect()
+    }
+
+    pub fn volume_series(&self) -> Option<&IndicatorSeriesData> {
+        self.indicators
+            .iter()
+            .find(|i| i.indicator_type == "volume" && i.enabled)
+            .and_then(|cfg| self.indicator_series.get(&cfg.id))
     }
 }
 
@@ -166,6 +210,10 @@ pub struct App {
     pub watchlist_selected: usize,
     /// When Some, main loop issues the matching watchlist HTTP mutation.
     pub pending_watchlist: Option<PendingWatchlistOp>,
+    /// When Some, main loop POSTs indicator apply for that chart.
+    pub pending_indicators: Option<PendingIndicatorsApply>,
+    /// Selected row in the indicator panel list.
+    pub indicator_selected: usize,
     pub input_mode: InputMode,
     pub should_quit: bool,
 }
@@ -190,6 +238,8 @@ impl Default for App {
             quotes: HashMap::new(),
             watchlist_selected: 0,
             pending_watchlist: None,
+            pending_indicators: None,
+            indicator_selected: 0,
             input_mode: InputMode::Normal,
             should_quit: false,
         }
@@ -419,7 +469,7 @@ impl App {
         self.focused = (self.focused + 1) % self.charts.len();
     }
 
-    /// Apply engine workspace public shape (layout + charts + watchlists).
+    /// Apply engine workspace public shape (layout + charts + watchlists + indicator configs).
     pub fn apply_workspace(&mut self, ws: WorkspaceSnapshot) {
         self.layout = LayoutMode::from_engine(&ws.layout_mode);
         if ws.charts.is_empty() {
@@ -433,12 +483,17 @@ impl App {
             self.charts = ws
                 .charts
                 .into_iter()
-                .map(|c| Chart::new(c.id, c.instrument, c.timeframe))
+                .map(|c| {
+                    let mut chart = Chart::new(c.id, c.instrument, c.timeframe);
+                    chart.indicators = c.indicators;
+                    chart
+                })
                 .collect();
         }
         if self.focused >= self.charts.len() {
             self.focused = 0;
         }
+        self.clamp_indicator_selection();
         if !ws.watchlists.is_empty() {
             self.watchlists = ws.watchlists;
             self.active_watchlist_id = if !ws.active_watchlist_id.is_empty()
@@ -455,10 +510,282 @@ impl App {
         }
     }
 
+    pub fn apply_indicator_payloads(
+        &mut self,
+        payloads: HashMap<String, ChartIndicatorsPayload>,
+    ) {
+        for (chart_id, payload) in payloads {
+            if let Some(chart) = self.charts.iter_mut().find(|c| c.id == chart_id) {
+                // Always take engine configs (including empty = naked).
+                chart.indicators = payload.indicators;
+                chart.indicator_series = payload.series;
+            }
+        }
+        self.clamp_indicator_selection();
+    }
+
+    fn clamp_indicator_selection(&mut self) {
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            self.indicator_selected = 0;
+        } else if self.indicator_selected >= n {
+            self.indicator_selected = n - 1;
+        }
+    }
+
+    pub fn toggle_indicator_panel(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        match self.input_mode {
+            InputMode::Normal => {
+                self.input_mode = InputMode::IndicatorPanel;
+                self.clamp_indicator_selection();
+            }
+            InputMode::IndicatorPanel => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn close_indicator_panel(&mut self) {
+        if matches!(self.input_mode, InputMode::IndicatorPanel) {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn indicator_select_delta(&mut self, delta: i32) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            self.indicator_selected = 0;
+            return;
+        }
+        let cur = self.indicator_selected.min(n - 1) as i32;
+        self.indicator_selected = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    fn arm_indicators_apply(&mut self) {
+        let chart = self.focused_chart();
+        self.pending_indicators = Some(PendingIndicatorsApply {
+            chart_id: chart.id.clone(),
+            indicators: chart.indicators.clone(),
+        });
+    }
+
+    pub fn indicators_request_started(&mut self) {
+        self.pending_indicators = None;
+    }
+
+    /// Add default MA stack (SMA 10/60/200), or fill remaining default lengths up to max 3.
+    pub fn indicator_add_default_ma_stack(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let existing_lengths: std::collections::HashSet<i64> = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "ma")
+            .filter_map(|i| i.length)
+            .collect();
+        let ma_count = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "ma")
+            .count();
+        if ma_count >= MAX_MA_LINES {
+            return;
+        }
+        let mut added = false;
+        for length in DEFAULT_MA_LENGTHS {
+            let ma_now = chart
+                .indicators
+                .iter()
+                .filter(|i| i.indicator_type == "ma")
+                .count();
+            if ma_now >= MAX_MA_LINES {
+                break;
+            }
+            if existing_lengths.contains(&length) {
+                continue;
+            }
+            chart.indicators.push(IndicatorConfig {
+                id: format!("ma{length}"),
+                indicator_type: "ma".into(),
+                enabled: true,
+                ma_type: Some("sma".into()),
+                length: Some(length),
+            });
+            added = true;
+        }
+        // If all defaults present but under max (custom lengths), add a short SMA.
+        if !added {
+            let ma_now = chart
+                .indicators
+                .iter()
+                .filter(|i| i.indicator_type == "ma")
+                .count();
+            if ma_now < MAX_MA_LINES {
+                let mut length = 20_i64;
+                while chart
+                    .indicators
+                    .iter()
+                    .any(|i| i.indicator_type == "ma" && i.length == Some(length))
+                {
+                    length += 1;
+                }
+                chart.indicators.push(IndicatorConfig {
+                    id: format!("ma{length}"),
+                    indicator_type: "ma".into(),
+                    enabled: true,
+                    ma_type: Some("sma".into()),
+                    length: Some(length),
+                });
+                added = true;
+            }
+        }
+        if !added {
+            return;
+        }
+        self.clamp_indicator_selection();
+        self.arm_indicators_apply();
+    }
+
+    /// Add Volume instance if none present (max 1).
+    pub fn indicator_add_volume(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        if chart
+            .indicators
+            .iter()
+            .any(|i| i.indicator_type == "volume")
+        {
+            return;
+        }
+        chart.indicators.push(IndicatorConfig {
+            id: "volume".into(),
+            indicator_type: "volume".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+        });
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.arm_indicators_apply();
+    }
+
+    pub fn indicator_toggle_selected(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let enabled = self.focused_chart().indicators[idx].enabled;
+        self.focused_chart_mut().indicators[idx].enabled = !enabled;
+        self.arm_indicators_apply();
+    }
+
+    pub fn indicator_remove_selected(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let chart = self.focused_chart_mut();
+        let removed = chart.indicators.remove(idx);
+        chart.indicator_series.remove(&removed.id);
+        self.clamp_indicator_selection();
+        self.arm_indicators_apply();
+    }
+
+    pub fn indicator_cycle_ma_type(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let cfg = &mut self.focused_chart_mut().indicators[idx];
+        if cfg.indicator_type != "ma" {
+            return;
+        }
+        let next = match cfg.ma_type.as_deref() {
+            Some("ema") => "sma",
+            _ => "ema",
+        };
+        cfg.ma_type = Some(next.into());
+        self.arm_indicators_apply();
+    }
+
+    pub fn indicator_adjust_length(&mut self, delta: i64) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let cfg = &mut self.focused_chart_mut().indicators[idx];
+        if cfg.indicator_type != "ma" {
+            return;
+        }
+        let cur = cfg.length.unwrap_or(1).max(1);
+        let next = (cur + delta).max(1);
+        if next == cur {
+            return;
+        }
+        cfg.length = Some(next);
+        self.arm_indicators_apply();
+    }
+
+    pub fn apply_indicators_response(&mut self, body: IndicatorsApplyResponse) {
+        if let Some(chart) = self.charts.iter_mut().find(|c| c.id == body.chart_id) {
+            chart.indicators = body.indicators;
+            chart.indicator_series = body.series;
+        }
+        self.clamp_indicator_selection();
+    }
+
+    pub fn apply_indicator_update(&mut self, update: IndicatorUpdateEvent) {
+        let Some(idx) = self.find_chart_index(
+            Some(&update.chart_id),
+            &update.instrument,
+            &update.timeframe,
+        ) else {
+            return;
+        };
+        let chart = &mut self.charts[idx];
+        if update.instrument != chart.instrument || update.timeframe != chart.timeframe {
+            return;
+        }
+        // Engine always includes the full config list for this chart (may be empty).
+        chart.indicators = update.indicators;
+        chart.indicator_series = update.series;
+    }
+
     /// Cycle focused chart timeframe by `delta` steps within [`V1_TIMEFRAMES`] only.
     /// No-op outside workspace normal mode, or when the index would not change.
     pub fn cycle_timeframe(&mut self, delta: i32) {
         if self.screen != Screen::Workspace {
+            return;
+        }
+        // When indicator panel is open, [ ] adjust MA length instead.
+        if matches!(self.input_mode, InputMode::IndicatorPanel) {
+            self.indicator_adjust_length(delta as i64);
             return;
         }
         if !matches!(self.input_mode, InputMode::Normal) {
@@ -529,7 +856,7 @@ impl App {
                     }
                 }
             }
-            InputMode::Normal => {}
+            InputMode::Normal | InputMode::IndicatorPanel => {}
         }
     }
 
@@ -539,7 +866,7 @@ impl App {
             | InputMode::WatchlistAddPrompt { buffer } => {
                 buffer.pop();
             }
-            InputMode::Normal => {}
+            InputMode::Normal | InputMode::IndicatorPanel => {}
         }
     }
 
@@ -559,6 +886,7 @@ impl App {
                 feed,
                 workspace,
                 quotes,
+                indicators,
             } => {
                 self.set_feed(feed);
                 if let Some(ws) = workspace {
@@ -569,6 +897,7 @@ impl App {
                     } else {
                         self.apply_workspace(ws);
                         self.apply_quotes(quotes);
+                        self.apply_indicator_payloads(indicators);
                         self.request_chart_load();
                     }
                 } else {
@@ -580,6 +909,7 @@ impl App {
                         }
                     }
                     if self.screen == Screen::Workspace {
+                        self.apply_indicator_payloads(indicators);
                         self.request_chart_load();
                     }
                 }
@@ -614,6 +944,12 @@ impl App {
             IpcEvent::QuoteUpdate(update) => {
                 self.apply_quote_update(update);
             }
+            IpcEvent::IndicatorUpdate(update) => {
+                self.apply_indicator_update(update);
+            }
+            IpcEvent::IndicatorsApplied(body) => {
+                self.apply_indicators_response(body);
+            }
             IpcEvent::Workspace(ws) => {
                 self.apply_workspace(ws);
                 self.request_chart_load();
@@ -635,6 +971,9 @@ impl App {
             IpcEvent::WatchlistFailed { message: _ } => {
                 // Leave membership unchanged; trader can retry.
             }
+            IpcEvent::IndicatorsFailed { message: _ } => {
+                // Leave local indicator draft; trader can retry panel action.
+            }
             IpcEvent::Disconnected { reason } => {
                 self.connection = ConnectionStatus::Disconnected { reason };
             }
@@ -655,12 +994,16 @@ impl App {
         if series.instrument != chart.instrument || series.timeframe != chart.timeframe {
             return;
         }
+        // Interest always carries the engine's config list (may be empty = naked).
+        chart.indicators = series.indicators;
+        chart.indicator_series = series.series;
         match series.status.as_str() {
             "ok" => {
                 chart.series = ChartSeriesState::Available { bars: series.bars };
             }
             "unavailable" => {
                 chart.series = ChartSeriesState::Unavailable;
+                chart.indicator_series.clear();
             }
             other => {
                 chart.series = ChartSeriesState::Error {
@@ -806,6 +1149,7 @@ mod tests {
             },
             workspace: None,
             quotes: vec![],
+                    indicators: HashMap::new(),
         });
         assert_eq!(app.connection, ConnectionStatus::Connected);
         assert_eq!(app.vendor_mode_label(), "fake");
@@ -841,6 +1185,8 @@ mod tests {
                 volume: 1_000_000.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         match &app.chart().series {
             ChartSeriesState::Available { bars } => {
@@ -862,6 +1208,8 @@ mod tests {
             status: "unavailable".into(),
             bars: vec![],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         assert_eq!(app.chart().series, ChartSeriesState::Unavailable);
         assert_eq!(app.empty_state_copy(), Some("Data Currently not Available"));
@@ -884,6 +1232,8 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("other".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         assert_eq!(app.chart().series, ChartSeriesState::Loading);
     }
@@ -905,6 +1255,8 @@ mod tests {
                 volume: 50_900_000.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
             instrument: "SPY".into(),
@@ -947,6 +1299,8 @@ mod tests {
                 volume: 50_900_000.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
             instrument: "SPY".into(),
@@ -996,6 +1350,8 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
             instrument: "QQQ".into(),
@@ -1035,6 +1391,8 @@ mod tests {
             status: "ok".into(),
             bars: vec![],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         assert_eq!(app.chart().timeframe, "1D");
 
@@ -1077,6 +1435,8 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
 
         assert!(app.set_instrument("qqq"));
@@ -1164,6 +1524,8 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         // Late failure from previous SPY interest must not clobber QQQ.
         app.apply_chart_load_error("primary", "SPY", "1D", "timeout".into());
@@ -1189,11 +1551,13 @@ mod tests {
                         id: "top".into(),
                         instrument: "ES".into(),
                         timeframe: "1D".into(),
+                                            indicators: vec![],
                     },
                     WorkspaceChartSnapshot {
                         id: "bottom".into(),
                         instrument: "QQQ".into(),
                         timeframe: "1h".into(),
+                                            indicators: vec![],
                     },
                 ],
                 watchlists: vec![
@@ -1218,6 +1582,7 @@ mod tests {
                 change: Some(1.75),
                 change_pct: Some(1.75 / 546.25),
             }],
+            indicators: HashMap::new(),
         });
         // Still on Welcome with defaults until Enter.
         assert_eq!(app.screen, Screen::Welcome);
@@ -1304,6 +1669,8 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("top".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         app.apply_chart_series(ChartInterestResponse {
             instrument: "SPY".into(),
@@ -1318,6 +1685,8 @@ mod tests {
                 volume: 2.0,
             }],
             chart_id: Some("bottom".into()),
+                    indicators: vec![],
+            series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
             instrument: "QQQ".into(),
@@ -1363,7 +1732,8 @@ mod tests {
                 id: "primary".into(),
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
-            }],
+                                    indicators: vec![],
+                    }],
             watchlists: vec![
                 WatchlistSnapshot {
                     id: "core".into(),
@@ -1423,7 +1793,8 @@ mod tests {
                 id: "primary".into(),
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
-            }],
+                                    indicators: vec![],
+                    }],
             watchlists: vec![WatchlistSnapshot {
                 id: "core".into(),
                 name: "Core".into(),
@@ -1449,12 +1820,14 @@ mod tests {
                     id: "top".into(),
                     instrument: "QQQ".into(),
                     timeframe: "1D".into(),
-                },
+                                        indicators: vec![],
+                    },
                 WorkspaceChartSnapshot {
                     id: "bottom".into(),
                     instrument: "SPY".into(),
                     timeframe: "1D".into(),
-                },
+                                        indicators: vec![],
+                    },
             ],
             watchlists: vec![],
             active_watchlist_id: String::new(),

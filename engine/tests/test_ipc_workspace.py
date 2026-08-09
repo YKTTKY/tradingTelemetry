@@ -48,7 +48,7 @@ def test_snapshot_includes_default_single_workspace_spy_1d(tmp_path: Path):
     ws = body["workspace"]
     assert ws["layout_mode"] == "single"
     assert ws["charts"] == [
-        {"id": "primary", "instrument": "SPY", "timeframe": "1D"},
+        {"id": "primary", "instrument": "SPY", "timeframe": "1D", "indicators": []},
     ]
     # First launch: no file written until a mutation (or write-on-load is ok either way).
     # After snapshot alone, file may or may not exist; mutations must persist.
@@ -67,8 +67,8 @@ def test_set_layout_dual_vertical_defaults_top_qqq_bottom_spy(tmp_path: Path):
     body = response.json()
     assert body["layout_mode"] == "dual-vertical"
     assert body["charts"] == [
-        {"id": "top", "instrument": "QQQ", "timeframe": "1D"},
-        {"id": "bottom", "instrument": "SPY", "timeframe": "1D"},
+        {"id": "top", "instrument": "QQQ", "timeframe": "1D", "indicators": []},
+        {"id": "bottom", "instrument": "SPY", "timeframe": "1D", "indicators": []},
     ]
 
     snap = client.get("/v1/snapshot").json()["workspace"]
@@ -87,8 +87,8 @@ def test_single_and_dual_selections_are_independent(tmp_path: Path):
     )
     dual = client.post("/v1/workspace", json={"layout_mode": "dual-vertical"}).json()
     assert dual["charts"] == [
-        {"id": "top", "instrument": "QQQ", "timeframe": "1D"},
-        {"id": "bottom", "instrument": "SPY", "timeframe": "1D"},
+        {"id": "top", "instrument": "QQQ", "timeframe": "1D", "indicators": []},
+        {"id": "bottom", "instrument": "SPY", "timeframe": "1D", "indicators": []},
     ]
     # Customize dual top, then return to single — primary still ES.
     client.post(
@@ -98,13 +98,13 @@ def test_single_and_dual_selections_are_independent(tmp_path: Path):
     body = client.post("/v1/workspace", json={"layout_mode": "single"}).json()
     assert body["layout_mode"] == "single"
     assert body["charts"] == [
-        {"id": "primary", "instrument": "ES", "timeframe": "1D"},
+        {"id": "primary", "instrument": "ES", "timeframe": "1D", "indicators": []},
     ]
     # Dual still remembers customized top on re-entry.
     again = client.post("/v1/workspace", json={"layout_mode": "dual-vertical"}).json()
     assert again["charts"] == [
-        {"id": "top", "instrument": "QQQ", "timeframe": "1h"},
-        {"id": "bottom", "instrument": "SPY", "timeframe": "1D"},
+        {"id": "top", "instrument": "QQQ", "timeframe": "1h", "indicators": []},
+        {"id": "bottom", "instrument": "SPY", "timeframe": "1D", "indicators": []},
     ]
 
 
@@ -136,8 +136,8 @@ def test_dual_charts_have_independent_interest_and_history(tmp_path: Path):
     # Both remain active after second interest (multi-interest, not sole-active).
     snap = client.get("/v1/snapshot").json()["workspace"]
     assert snap["charts"] == [
-        {"id": "top", "instrument": "QQQ", "timeframe": "1D"},
-        {"id": "bottom", "instrument": "SPY", "timeframe": "1D"},
+        {"id": "top", "instrument": "QQQ", "timeframe": "1D", "indicators": []},
+        {"id": "bottom", "instrument": "SPY", "timeframe": "1D", "indicators": []},
     ]
 
 
@@ -157,7 +157,7 @@ def test_chart_interest_without_chart_id_defaults_to_primary_in_single(tmp_path:
     snap = client.get("/v1/snapshot").json()["workspace"]
     assert snap["layout_mode"] == "single"
     assert snap["charts"] == [
-        {"id": "primary", "instrument": "QQQ", "timeframe": "1D"},
+        {"id": "primary", "instrument": "QQQ", "timeframe": "1D", "indicators": []},
     ]
 
 
@@ -186,8 +186,8 @@ def test_workspace_persists_across_engine_restart(tmp_path: Path):
     snap = client2.get("/v1/snapshot").json()["workspace"]
     assert snap["layout_mode"] == "dual-vertical"
     assert snap["charts"] == [
-        {"id": "top", "instrument": "ES", "timeframe": "1D"},
-        {"id": "bottom", "instrument": "QQQ", "timeframe": "1D"},
+        {"id": "top", "instrument": "ES", "timeframe": "1D", "indicators": []},
+        {"id": "bottom", "instrument": "QQQ", "timeframe": "1D", "indicators": []},
     ]
 
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from market_engine.chart import ChartService
 from market_engine.feed import FeedState, default_feed_state
+from market_engine.indicators import IndicatorService, parse_indicators_payload
 from market_engine.publish import ConflatingHub
 from market_engine.quotes import QuoteService
 from market_engine.vendor import Bar, MarketDataVendor, default_vendor
@@ -39,6 +40,11 @@ class WatchlistSymbolBody(BaseModel):
     symbol: str = Field(min_length=1)
 
 
+class IndicatorsBody(BaseModel):
+    chart_id: str | None = None
+    indicators: list[dict[str, Any]] = Field(default_factory=list)
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -60,6 +66,33 @@ def create_app(
     path = Path(workspace_path) if workspace_path is not None else None
     include_vix = _vendor_resolves_vix(market_vendor)
     workspace = WorkspaceStore(path=path, include_vix=include_vix)
+    indicators = IndicatorService()
+
+    # Restore persisted per-chart indicator configs into the hot service.
+    for chart_id, configs in workspace.state.all_chart_indicator_slots():
+        if configs:
+            indicators.load_from_workspace(chart_id, configs)
+
+    # ChartService is created before the bar callback closes over it.
+    charts = ChartService(vendor=market_vendor)
+
+    def publish_indicators_for_chart(chart_id: str) -> None:
+        bars = charts.bars_for(chart_id)
+        meta = charts.slot_meta(chart_id)
+        if bars is None or meta is None:
+            indicators.clear_series(chart_id)
+            return
+        series = indicators.recompute(chart_id, bars)
+        instrument, timeframe = meta
+        hub.note_indicator_update(
+            {
+                "chart_id": chart_id,
+                "instrument": instrument,
+                "timeframe": timeframe,
+                "indicators": [c.to_public() for c in indicators.get_configs(chart_id)],
+                "series": series,
+            }
+        )
 
     def on_bar_update(
         instrument: str,
@@ -68,11 +101,14 @@ def create_app(
         bar: Bar,
     ) -> None:
         hub.note_bar_update(instrument, timeframe, completed, bar)
+        for chart_id in charts.chart_ids_for_series(instrument, timeframe):
+            if indicators.get_configs(chart_id):
+                publish_indicators_for_chart(chart_id)
 
     def on_quote_update(symbol: str, payload: dict[str, Any]) -> None:
         hub.note_quote_update(symbol, payload)
 
-    charts = ChartService(vendor=market_vendor, on_bar_update=on_bar_update)
+    charts.on_bar_update = on_bar_update
     quotes = QuoteService(vendor=market_vendor, on_quote_update=on_quote_update)
 
     def sync_watchlist_quotes() -> list[dict[str, Any]]:
@@ -99,6 +135,7 @@ def create_app(
     app.state.hub = hub
     app.state.vendor = market_vendor
     app.state.workspace = workspace
+    app.state.indicators = indicators
 
     def public_workspace() -> dict[str, Any]:
         return workspace.state.to_public()
@@ -109,6 +146,23 @@ def create_app(
             "quotes": sync_watchlist_quotes(),
         }
 
+    def indicators_payload() -> dict[str, Any]:
+        return indicators.public_all(workspace.state.active_chart_ids())
+
+    def indicator_apply_response(chart_id: str) -> dict[str, Any]:
+        bars = charts.bars_for(chart_id)
+        if bars is not None:
+            series = indicators.recompute(chart_id, bars)
+        else:
+            series = {}
+            indicators.clear_series(chart_id)
+        return {
+            "chart_id": chart_id,
+            "indicators": [c.to_public() for c in indicators.get_configs(chart_id)],
+            "series": series,
+            "workspace": public_workspace(),
+        }
+
     @app.get("/v1/snapshot")
     def snapshot() -> dict[str, Any]:
         feed_state: FeedState = app.state.feed
@@ -116,6 +170,7 @@ def create_app(
             "feed": feed_state.to_snapshot(),
             "workspace": public_workspace(),
             "quotes": sync_watchlist_quotes(),
+            "indicators": indicators_payload(),
         }
 
     @app.post("/v1/workspace")
@@ -127,7 +182,9 @@ def create_app(
             )
         public = workspace.set_layout(body.layout_mode)
         # Drop live series for charts that left the layout; TUI reloads interest.
-        charts.sync_active_charts(workspace.state.active_chart_ids())
+        active = workspace.state.active_chart_ids()
+        charts.sync_active_charts(active)
+        indicators.prune_series_to(active)
         return public
 
     @app.post("/v1/chart/interest")
@@ -139,6 +196,11 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # Ensure workspace configs are loaded into the service for this chart.
+        indicators.load_from_workspace(
+            chart_id, workspace.state.indicators_for(chart_id)
+        )
+
         result = chart_svc.set_interest(
             body.instrument,
             body.timeframe,
@@ -149,7 +211,28 @@ def create_app(
         workspace.set_chart(chart_id, result.instrument, result.timeframe)
         response = result.to_interest_response()
         response["chart_id"] = chart_id
+        configs = indicators.get_configs(chart_id)
+        response["indicators"] = [c.to_public() for c in configs]
+        if result.available:
+            bars = charts.bars_for(chart_id) or []
+            response["series"] = indicators.recompute(chart_id, bars)
+        else:
+            indicators.clear_series(chart_id)
+            response["series"] = {}
         return response
+
+    @app.post("/v1/indicators")
+    def apply_indicators(body: IndicatorsBody) -> dict[str, Any]:
+        try:
+            chart_id = workspace.state.resolve_chart_id(body.chart_id)
+            workspace.state.validate_chart_id_for_layout(chart_id)
+            configs = parse_indicators_payload(body.indicators)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        indicators.set_configs(chart_id, configs)
+        workspace.set_indicators(chart_id, configs)
+        return indicator_apply_response(chart_id)
 
     @app.post("/v1/watchlist/active")
     def set_active_watchlist(body: WatchlistActiveBody) -> dict[str, Any]:
@@ -185,7 +268,7 @@ def create_app(
             # Trivial live event so clients can verify the stream is alive.
             await hub.send(websocket, {"type": "heartbeat", "ts": time.time()})
             # Keep the connection open until the client disconnects.
-            # Live bar_update / quote_update frames are pushed by ConflatingHub.
+            # Live bar_update / quote_update / indicator_update frames from hub.
             while True:
                 await asyncio.sleep(1.0)
                 await hub.send(websocket, {"type": "heartbeat", "ts": time.time()})

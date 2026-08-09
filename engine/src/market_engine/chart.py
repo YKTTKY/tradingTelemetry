@@ -153,6 +153,28 @@ class ChartService:
             for cid, slot in self._slots.items()
         ]
 
+    def bars_for(self, chart_id: str) -> list[Bar] | None:
+        """Return a copy of bars for a live chart slot, or None if unavailable."""
+        slot = self._slots.get(chart_id)
+        if slot is None:
+            return None
+        return list(slot.bars)
+
+    def slot_meta(self, chart_id: str) -> tuple[str, str] | None:
+        """Return (instrument, timeframe) for a live slot."""
+        slot = self._slots.get(chart_id)
+        if slot is None:
+            return None
+        return slot.instrument, slot.timeframe
+
+    def chart_ids_for_series(self, instrument: str, timeframe: str) -> list[str]:
+        """Chart slots currently holding this instrument+timeframe series."""
+        return [
+            cid
+            for cid, slot in self._slots.items()
+            if slot.instrument == instrument and slot.timeframe == timeframe
+        ]
+
     def _drop_slot(self, chart_id: str) -> None:
         self._slots.pop(chart_id, None)
 

@@ -60,8 +60,10 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
 
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let panel_open = matches!(app.input_mode, InputMode::IndicatorPanel);
     let prompt_h = match &app.input_mode {
         InputMode::InstrumentPrompt { .. } | InputMode::WatchlistAddPrompt { .. } => 3,
+        InputMode::IndicatorPanel => 10,
         InputMode::Normal => 0,
     };
     let chunks = Layout::default()
@@ -110,6 +112,9 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(prompt, chunks[2]);
         }
+        InputMode::IndicatorPanel => {
+            draw_indicator_panel(frame, chunks[2], app);
+        }
         InputMode::Normal => {}
     }
 
@@ -123,16 +128,66 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .active_watchlist()
         .map(|w| w.name.as_str())
         .unwrap_or("—");
-    let help = Paragraph::new(format!(
-        "{} · {} · {}  ·  l layout  ·  [ ] tf  ·  i instr{}  ·  w watchlist  ·  n/p list  ·  a add  ·  x rem  ·  ↑↓  ·  q  [{}]",
-        app.layout.as_str(),
-        focused.instrument,
-        focused.timeframe,
-        focus_hint,
-        wl_name,
-    ))
-    .style(Style::default().fg(Color::DarkGray));
+    let help = if panel_open {
+        Paragraph::new(format!(
+            "Indicators · {}  ·  m MA stack  ·  v Volume  ·  Space toggle  ·  s SMA/EMA  ·  [ ] length  ·  x rem  ·  o/Esc close",
+            focused.title(),
+        ))
+        .style(Style::default().fg(Color::DarkGray))
+    } else {
+        Paragraph::new(format!(
+            "{} · {} · {}  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w watchlist  ·  n/p list  ·  a add  ·  x rem  ·  ↑↓  ·  q  [{}]",
+            app.layout.as_str(),
+            focused.instrument,
+            focused.timeframe,
+            focus_hint,
+            wl_name,
+        ))
+        .style(Style::default().fg(Color::DarkGray))
+    };
     frame.render_widget(help, chunks[3]);
+}
+
+fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let chart = app.focused_chart();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if chart.indicators.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(naked — m add MA 10/60/200 · v add Volume)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, ind) in chart.indicators.iter().enumerate() {
+            let selected = i == app.indicator_selected.min(chart.indicators.len() - 1);
+            let mark = if selected { "› " } else { "  " };
+            let on = if ind.enabled { "on " } else { "off" };
+            let label = match ind.indicator_type.as_str() {
+                "ma" => format!(
+                    "{mark}[{on}] MA {} {}",
+                    ind.ma_type.as_deref().unwrap_or("sma").to_uppercase(),
+                    ind.length.unwrap_or(1)
+                ),
+                "volume" => format!("{mark}[{on}] Volume"),
+                other => format!("{mark}[{on}] {other}"),
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if ind.enabled {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+    }
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Indicators · {} ", chart.title())),
+    );
+    frame.render_widget(body, area);
 }
 
 fn draw_watchlist(frame: &mut Frame, area: Rect, app: &App) {
@@ -297,12 +352,12 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App, chart: &Chart, focused: 
             frame.render_widget(body, area);
         }
         ChartSeriesState::Available { bars } => {
-            draw_candles(frame, area, &title, bars);
+            draw_price_and_volume(frame, area, &title, chart, bars);
         }
     }
 }
 
-fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
+fn draw_price_and_volume(frame: &mut Frame, area: Rect, title: &str, chart: &Chart, bars: &[OhlcvBar]) {
     if bars.is_empty() {
         let body = Paragraph::new(UNAVAILABLE_COPY)
             .alignment(Alignment::Center)
@@ -311,10 +366,37 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
         return;
     }
 
+    let show_volume = chart.has_volume() && chart.volume_series().is_some();
+    if show_volume && area.height >= 8 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
+            .split(area);
+        draw_candles(frame, rows[0], title, chart, bars);
+        draw_volume_pane(frame, rows[1], chart, bars);
+    } else {
+        draw_candles(frame, area, title, chart, bars);
+    }
+}
+
+const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::Magenta];
+
+fn draw_candles(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    chart: &Chart,
+    bars: &[OhlcvBar],
+) {
     // Fit roughly one candle per terminal column (inner width minus borders).
     // Drawing 500 sub-pixel bodies makes the series unreadable even with good data.
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
-    let visible = visible_bar_window(bars, inner_w);
+    let start = if bars.len() <= inner_w {
+        0
+    } else {
+        bars.len() - inner_w
+    };
+    let visible = &bars[start..];
     let n = visible.len() as f64;
 
     let mut min_p = visible[0].low;
@@ -322,6 +404,16 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
     for b in visible {
         min_p = min_p.min(b.low);
         max_p = max_p.max(b.high);
+    }
+    // Include MA values in price scale when present.
+    let ma_lines = chart.enabled_ma_lines();
+    for (_, series) in &ma_lines {
+        for val in series.values.iter().skip(start).take(visible.len()) {
+            if let Some(v) = val {
+                min_p = min_p.min(*v);
+                max_p = max_p.max(*v);
+            }
+        }
     }
     // Flat series (or single print) still needs a non-zero y span for Canvas.
     if (max_p - min_p).abs() < f64::EPSILON {
@@ -333,8 +425,13 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
     max_p += pad;
 
     let last = bars.last().expect("non-empty");
+    let ma_hint = if ma_lines.is_empty() {
+        String::new()
+    } else {
+        format!("  MA×{}", ma_lines.len())
+    };
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}",
         last.open,
         last.high,
         last.low,
@@ -344,7 +441,8 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
             format!(" show={}", visible.len())
         } else {
             String::new()
-        }
+        },
+        ma_hint,
     );
 
     let block = Block::default()
@@ -359,12 +457,25 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
     let body_w = 0.7_f64;
     let half_w = body_w / 2.0;
 
+    // Pre-extract MA segments for the paint closure (owned values).
+    let mut ma_segments: Vec<(Color, Vec<(f64, f64)>)> = Vec::new();
+    for (mi, (_cfg, series)) in ma_lines.iter().enumerate() {
+        let color = MA_COLORS[mi % MA_COLORS.len()];
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for (i, val) in series.values.iter().skip(start).take(visible.len()).enumerate() {
+            if let Some(v) = val {
+                pts.push((i as f64 + 0.5, *v));
+            }
+        }
+        ma_segments.push((color, pts));
+    }
+
     let canvas = Canvas::default()
         .block(block)
         .marker(symbols::Marker::Block)
         .x_bounds([0.0, n])
         .y_bounds([min_p, max_p])
-        .paint(|ctx| {
+        .paint(move |ctx| {
             for (i, bar) in visible.iter().enumerate() {
                 let x = i as f64 + 0.5;
                 let up = bar.close >= bar.open;
@@ -391,18 +502,75 @@ fn draw_candles(frame: &mut Frame, area: Rect, title: &str, bars: &[OhlcvBar]) {
                     color,
                 });
             }
+            for (color, pts) in &ma_segments {
+                for w in pts.windows(2) {
+                    let (x1, y1) = w[0];
+                    let (x2, y2) = w[1];
+                    // Only connect consecutive defined samples (skip warm-up gaps).
+                    if (x2 - x1).abs() <= 1.0 + f64::EPSILON {
+                        ctx.draw(&CanvasLine {
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color: *color,
+                        });
+                    }
+                }
+            }
         });
 
     frame.render_widget(canvas, area);
 }
 
-/// Right-aligned window of bars that fit the chart width (~1 candle per column).
-fn visible_bar_window(bars: &[OhlcvBar], max_bars: usize) -> &[OhlcvBar] {
-    if bars.len() <= max_bars {
-        bars
+fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvBar]) {
+    let Some(vol_series) = chart.volume_series() else {
+        return;
+    };
+    let inner_w = area.width.saturating_sub(2).max(8) as usize;
+    let start = if bars.len() <= inner_w {
+        0
     } else {
-        &bars[bars.len() - max_bars..]
-    }
+        bars.len() - inner_w
+    };
+    let visible_bars = &bars[start..];
+    let n = visible_bars.len() as f64;
+    let values: Vec<f64> = vol_series
+        .values
+        .iter()
+        .skip(start)
+        .take(visible_bars.len())
+        .map(|v| v.unwrap_or(0.0))
+        .collect();
+    let max_v = values.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Volume ");
+
+    let body_w = 0.7_f64;
+    let half_w = body_w / 2.0;
+    let canvas = Canvas::default()
+        .block(block)
+        .marker(symbols::Marker::Block)
+        .x_bounds([0.0, n])
+        .y_bounds([0.0, max_v * 1.05])
+        .paint(move |ctx| {
+            for (i, (bar, &vol)) in visible_bars.iter().zip(values.iter()).enumerate() {
+                let x = i as f64 + 0.5;
+                let up = bar.close >= bar.open;
+                let color = if up { Color::Green } else { Color::Red };
+                let height = vol.max(max_v * 0.01);
+                ctx.draw(&Rectangle {
+                    x: x - half_w,
+                    y: 0.0,
+                    width: body_w,
+                    height,
+                    color,
+                });
+            }
+        });
+    frame.render_widget(canvas, area);
 }
 
 fn feed_line(app: &App) -> Line<'static> {

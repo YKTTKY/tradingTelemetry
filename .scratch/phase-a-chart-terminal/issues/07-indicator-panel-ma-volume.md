@@ -4,18 +4,18 @@
 
 **Blocked by:** 05 — Dual layout + workspace persistence
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] First-ever chart with no saved indicator state opens naked (no overlays/sub-panes)
-- [ ] Indicator panel can add, toggle, and configure indicators for the focused chart only
-- [ ] Dual layout: each chart has its own indicator set and limits
-- [ ] MA: max 3 lines; per-line SMA or EMA; default stack lengths 10 / 60 / 200
-- [ ] Volume: max 1 instance; sub-pane histogram under price
-- [ ] Instance limits enforced with clear behavior (reject or clamp — pick one and test it)
-- [ ] Engine computes MA/Volume and exposes them via snapshot + live updates as needed
-- [ ] TUI draws MA on price and Volume in a sub-pane
-- [ ] Indicator configs restore per chart after restart (file-backed workspace)
-- [ ] Contract tests cover apply, limits, and restore for MA and Volume with fake vendor bars
+- [x] First-ever chart with no saved indicator state opens naked (no overlays/sub-panes)
+- [x] Indicator panel can add, toggle, and configure indicators for the focused chart only
+- [x] Dual layout: each chart has its own indicator set and limits
+- [x] MA: max 3 lines; per-line SMA or EMA; default stack lengths 10 / 60 / 200
+- [x] Volume: max 1 instance; sub-pane histogram under price
+- [x] Instance limits enforced with clear behavior (reject or clamp — pick one and test it)
+- [x] Engine computes MA/Volume and exposes them via snapshot + live updates as needed
+- [x] TUI draws MA on price and Volume in a sub-pane
+- [x] Indicator configs restore per chart after restart (file-backed workspace)
+- [x] Contract tests cover apply, limits, and restore for MA and Volume with fake vendor bars
 
 ## Notes
 

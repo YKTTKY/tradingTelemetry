@@ -15,8 +15,8 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ipc::{
-    post_chart_interest, post_watchlist_active, post_watchlist_add, post_watchlist_remove,
-    post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
+    post_chart_interest, post_indicators, post_watchlist_active, post_watchlist_add,
+    post_watchlist_remove, post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -103,6 +103,24 @@ async fn run_loop(
             });
         }
 
+        if let Some(pending) = app.pending_indicators.clone() {
+            app.indicators_request_started();
+            let ep = endpoint.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                match post_indicators(&ep, &pending.chart_id, &pending.indicators).await {
+                    Ok(body) => {
+                        let _ = tx.send(IpcEvent::IndicatorsApplied(body));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(IpcEvent::IndicatorsFailed {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
         if app.needs_chart_load {
             app.chart_load_started();
             for chart in app.charts.iter() {
@@ -166,6 +184,25 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(c) => app.prompt_push_char(c),
             _ => {}
         },
+        InputMode::IndicatorPanel => match code {
+            KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
+                app.close_indicator_panel();
+            }
+            KeyCode::Up => app.indicator_select_delta(-1),
+            KeyCode::Down => app.indicator_select_delta(1),
+            KeyCode::Char(' ') | KeyCode::Enter => app.indicator_toggle_selected(),
+            KeyCode::Char('m') | KeyCode::Char('M') => app.indicator_add_default_ma_stack(),
+            KeyCode::Char('v') | KeyCode::Char('V') => app.indicator_add_volume(),
+            KeyCode::Char('x') | KeyCode::Char('X') => app.indicator_remove_selected(),
+            KeyCode::Char('s') | KeyCode::Char('S') => app.indicator_cycle_ma_type(),
+            KeyCode::Char(']') => app.cycle_timeframe(1),
+            KeyCode::Char('[') => app.cycle_timeframe(-1),
+            KeyCode::Char('+') | KeyCode::Char('=') => app.indicator_adjust_length(1),
+            KeyCode::Char('-') | KeyCode::Char('_') => app.indicator_adjust_length(-1),
+            KeyCode::Tab => app.focus_next(),
+            KeyCode::Char('q') => app.quit(),
+            _ => {}
+        },
         InputMode::Normal => match code {
             KeyCode::Char('q') => app.quit(),
             KeyCode::Esc => {
@@ -178,6 +215,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('[') if app.screen == Screen::Workspace => app.cycle_timeframe(-1),
             KeyCode::Char('i') | KeyCode::Char('I') if app.screen == Screen::Workspace => {
                 app.begin_instrument_prompt();
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') if app.screen == Screen::Workspace => {
+                app.toggle_indicator_panel();
             }
             KeyCode::Char('l') | KeyCode::Char('L') if app.screen == Screen::Workspace => {
                 app.toggle_layout();

@@ -49,6 +49,7 @@ class ConflatingHub:
         self.interval_s = interval_s
         self._pending: dict[tuple[str, str], PendingBarUpdate] = {}
         self._pending_quotes: dict[str, dict[str, Any]] = {}
+        self._pending_indicators: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._clients: list[_Client] = []
         self._clients_lock = asyncio.Lock()
@@ -81,6 +82,17 @@ class ConflatingHub:
         event["symbol"] = symbol
         with self._lock:
             self._pending_quotes[symbol] = event
+
+    def note_indicator_update(self, event: dict[str, Any]) -> None:
+        """Coalesce latest indicator series per chart_id until the next flush."""
+        chart_id = str(event.get("chart_id", "")).strip()
+        if not chart_id:
+            return
+        payload = dict(event)
+        payload["type"] = "indicator_update"
+        payload["chart_id"] = chart_id
+        with self._lock:
+            self._pending_indicators[chart_id] = payload
 
     async def add_client(self, websocket: WebSocket) -> None:
         async with self._clients_lock:
@@ -137,8 +149,11 @@ class ConflatingHub:
             self._pending.clear()
             quote_batch = list(self._pending_quotes.values())
             self._pending_quotes.clear()
+            indicator_batch = list(self._pending_indicators.values())
+            self._pending_indicators.clear()
         events: list[dict[str, Any]] = [item.to_event() for item in bar_batch]
         events.extend(quote_batch)
+        events.extend(indicator_batch)
         if not events:
             return
         async with self._clients_lock:
