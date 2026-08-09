@@ -4,17 +4,17 @@
 
 **Blocked by:** 07 — Indicator panel + MA + Volume (naked → restore)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Session VP can be added via indicator panel; max 1 per chart enforced
-- [ ] Mode All only; one profile per day; no pre/RTH/post session modes
-- [ ] Day bounds match equities/ETF vs ES/NQ rules in America/New_York
-- [ ] Number of rows = equal price buckets across profile high–low (default 500); not ticks-per-row
-- [ ] Value area default 70%; POC/VAH/VAL from volume distribution; each level toggleable with style
-- [ ] Box width (% of session span) and left/right placement work
-- [ ] Overlay render keeps candles readable (opacity tunable)
-- [ ] Snapshot/live indicator payloads and workspace restore include Session VP settings
-- [ ] Contract tests with fake vendor bars assert POC/VAH/VAL structure and session window behavior
+- [x] Session VP can be added via indicator panel; max 1 per chart enforced
+- [x] Mode All only; one profile per day; no pre/RTH/post session modes
+- [x] Day bounds match equities/ETF vs ES/NQ rules in America/New_York
+- [x] Number of rows = equal price buckets across profile high–low (default 500); not ticks-per-row
+- [x] Value area default 70%; POC/VAH/VAL from volume distribution; each level toggleable with style
+- [x] Box width (% of session span) and left/right placement work
+- [x] Overlay render keeps candles readable (opacity tunable)
+- [x] Snapshot/live indicator payloads and workspace restore include Session VP settings
+- [x] Contract tests with fake vendor bars assert POC/VAH/VAL structure and session window behavior
 
 ## Notes
 

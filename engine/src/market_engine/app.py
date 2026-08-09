@@ -82,8 +82,8 @@ def create_app(
         if bars is None or meta is None:
             indicators.clear_series(chart_id)
             return
-        series = indicators.recompute(chart_id, bars)
         instrument, timeframe = meta
+        series = indicators.recompute(chart_id, bars, instrument=instrument)
         hub.note_indicator_update(
             {
                 "chart_id": chart_id,
@@ -151,8 +151,10 @@ def create_app(
 
     def indicator_apply_response(chart_id: str) -> dict[str, Any]:
         bars = charts.bars_for(chart_id)
+        meta = charts.slot_meta(chart_id)
         if bars is not None:
-            series = indicators.recompute(chart_id, bars)
+            instrument = meta[0] if meta is not None else ""
+            series = indicators.recompute(chart_id, bars, instrument=instrument)
         else:
             series = {}
             indicators.clear_series(chart_id)
@@ -215,7 +217,9 @@ def create_app(
         response["indicators"] = [c.to_public() for c in configs]
         if result.available:
             bars = charts.bars_for(chart_id) or []
-            response["series"] = indicators.recompute(chart_id, bars)
+            response["series"] = indicators.recompute(
+                chart_id, bars, instrument=result.instrument
+            )
         else:
             indicators.clear_series(chart_id)
             response["series"] = {}

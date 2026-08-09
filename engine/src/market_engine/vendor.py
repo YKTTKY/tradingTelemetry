@@ -302,6 +302,17 @@ class FakeVendor:
         key = (instrument.strip().upper(), timeframe.strip())
         self._extra_history[key] = bars
 
+    def seed_raw_bars(
+        self,
+        instrument: str,
+        timeframe: str,
+        bars: tuple[Bar, ...] | list[Bar],
+    ) -> None:
+        """Test/control hook: register exact OHLCV bars (e.g. session-clock fixtures)."""
+        key = (instrument.strip().upper(), timeframe.strip())
+        ordered = tuple(sorted(bars, key=lambda b: b.ts))
+        self._extra_history[key] = ordered
+
     def resolves(self, instrument: str, timeframe: str = "1D") -> bool:
         """True when the vendor can serve history for the pair."""
         return self.fetch_history(instrument, timeframe).available

@@ -1,18 +1,36 @@
-"""Per-chart indicator configs, limits, and MA/Volume compute."""
+"""Per-chart indicator configs, limits, and MA/Volume/Session-VP compute."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from market_engine.vendor import Bar
 
-IndicatorType = Literal["ma", "volume"]
+IndicatorType = Literal["ma", "volume", "session_vp"]
 MaType = Literal["sma", "ema"]
+SessionClock = Literal["equity", "cme_equity_index"]
+Placement = Literal["left", "right"]
 
 MAX_MA_LINES = 3
 MAX_VOLUME = 1
+MAX_SESSION_VP = 1
 DEFAULT_MA_STACK_LENGTHS: tuple[int, int, int] = (10, 60, 200)
+
+DEFAULT_SESSION_VP_ROWS = 500
+DEFAULT_VALUE_AREA_VOLUME = 70.0
+DEFAULT_BOX_WIDTH = 30.0
+DEFAULT_PLACEMENT: Placement = "right"
+DEFAULT_HISTOGRAM: dict[str, Any] = {"color": "steelblue", "opacity": 0.35}
+DEFAULT_POC: dict[str, Any] = {"enabled": True, "color": "yellow", "opacity": 1.0}
+DEFAULT_VAH: dict[str, Any] = {"enabled": True, "color": "lime", "opacity": 1.0}
+DEFAULT_VAL: dict[str, Any] = {"enabled": True, "color": "red", "opacity": 1.0}
+
+# CME equity-index futures roots use the overnight session clock.
+_CME_EQUITY_INDEX_ROOTS: frozenset[str] = frozenset({"ES", "NQ", "MES", "MNQ"})
+_NY = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -24,6 +42,16 @@ class IndicatorConfig:
     enabled: bool = True
     ma_type: MaType | None = None
     length: int | None = None
+    # Session VP
+    mode: str | None = None
+    box_width: float | None = None
+    placement: str | None = None
+    rows: int | None = None
+    value_area_volume: float | None = None
+    histogram: dict[str, Any] | None = None
+    poc: dict[str, Any] | None = None
+    vah: dict[str, Any] | None = None
+    val: dict[str, Any] | None = None
 
     def to_public(self) -> dict[str, Any]:
         if self.type == "ma":
@@ -34,10 +62,32 @@ class IndicatorConfig:
                 "ma_type": self.ma_type or "sma",
                 "length": int(self.length or 1),
             }
+        if self.type == "volume":
+            return {
+                "id": self.id,
+                "type": "volume",
+                "enabled": self.enabled,
+            }
+        # session_vp
         return {
             "id": self.id,
-            "type": "volume",
+            "type": "session_vp",
             "enabled": self.enabled,
+            "mode": self.mode or "all",
+            "box_width": float(
+                self.box_width if self.box_width is not None else DEFAULT_BOX_WIDTH
+            ),
+            "placement": self.placement or DEFAULT_PLACEMENT,
+            "rows": int(self.rows if self.rows is not None else DEFAULT_SESSION_VP_ROWS),
+            "value_area_volume": float(
+                self.value_area_volume
+                if self.value_area_volume is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            ),
+            "histogram": dict(self.histogram or DEFAULT_HISTOGRAM),
+            "poc": dict(self.poc or DEFAULT_POC),
+            "vah": dict(self.vah or DEFAULT_VAH),
+            "val": dict(self.val or DEFAULT_VAL),
         }
 
     def to_storage(self) -> dict[str, Any]:
@@ -49,6 +99,42 @@ class IndicatorConfig:
             return parse_indicator_dict(data)
         except ValueError:
             return None
+
+
+def _parse_style_level(raw: Any, default: dict[str, Any]) -> dict[str, Any]:
+    out = dict(default)
+    if not isinstance(raw, dict):
+        return out
+    if "enabled" in raw:
+        out["enabled"] = bool(raw["enabled"])
+    if "color" in raw and raw["color"] is not None:
+        out["color"] = str(raw["color"])
+    if "opacity" in raw and raw["opacity"] is not None:
+        try:
+            opacity = float(raw["opacity"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("level opacity must be a number") from exc
+        if opacity < 0.0 or opacity > 1.0:
+            raise ValueError("level opacity must be between 0 and 1")
+        out["opacity"] = opacity
+    return out
+
+
+def _parse_histogram_style(raw: Any) -> dict[str, Any]:
+    out = dict(DEFAULT_HISTOGRAM)
+    if not isinstance(raw, dict):
+        return out
+    if "color" in raw and raw["color"] is not None:
+        out["color"] = str(raw["color"])
+    if "opacity" in raw and raw["opacity"] is not None:
+        try:
+            opacity = float(raw["opacity"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("histogram opacity must be a number") from exc
+        if opacity < 0.0 or opacity > 1.0:
+            raise ValueError("histogram opacity must be between 0 and 1")
+        out["opacity"] = opacity
+    return out
 
 
 def parse_indicator_dict(raw: dict[str, Any]) -> IndicatorConfig:
@@ -80,6 +166,58 @@ def parse_indicator_dict(raw: dict[str, Any]) -> IndicatorConfig:
     if itype == "volume":
         return IndicatorConfig(id=iid, type="volume", enabled=enabled)
 
+    if itype == "session_vp":
+        mode = str(raw.get("mode", "all")).strip().lower()
+        if mode != "all":
+            raise ValueError(
+                "session_vp mode must be 'all' (pre/RTH/post session modes are out of v1)"
+            )
+        placement = str(raw.get("placement", DEFAULT_PLACEMENT)).strip().lower()
+        if placement not in ("left", "right"):
+            raise ValueError("session_vp placement must be 'left' or 'right'")
+        try:
+            rows = int(
+                raw["rows"] if "rows" in raw and raw["rows"] is not None else DEFAULT_SESSION_VP_ROWS
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_vp rows must be a positive integer") from exc
+        if rows < 1:
+            raise ValueError("session_vp rows must be >= 1")
+        try:
+            box_width = float(
+                raw["box_width"]
+                if "box_width" in raw and raw["box_width"] is not None
+                else DEFAULT_BOX_WIDTH
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_vp box_width must be a number") from exc
+        if box_width <= 0 or box_width > 100:
+            raise ValueError("session_vp box_width must be in (0, 100]")
+        try:
+            va = float(
+                raw["value_area_volume"]
+                if "value_area_volume" in raw and raw["value_area_volume"] is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_vp value_area_volume must be a number") from exc
+        if va <= 0 or va > 100:
+            raise ValueError("session_vp value_area_volume must be in (0, 100]")
+        return IndicatorConfig(
+            id=iid,
+            type="session_vp",
+            enabled=enabled,
+            mode="all",
+            box_width=box_width,
+            placement=placement,
+            rows=rows,
+            value_area_volume=va,
+            histogram=_parse_histogram_style(raw.get("histogram")),
+            poc=_parse_style_level(raw.get("poc"), DEFAULT_POC),
+            vah=_parse_style_level(raw.get("vah"), DEFAULT_VAH),
+            val=_parse_style_level(raw.get("val"), DEFAULT_VAL),
+        )
+
     raise ValueError(f"unsupported indicator type: {itype!r}")
 
 
@@ -87,6 +225,7 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     """Enforce per-chart instance limits (reject — not clamp)."""
     ma_count = sum(1 for c in configs if c.type == "ma")
     vol_count = sum(1 for c in configs if c.type == "volume")
+    svp_count = sum(1 for c in configs if c.type == "session_vp")
     if ma_count > MAX_MA_LINES:
         raise ValueError(
             f"ma limit exceeded: max {MAX_MA_LINES} lines per chart, got {ma_count}"
@@ -94,6 +233,10 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     if vol_count > MAX_VOLUME:
         raise ValueError(
             f"volume limit exceeded: max {MAX_VOLUME} instance per chart, got {vol_count}"
+        )
+    if svp_count > MAX_SESSION_VP:
+        raise ValueError(
+            f"session_vp limit exceeded: max {MAX_SESSION_VP} instance per chart, got {svp_count}"
         )
     ids = [c.id for c in configs]
     if len(ids) != len(set(ids)):
@@ -136,6 +279,7 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
         trimmed: list[IndicatorConfig] = []
         ma_n = 0
         vol_n = 0
+        svp_n = 0
         seen: set[str] = set()
         for c in out:
             if c.id in seen:
@@ -148,6 +292,10 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
                 if vol_n >= MAX_VOLUME:
                     continue
                 vol_n += 1
+            elif c.type == "session_vp":
+                if svp_n >= MAX_SESSION_VP:
+                    continue
+                svp_n += 1
             seen.add(c.id)
             trimmed.append(c)
         return trimmed
@@ -184,11 +332,194 @@ def ema(closes: list[float], length: int) -> list[float | None]:
     return values
 
 
+def session_clock_for_instrument(instrument: str) -> SessionClock:
+    """Map instrument root to Session VP day-bound rules."""
+    root = instrument.strip().upper().split(".", 1)[0]
+    if root in _CME_EQUITY_INDEX_ROOTS:
+        return "cme_equity_index"
+    return "equity"
+
+
+def session_window_for_ts(ts: int | float, clock: SessionClock) -> tuple[int, int] | None:
+    """Return [session_start, session_end) unix seconds for a bar open, or None if in break."""
+    dt = datetime.fromtimestamp(float(ts), tz=_NY)
+    if clock == "equity":
+        # US equities/ETFs: 16:00 → next calendar day 16:00.
+        # Before 16:00 → session started previous calendar day 16:00; else today 16:00.
+        if (dt.hour, dt.minute, dt.second, dt.microsecond) < (16, 0, 0, 0):
+            start_date = (dt - timedelta(days=1)).date()
+        else:
+            start_date = dt.date()
+        start = datetime(
+            start_date.year, start_date.month, start_date.day, 16, 0, 0, tzinfo=_NY
+        )
+        end = start + timedelta(days=1)
+        return int(start.timestamp()), int(end.timestamp())
+
+    # CME ES/NQ: prior calendar day 18:00 → 17:00 (break ~17:00–18:00).
+    t = (dt.hour, dt.minute, dt.second, dt.microsecond)
+    if t >= (17, 0, 0, 0) and t < (18, 0, 0, 0):
+        return None  # maintenance break
+    if t >= (18, 0, 0, 0):
+        # Session opened today 18:00, ends tomorrow 17:00 (= start + 23h).
+        start = datetime(dt.year, dt.month, dt.day, 18, 0, 0, tzinfo=_NY)
+        end = start + timedelta(hours=23)
+        return int(start.timestamp()), int(end.timestamp())
+    # Before 17:00: session started yesterday 18:00, ends today 17:00.
+    end = datetime(dt.year, dt.month, dt.day, 17, 0, 0, tzinfo=_NY)
+    start = end - timedelta(hours=23)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _bucket_index(price: float, price_low: float, row_height: float, rows: int) -> int:
+    if row_height <= 0:
+        return 0
+    idx = int((price - price_low) / row_height)
+    if idx < 0:
+        return 0
+    if idx >= rows:
+        return rows - 1
+    return idx
+
+
+def build_volume_profile(
+    bars: list[Bar] | tuple[Bar, ...],
+    *,
+    rows: int,
+    value_area_volume: float,
+) -> dict[str, Any] | None:
+    """Build one profile from bars: equal price buckets, POC / VAH / VAL."""
+    if not bars or rows < 1:
+        return None
+    price_low = min(b.low for b in bars)
+    price_high = max(b.high for b in bars)
+    if price_high < price_low:
+        return None
+    if price_high == price_low:
+        # Degenerate single price: still one usable bucket span.
+        pad = max(abs(price_low) * 1e-6, 1e-6)
+        price_low -= pad
+        price_high += pad
+    row_height = (price_high - price_low) / rows
+    volumes = [0.0] * rows
+
+    for bar in bars:
+        lo = min(bar.low, bar.high)
+        hi = max(bar.low, bar.high)
+        i0 = _bucket_index(lo, price_low, row_height, rows)
+        i1 = _bucket_index(hi, price_low, row_height, rows)
+        if i1 < i0:
+            i0, i1 = i1, i0
+        n_bins = i1 - i0 + 1
+        share = float(bar.volume) / n_bins if n_bins else float(bar.volume)
+        for i in range(i0, i1 + 1):
+            volumes[i] += share
+
+    total = sum(volumes)
+    if total <= 0:
+        return None
+
+    poc_idx = max(range(rows), key=lambda i: (volumes[i], -i))
+    target = total * (value_area_volume / 100.0)
+    included = {poc_idx}
+    accumulated = volumes[poc_idx]
+    low_i = high_i = poc_idx
+    while accumulated < target and (low_i > 0 or high_i < rows - 1):
+        down_vol = volumes[low_i - 1] if low_i > 0 else -1.0
+        up_vol = volumes[high_i + 1] if high_i < rows - 1 else -1.0
+        # Prefer the side with more volume; ties expand upward (classic TV-style).
+        if up_vol > down_vol:
+            high_i += 1
+            included.add(high_i)
+            accumulated += volumes[high_i]
+        elif down_vol > up_vol:
+            low_i -= 1
+            included.add(low_i)
+            accumulated += volumes[low_i]
+        elif high_i < rows - 1:
+            high_i += 1
+            included.add(high_i)
+            accumulated += volumes[high_i]
+        else:
+            low_i -= 1
+            included.add(low_i)
+            accumulated += volumes[low_i]
+
+    bins: list[dict[str, float]] = []
+    for i in range(rows):
+        b_low = price_low + i * row_height
+        b_high = price_low + (i + 1) * row_height
+        bins.append(
+            {
+                "price_low": b_low,
+                "price_high": b_high,
+                "volume": volumes[i],
+            }
+        )
+
+    poc_low = price_low + poc_idx * row_height
+    poc_high = price_low + (poc_idx + 1) * row_height
+    val_low = price_low + low_i * row_height
+    vah_high = price_low + (high_i + 1) * row_height
+
+    return {
+        "high": price_high,
+        "low": price_low,
+        "poc": (poc_low + poc_high) / 2.0,
+        "val": val_low,
+        "vah": vah_high,
+        "total_volume": total,
+        "bins": bins,
+    }
+
+
+def compute_session_vp(
+    bars: list[Bar] | tuple[Bar, ...],
+    *,
+    instrument: str,
+    rows: int,
+    value_area_volume: float,
+) -> list[dict[str, Any]]:
+    """One profile per session day for the instrument's session clock."""
+    clock = session_clock_for_instrument(instrument)
+    by_session: dict[tuple[int, int], list[Bar]] = {}
+    order: list[tuple[int, int]] = []
+    for bar in bars:
+        window = session_window_for_ts(bar.ts, clock)
+        if window is None:
+            continue
+        if window not in by_session:
+            by_session[window] = []
+            order.append(window)
+        by_session[window].append(bar)
+
+    profiles: list[dict[str, Any]] = []
+    for window in order:
+        built = build_volume_profile(
+            by_session[window],
+            rows=rows,
+            value_area_volume=value_area_volume,
+        )
+        if built is None:
+            continue
+        session_start, session_end = window
+        profiles.append(
+            {
+                "session_start": session_start,
+                "session_end": session_end,
+                **built,
+            }
+        )
+    return profiles
+
+
 def compute_series(
     configs: list[IndicatorConfig],
     bars: list[Bar] | tuple[Bar, ...],
+    *,
+    instrument: str = "",
 ) -> dict[str, dict[str, Any]]:
-    """Compute enabled indicator series aligned to bar index."""
+    """Compute enabled indicator series aligned to bar index (or VP profiles)."""
     closes = [b.close for b in bars]
     volumes = [b.volume for b in bars]
     series: dict[str, dict[str, Any]] = {}
@@ -212,6 +543,23 @@ def compute_series(
                 "type": "volume",
                 "values": list(volumes),
             }
+        elif cfg.type == "session_vp":
+            rows = int(cfg.rows if cfg.rows is not None else DEFAULT_SESSION_VP_ROWS)
+            va = float(
+                cfg.value_area_volume
+                if cfg.value_area_volume is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+            profiles = compute_session_vp(
+                bars,
+                instrument=instrument,
+                rows=rows,
+                value_area_volume=va,
+            )
+            series[cfg.id] = {
+                "type": "session_vp",
+                "profiles": profiles,
+            }
     return series
 
 
@@ -229,9 +577,15 @@ class IndicatorService:
         validate_indicator_list(configs)
         self._configs[chart_id] = list(configs)
 
-    def recompute(self, chart_id: str, bars: list[Bar] | tuple[Bar, ...]) -> dict[str, dict[str, Any]]:
+    def recompute(
+        self,
+        chart_id: str,
+        bars: list[Bar] | tuple[Bar, ...],
+        *,
+        instrument: str = "",
+    ) -> dict[str, dict[str, Any]]:
         configs = self._configs.get(chart_id, [])
-        series = compute_series(configs, bars)
+        series = compute_series(configs, bars, instrument=instrument)
         self._series[chart_id] = series
         return series
 
@@ -256,7 +610,11 @@ class IndicatorService:
         }
 
     def public_all(self, chart_ids: list[str]) -> dict[str, dict[str, Any]]:
-        return {cid: self.public_for_chart(cid) for cid in chart_ids if cid in self._configs or cid in self._series}
+        return {
+            cid: self.public_for_chart(cid)
+            for cid in chart_ids
+            if cid in self._configs or cid in self._series
+        }
 
     def load_from_workspace(self, chart_id: str, configs: list[IndicatorConfig]) -> None:
         self._configs[chart_id] = list(configs)

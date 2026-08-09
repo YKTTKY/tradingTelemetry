@@ -86,6 +86,7 @@ pub struct PendingIndicatorsApply {
 }
 
 pub const MAX_MA_LINES: usize = 3;
+pub const MAX_SESSION_VP: usize = 1;
 pub const DEFAULT_MA_LENGTHS: [i64; 3] = [10, 60, 200];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +180,14 @@ impl Chart {
             .iter()
             .find(|i| i.indicator_type == "volume" && i.enabled)
             .and_then(|cfg| self.indicator_series.get(&cfg.id))
+    }
+
+    /// Enabled Session VP config + series (max one per chart).
+    pub fn enabled_session_vp(&self) -> Option<(&IndicatorConfig, &IndicatorSeriesData)> {
+        self.indicators
+            .iter()
+            .find(|i| i.indicator_type == "session_vp" && i.enabled)
+            .and_then(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
     }
 }
 
@@ -613,13 +622,7 @@ impl App {
             if existing_lengths.contains(&length) {
                 continue;
             }
-            chart.indicators.push(IndicatorConfig {
-                id: format!("ma{length}"),
-                indicator_type: "ma".into(),
-                enabled: true,
-                ma_type: Some("sma".into()),
-                length: Some(length),
-            });
+            chart.indicators.push(IndicatorConfig::ma(format!("ma{length}"), "sma", length));
             added = true;
         }
         // If all defaults present but under max (custom lengths), add a short SMA.
@@ -638,13 +641,9 @@ impl App {
                 {
                     length += 1;
                 }
-                chart.indicators.push(IndicatorConfig {
-                    id: format!("ma{length}"),
-                    indicator_type: "ma".into(),
-                    enabled: true,
-                    ma_type: Some("sma".into()),
-                    length: Some(length),
-                });
+                chart
+                    .indicators
+                    .push(IndicatorConfig::ma(format!("ma{length}"), "sma", length));
                 added = true;
             }
         }
@@ -668,13 +667,28 @@ impl App {
         {
             return;
         }
-        chart.indicators.push(IndicatorConfig {
-            id: "volume".into(),
-            indicator_type: "volume".into(),
-            enabled: true,
-            ma_type: None,
-            length: None,
-        });
+        chart.indicators.push(IndicatorConfig::volume("volume"));
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.arm_indicators_apply();
+    }
+
+    /// Add Session Volume Profile if none present (max 1).
+    pub fn indicator_add_session_vp(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let count = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "session_vp")
+            .count();
+        if count >= MAX_SESSION_VP {
+            return;
+        }
+        chart
+            .indicators
+            .push(IndicatorConfig::session_vp_default("session_vp"));
         self.indicator_selected = chart.indicators.len().saturating_sub(1);
         self.arm_indicators_apply();
     }
@@ -730,6 +744,30 @@ impl App {
         self.arm_indicators_apply();
     }
 
+    /// Cycle placement left/right when Session VP is selected; else MA type.
+    pub fn indicator_cycle_style(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let itype = self.focused_chart().indicators[idx].indicator_type.clone();
+        if itype == "session_vp" {
+            let cfg = &mut self.focused_chart_mut().indicators[idx];
+            let next = match cfg.placement.as_deref() {
+                Some("left") => "right",
+                _ => "left",
+            };
+            cfg.placement = Some(next.into());
+            self.arm_indicators_apply();
+            return;
+        }
+        self.indicator_cycle_ma_type();
+    }
+
     pub fn indicator_adjust_length(&mut self, delta: i64) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
@@ -740,15 +778,57 @@ impl App {
         }
         let idx = self.indicator_selected.min(n - 1);
         let cfg = &mut self.focused_chart_mut().indicators[idx];
-        if cfg.indicator_type != "ma" {
+        if cfg.indicator_type == "ma" {
+            let cur = cfg.length.unwrap_or(1).max(1);
+            let next = (cur + delta).max(1);
+            if next == cur {
+                return;
+            }
+            cfg.length = Some(next);
+            self.arm_indicators_apply();
             return;
         }
-        let cur = cfg.length.unwrap_or(1).max(1);
-        let next = (cur + delta).max(1);
-        if next == cur {
+        if cfg.indicator_type == "session_vp" {
+            // +/- adjusts box width %; [ ] still used for timeframe in panel path.
+            let cur = cfg.box_width.unwrap_or(30.0);
+            let next = (cur + delta as f64 * 5.0).clamp(5.0, 100.0);
+            if (next - cur).abs() < f64::EPSILON {
+                return;
+            }
+            cfg.box_width = Some(next);
+            self.arm_indicators_apply();
+        }
+    }
+
+    /// Toggle POC / VAH / VAL when Session VP is selected (`which`: 0/1/2).
+    pub fn indicator_toggle_vp_level(&mut self, which: u8) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
         }
-        cfg.length = Some(next);
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let cfg = &mut self.focused_chart_mut().indicators[idx];
+        if cfg.indicator_type != "session_vp" {
+            return;
+        }
+        let slot = match which {
+            0 => &mut cfg.poc,
+            1 => &mut cfg.vah,
+            2 => &mut cfg.val,
+            _ => return,
+        };
+        if let Some(style) = slot.as_mut() {
+            style.enabled = !style.enabled;
+        } else {
+            *slot = Some(crate::ipc::LevelStyle {
+                enabled: false,
+                color: None,
+                opacity: Some(1.0),
+            });
+        }
         self.arm_indicators_apply();
     }
 

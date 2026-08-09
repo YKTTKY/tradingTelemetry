@@ -130,7 +130,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .unwrap_or("—");
     let help = if panel_open {
         Paragraph::new(format!(
-            "Indicators · {}  ·  m MA stack  ·  v Volume  ·  Space toggle  ·  s SMA/EMA  ·  [ ] length  ·  x rem  ·  o/Esc close",
+            "Indicators · {}  ·  m MA  ·  v Vol  ·  p SVP  ·  Space  ·  s type/place  ·  +/- len/width  ·  1/2/3 POC/VAH/VAL  ·  x rem  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
@@ -153,7 +153,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m add MA 10/60/200 · v add Volume)",
+            "(naked — m MA 10/60/200 · v Volume · p Session VP)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -168,6 +168,30 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     ind.length.unwrap_or(1)
                 ),
                 "volume" => format!("{mark}[{on}] Volume"),
+                "session_vp" => {
+                    let rows = ind.rows.unwrap_or(500);
+                    let place = ind.placement.as_deref().unwrap_or("right");
+                    let bw = ind.box_width.unwrap_or(30.0) as i64;
+                    let levels = format!(
+                        "POC{} VAH{} VAL{}",
+                        if ind.poc.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                            "+"
+                        } else {
+                            "-"
+                        },
+                        if ind.vah.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                            "+"
+                        } else {
+                            "-"
+                        },
+                        if ind.val.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                            "+"
+                        } else {
+                            "-"
+                        },
+                    );
+                    format!("{mark}[{on}] Session VP rows={rows} w={bw}% {place} {levels}")
+                }
                 other => format!("{mark}[{on}] {other}"),
             };
             let style = if selected {
@@ -432,8 +456,10 @@ fn draw_candles(
 
     let last = bars.last().expect("non-empty");
     let ma_hint = ma_legend(&ma_lines);
+    let svp = chart.enabled_session_vp();
+    let vp_hint = if svp.is_some() { "  VP" } else { "" };
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
         last.open,
         last.high,
         last.low,
@@ -445,6 +471,7 @@ fn draw_candles(
             String::new()
         },
         ma_hint,
+        vp_hint,
     );
 
     let block = Block::default()
@@ -472,6 +499,9 @@ fn draw_candles(
         }
         ma_segments.push((color, pts));
     }
+
+    // Precompute Session VP drawable primitives in chart x/y space.
+    let vp_draw = build_session_vp_draw(svp, visible, n);
 
     let canvas = Canvas::default()
         .block(block)
@@ -505,6 +535,25 @@ fn draw_candles(
                     color,
                 });
             }
+            // Session VP histogram + levels (under MA so trend lines stay sharp).
+            for rect in &vp_draw.hist_rects {
+                ctx.draw(&Rectangle {
+                    x: rect.0,
+                    y: rect.1,
+                    width: rect.2,
+                    height: rect.3,
+                    color: rect.4,
+                });
+            }
+            for (x0, x1, y, color) in &vp_draw.levels {
+                ctx.draw(&CanvasLine {
+                    x1: *x0,
+                    y1: *y,
+                    x2: *x1,
+                    y2: *y,
+                    color: *color,
+                });
+            }
             // MA as connected segments (thin braille strokes over candles).
             for (color, pts) in &ma_segments {
                 for w in pts.windows(2) {
@@ -524,6 +573,167 @@ fn draw_candles(
         });
 
     frame.render_widget(canvas, area);
+}
+
+/// Precomputed Session VP geometry in candle-index / price coordinates.
+struct SessionVpDraw {
+    /// (x, y, width, height, color) histogram rectangles.
+    hist_rects: Vec<(f64, f64, f64, f64, Color)>,
+    /// (x0, x1, y, color) level segments per profile.
+    levels: Vec<(f64, f64, f64, Color)>,
+}
+
+fn named_color(name: Option<&str>, fallback: Color) -> Color {
+    match name.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("yellow") | Some("gold") => Color::Yellow,
+        Some("green") | Some("lime") => Color::Green,
+        Some("red") | Some("magenta") => Color::Red,
+        Some("cyan") | Some("steelblue") | Some("blue") => Color::Cyan,
+        Some("white") => Color::White,
+        Some("gray") | Some("grey") | Some("darkgray") | Some("darkgrey") => Color::DarkGray,
+        Some("lightblue") => Color::LightBlue,
+        Some("lightgreen") => Color::LightGreen,
+        _ => fallback,
+    }
+}
+
+fn hist_color_for_opacity(name: Option<&str>, opacity: Option<f64>) -> Option<Color> {
+    let op = opacity.unwrap_or(0.35);
+    if op <= 0.0 {
+        return None;
+    }
+    // Terminal has no true alpha: pick a quieter or stronger shade from opacity.
+    let base = named_color(name, Color::DarkGray);
+    if op < 0.25 {
+        Some(Color::DarkGray)
+    } else if op < 0.6 {
+        Some(base)
+    } else {
+        Some(match base {
+            Color::DarkGray => Color::Gray,
+            other => other,
+        })
+    }
+}
+
+fn build_session_vp_draw(
+    svp: Option<(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)>,
+    visible: &[OhlcvBar],
+    n: f64,
+) -> SessionVpDraw {
+    let empty = SessionVpDraw {
+        hist_rects: Vec::new(),
+        levels: Vec::new(),
+    };
+    let Some((cfg, series)) = svp else {
+        return empty;
+    };
+    if series.profiles.is_empty() || visible.is_empty() {
+        return empty;
+    }
+
+    let box_width_pct = cfg.box_width.unwrap_or(30.0).clamp(1.0, 100.0) / 100.0;
+    let placement_right = cfg.placement.as_deref().unwrap_or("right") != "left";
+    let hist_style = cfg.histogram.as_ref();
+    let hist_color = hist_color_for_opacity(
+        hist_style.and_then(|h| h.color.as_deref()),
+        hist_style.and_then(|h| h.opacity),
+    );
+    let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
+    let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
+    let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
+    let poc_color = named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
+    let vah_color = named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
+    let val_color = named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+    // Skip levels when opacity is explicitly 0.
+    let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
+        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+    };
+
+    // Map bar ts → x index within the visible window (nearest open).
+    let ts_to_x = |ts: i64| -> f64 {
+        if visible.len() == 1 {
+            return 0.5;
+        }
+        let mut best_i = 0usize;
+        let mut best_d = (visible[0].ts - ts).abs();
+        for (i, b) in visible.iter().enumerate().skip(1) {
+            let d = (b.ts - ts).abs();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        best_i as f64 + 0.5
+    };
+
+    let mut hist_rects: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
+    let mut levels: Vec<(f64, f64, f64, Color)> = Vec::new();
+
+    // One histogram + levels per day that intersects the visible window.
+    let vis_start = visible.first().map(|b| b.ts).unwrap_or(0);
+    let vis_end = visible.last().map(|b| b.ts).unwrap_or(0);
+
+    for profile in &series.profiles {
+        if profile.session_end <= vis_start || profile.session_start > vis_end {
+            continue;
+        }
+        let x_start = ts_to_x(profile.session_start);
+        let x_end = ts_to_x(profile.session_end.saturating_sub(1));
+        let (x_lo, x_hi) = if x_end >= x_start {
+            (x_start.min(n - 0.5).max(0.0), x_end.min(n).max(0.5))
+        } else {
+            (x_end.min(n - 0.5).max(0.0), x_start.min(n).max(0.5))
+        };
+        let span = (x_hi - x_lo).max(1.0);
+        let box_w = span * box_width_pct;
+        let hist_x0 = if placement_right { x_hi - box_w } else { x_lo };
+
+        if let Some(hcolor) = hist_color {
+            let max_vol = profile
+                .bins
+                .iter()
+                .map(|b| b.volume)
+                .fold(0.0_f64, f64::max)
+                .max(f64::EPSILON);
+            // Downsample bins to keep terminal draw cost bounded.
+            let bin_count = profile.bins.len();
+            let step = (bin_count / 80).max(1);
+            for (i, bin) in profile.bins.iter().enumerate() {
+                if i % step != 0 && i + 1 != bin_count {
+                    continue;
+                }
+                if bin.volume <= 0.0 {
+                    continue;
+                }
+                let frac = (bin.volume / max_vol).clamp(0.0, 1.0);
+                let bar_w = box_w * frac;
+                let x = if placement_right {
+                    hist_x0 + box_w - bar_w
+                } else {
+                    hist_x0
+                };
+                let y = bin.price_low;
+                let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
+                hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+            }
+        }
+
+        if poc_on && level_visible(cfg.poc.as_ref()) {
+            levels.push((x_lo, x_hi, profile.poc, poc_color));
+        }
+        if vah_on && level_visible(cfg.vah.as_ref()) {
+            levels.push((x_lo, x_hi, profile.vah, vah_color));
+        }
+        if val_on && level_visible(cfg.val.as_ref()) {
+            levels.push((x_lo, x_hi, profile.val, val_color));
+        }
+    }
+
+    SessionVpDraw {
+        hist_rects,
+        levels,
+    }
 }
 
 fn ma_legend(ma_lines: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)]) -> String {

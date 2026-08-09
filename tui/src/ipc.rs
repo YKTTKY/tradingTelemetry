@@ -83,7 +83,25 @@ pub struct FeedSnapshot {
     pub engine: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct LevelStyle {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub opacity: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct HistogramStyle {
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub opacity: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct IndicatorConfig {
     pub id: String,
     #[serde(rename = "type")]
@@ -94,21 +112,143 @@ pub struct IndicatorConfig {
     pub ma_type: Option<String>,
     #[serde(default)]
     pub length: Option<i64>,
+    // Session Volume Profile
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub box_width: Option<f64>,
+    #[serde(default)]
+    pub placement: Option<String>,
+    #[serde(default)]
+    pub rows: Option<i64>,
+    #[serde(default)]
+    pub value_area_volume: Option<f64>,
+    #[serde(default)]
+    pub histogram: Option<HistogramStyle>,
+    #[serde(default)]
+    pub poc: Option<LevelStyle>,
+    #[serde(default)]
+    pub vah: Option<LevelStyle>,
+    #[serde(default)]
+    pub val: Option<LevelStyle>,
 }
 
 fn default_true() -> bool {
     true
 }
 
+impl IndicatorConfig {
+    pub fn ma(id: impl Into<String>, ma_type: &str, length: i64) -> Self {
+        Self {
+            id: id.into(),
+            indicator_type: "ma".into(),
+            enabled: true,
+            ma_type: Some(ma_type.into()),
+            length: Some(length),
+            mode: None,
+            box_width: None,
+            placement: None,
+            rows: None,
+            value_area_volume: None,
+            histogram: None,
+            poc: None,
+            vah: None,
+            val: None,
+        }
+    }
+
+    pub fn volume(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            indicator_type: "volume".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: None,
+            box_width: None,
+            placement: None,
+            rows: None,
+            value_area_volume: None,
+            histogram: None,
+            poc: None,
+            vah: None,
+            val: None,
+        }
+    }
+
+    pub fn session_vp_default(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            indicator_type: "session_vp".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: Some("all".into()),
+            box_width: Some(30.0),
+            placement: Some("right".into()),
+            rows: Some(500),
+            value_area_volume: Some(70.0),
+            histogram: Some(HistogramStyle {
+                color: Some("steelblue".into()),
+                opacity: Some(0.35),
+            }),
+            poc: Some(LevelStyle {
+                enabled: true,
+                color: Some("yellow".into()),
+                opacity: Some(1.0),
+            }),
+            vah: Some(LevelStyle {
+                enabled: true,
+                color: Some("lime".into()),
+                opacity: Some(1.0),
+            }),
+            val: Some(LevelStyle {
+                enabled: true,
+                color: Some("red".into()),
+                opacity: Some(1.0),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct VpBin {
+    pub price_low: f64,
+    pub price_high: f64,
+    pub volume: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SessionVpProfile {
+    pub session_start: i64,
+    pub session_end: i64,
+    #[serde(default)]
+    pub high: f64,
+    #[serde(default)]
+    pub low: f64,
+    pub poc: f64,
+    pub vah: f64,
+    pub val: f64,
+    #[serde(default)]
+    pub total_volume: f64,
+    #[serde(default)]
+    pub bins: Vec<VpBin>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct IndicatorSeriesData {
     #[serde(rename = "type")]
     pub series_type: String,
+    /// Per-bar values for MA / Volume (empty for profile overlays).
+    #[serde(default)]
     pub values: Vec<Option<f64>>,
     #[serde(default)]
     pub ma_type: Option<String>,
     #[serde(default)]
     pub length: Option<i64>,
+    /// Session / range volume profiles (type = session_vp, …).
+    #[serde(default)]
+    pub profiles: Vec<SessionVpProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -145,7 +285,7 @@ pub struct IndicatorUpdateEvent {
     pub series: std::collections::HashMap<String, IndicatorSeriesData>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkspaceChartSnapshot {
     pub id: String,
     pub instrument: String,
@@ -161,7 +301,7 @@ pub struct WatchlistSnapshot {
     pub symbols: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkspaceSnapshot {
     pub layout_mode: String,
     pub charts: Vec<WorkspaceChartSnapshot>,
