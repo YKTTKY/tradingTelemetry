@@ -114,9 +114,13 @@ fn draw_help_popup(frame: &mut Frame) {
         row("m", "Add MA stack (SMA 10 / 60 / 200)"),
         row("v", "Add Volume (max 1)"),
         row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
-        row("s", "MA: SMA↔EMA · Session VP: left↔right place"),
-        row("+ / -", "MA: length · Session VP: box width %"),
-        row("1 2 3", "Session VP: toggle POC / VAH / VAL"),
+        row("f", "Add Fixed Range VP (max 4; anchors = first/last bar)"),
+        row("e", "Fixed Range: toggle extend-to-right"),
+        row(", / .", "Fixed Range: nudge start earlier / later (one bar)"),
+        row("< / >", "Fixed Range: nudge end earlier / later (one bar)"),
+        row("s", "MA: SMA↔EMA · VP: left↔right place"),
+        row("+ / -", "MA: length · VP: box width %"),
+        row("1 2 3", "VP: toggle POC / VAH / VAL"),
         row("x", "Remove selected indicator"),
         row("o / Esc", "Close indicator panel"),
         section("Text prompts"),
@@ -252,7 +256,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m MA 10/60/200 · v Volume · p Session VP)",
+            "(naked — m MA · v Volume · p Session VP · f Fixed Range VP)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -260,6 +264,26 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
             let selected = i == app.indicator_selected.min(chart.indicators.len() - 1);
             let mark = if selected { "› " } else { "  " };
             let on = if ind.enabled { "on " } else { "off" };
+            let vp_levels = |ind: &crate::ipc::IndicatorConfig| {
+                format!(
+                    "POC{} VAH{} VAL{}",
+                    if ind.poc.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                        "+"
+                    } else {
+                        "-"
+                    },
+                    if ind.vah.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                        "+"
+                    } else {
+                        "-"
+                    },
+                    if ind.val.as_ref().map(|s| s.enabled).unwrap_or(true) {
+                        "+"
+                    } else {
+                        "-"
+                    },
+                )
+            };
             let label = match ind.indicator_type.as_str() {
                 "ma" => format!(
                     "{mark}[{on}] MA {} {}",
@@ -271,25 +295,24 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     let rows = ind.rows.unwrap_or(500);
                     let place = ind.placement.as_deref().unwrap_or("right");
                     let bw = ind.box_width.unwrap_or(30.0) as i64;
-                    let levels = format!(
-                        "POC{} VAH{} VAL{}",
-                        if ind.poc.as_ref().map(|s| s.enabled).unwrap_or(true) {
-                            "+"
-                        } else {
-                            "-"
-                        },
-                        if ind.vah.as_ref().map(|s| s.enabled).unwrap_or(true) {
-                            "+"
-                        } else {
-                            "-"
-                        },
-                        if ind.val.as_ref().map(|s| s.enabled).unwrap_or(true) {
-                            "+"
-                        } else {
-                            "-"
-                        },
-                    );
-                    format!("{mark}[{on}] Session VP rows={rows} w={bw}% {place} {levels}")
+                    format!(
+                        "{mark}[{on}] Session VP rows={rows} w={bw}% {place} {}",
+                        vp_levels(ind)
+                    )
+                }
+                "fixed_range_vp" => {
+                    let rows = ind.rows.unwrap_or(200);
+                    let place = ind.placement.as_deref().unwrap_or("right");
+                    let bw = ind.box_width.unwrap_or(30.0) as i64;
+                    let ext = if ind.extend_to_right.unwrap_or(false) {
+                        "ext+"
+                    } else {
+                        "ext-"
+                    };
+                    format!(
+                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {}",
+                        vp_levels(ind)
+                    )
                 }
                 other => format!("{mark}[{on}] {other}"),
             };
@@ -556,7 +579,13 @@ fn draw_candles(
     let last = bars.last().expect("non-empty");
     let ma_hint = ma_legend(&ma_lines);
     let svp = chart.enabled_session_vp();
-    let vp_hint = if svp.is_some() { "  VP" } else { "" };
+    let frvps = chart.enabled_fixed_range_vps();
+    let vp_hint = match (svp.is_some(), !frvps.is_empty()) {
+        (true, true) => "  VP+FR",
+        (true, false) => "  VP",
+        (false, true) => "  FRVP",
+        (false, false) => "",
+    };
     let subtitle = format!(
         " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
         last.open,
@@ -599,8 +628,11 @@ fn draw_candles(
         ma_segments.push((color, pts));
     }
 
-    // Precompute Session VP drawable primitives in chart x/y space.
-    let vp_draw = build_session_vp_draw(svp, visible, n);
+    // Precompute Session + Fixed Range VP drawable primitives in chart x/y space.
+    let mut vp_draw = build_session_vp_draw(svp, visible, n);
+    let fr_draw = build_fixed_range_vp_draw(&frvps, visible, n);
+    vp_draw.hist_rects.extend(fr_draw.hist_rects);
+    vp_draw.levels.extend(fr_draw.levels);
 
     let canvas = Canvas::default()
         .block(block)
@@ -634,7 +666,7 @@ fn draw_candles(
                     color,
                 });
             }
-            // Session VP histogram + levels (under MA so trend lines stay sharp).
+            // VP histogram + levels (under MA so trend lines stay sharp).
             for rect in &vp_draw.hist_rects {
                 ctx.draw(&Rectangle {
                     x: rect.0,
@@ -674,8 +706,8 @@ fn draw_candles(
     frame.render_widget(canvas, area);
 }
 
-/// Precomputed Session VP geometry in candle-index / price coordinates.
-struct SessionVpDraw {
+/// Precomputed VP geometry in candle-index / price coordinates.
+struct VpOverlayDraw {
     /// (x, y, width, height, color) histogram rectangles.
     hist_rects: Vec<(f64, f64, f64, f64, Color)>,
     /// (x0, x1, y, color) level segments per profile.
@@ -719,8 +751,8 @@ fn build_session_vp_draw(
     svp: Option<(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)>,
     visible: &[OhlcvBar],
     n: f64,
-) -> SessionVpDraw {
-    let empty = SessionVpDraw {
+) -> VpOverlayDraw {
+    let empty = VpOverlayDraw {
         hist_rects: Vec::new(),
         levels: Vec::new(),
     };
@@ -774,11 +806,13 @@ fn build_session_vp_draw(
     let vis_end = visible.last().map(|b| b.ts).unwrap_or(0);
 
     for profile in &series.profiles {
-        if profile.session_end <= vis_start || profile.session_start > vis_end {
+        let sess_start = profile.session_start.unwrap_or(0);
+        let sess_end = profile.session_end.unwrap_or(0);
+        if sess_end <= vis_start || sess_start > vis_end {
             continue;
         }
-        let x_start = ts_to_x(profile.session_start);
-        let x_end = ts_to_x(profile.session_end.saturating_sub(1));
+        let x_start = ts_to_x(sess_start);
+        let x_end = ts_to_x(sess_end.saturating_sub(1));
         let (x_lo, x_hi) = if x_end >= x_start {
             (x_start.min(n - 0.5).max(0.0), x_end.min(n).max(0.5))
         } else {
@@ -829,7 +863,155 @@ fn build_session_vp_draw(
         }
     }
 
-    SessionVpDraw {
+    VpOverlayDraw {
+        hist_rects,
+        levels,
+    }
+}
+
+fn build_fixed_range_vp_draw(
+    frvps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+    visible: &[OhlcvBar],
+    n: f64,
+) -> VpOverlayDraw {
+    let empty = VpOverlayDraw {
+        hist_rects: Vec::new(),
+        levels: Vec::new(),
+    };
+    if frvps.is_empty() || visible.is_empty() {
+        return empty;
+    }
+
+    let vis_start = visible.first().map(|b| b.ts).unwrap_or(0);
+    let vis_end = visible.last().map(|b| b.ts).unwrap_or(0);
+
+    let ts_to_x = |ts: i64| -> f64 {
+        if visible.len() == 1 {
+            return 0.5;
+        }
+        let mut best_i = 0usize;
+        let mut best_d = (visible[0].ts - ts).abs();
+        for (i, b) in visible.iter().enumerate().skip(1) {
+            let d = (b.ts - ts).abs();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        best_i as f64 + 0.5
+    };
+
+    let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
+        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+    };
+
+    let mut hist_rects: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
+    let mut levels: Vec<(f64, f64, f64, Color)> = Vec::new();
+
+    for (cfg, series) in frvps {
+        if series.profiles.is_empty() {
+            continue;
+        }
+        let box_width_pct = cfg.box_width.unwrap_or(30.0).clamp(1.0, 100.0) / 100.0;
+        let placement_right = cfg.placement.as_deref().unwrap_or("right") != "left";
+        let hist_style = cfg.histogram.as_ref();
+        let hist_color = hist_color_for_opacity(
+            hist_style.and_then(|h| h.color.as_deref()),
+            hist_style.and_then(|h| h.opacity),
+        );
+        let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let poc_color =
+            named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
+        let vah_color =
+            named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
+        let val_color =
+            named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+
+        for profile in &series.profiles {
+            let range_start = profile
+                .range_start
+                .or(cfg.start)
+                .unwrap_or(vis_start);
+            let range_end = profile.range_end.or(cfg.end).unwrap_or(vis_end);
+            let levels_end = profile
+                .levels_end
+                .or(profile.range_end)
+                .or(cfg.end)
+                .unwrap_or(range_end);
+            // Histogram spans accumulation window; skip if wholly outside view.
+            if range_end < vis_start || range_start > vis_end {
+                continue;
+            }
+            let x_start = ts_to_x(range_start);
+            let x_hist_end = ts_to_x(range_end);
+            let x_levels_end = ts_to_x(levels_end);
+            let (hist_lo, hist_hi) = if x_hist_end >= x_start {
+                (
+                    x_start.min(n - 0.5).max(0.0),
+                    x_hist_end.min(n).max(0.5),
+                )
+            } else {
+                (
+                    x_hist_end.min(n - 0.5).max(0.0),
+                    x_start.min(n).max(0.5),
+                )
+            };
+            let levels_hi = x_levels_end.min(n).max(hist_hi);
+            let span = (hist_hi - hist_lo).max(1.0);
+            let box_w = span * box_width_pct;
+            let hist_x0 = if placement_right {
+                hist_hi - box_w
+            } else {
+                hist_lo
+            };
+
+            if let Some(hcolor) = hist_color {
+                let max_vol = profile
+                    .bins
+                    .iter()
+                    .map(|b| b.volume)
+                    .fold(0.0_f64, f64::max)
+                    .max(f64::EPSILON);
+                let bin_count = profile.bins.len();
+                let step = (bin_count / 80).max(1);
+                for (i, bin) in profile.bins.iter().enumerate() {
+                    if i % step != 0 && i + 1 != bin_count {
+                        continue;
+                    }
+                    if bin.volume <= 0.0 {
+                        continue;
+                    }
+                    let frac = (bin.volume / max_vol).clamp(0.0, 1.0);
+                    let bar_w = box_w * frac;
+                    let x = if placement_right {
+                        hist_x0 + box_w - bar_w
+                    } else {
+                        hist_x0
+                    };
+                    let y = bin.price_low;
+                    let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
+                    hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+                }
+            }
+
+            // Levels: from range start to levels_end (projects past anchor when extend on).
+            let x_lo = hist_lo;
+            let x_hi = levels_hi.max(hist_hi);
+            if poc_on && level_visible(cfg.poc.as_ref()) {
+                levels.push((x_lo, x_hi, profile.poc, poc_color));
+            }
+            if vah_on && level_visible(cfg.vah.as_ref()) {
+                levels.push((x_lo, x_hi, profile.vah, vah_color));
+            }
+            if val_on && level_visible(cfg.val.as_ref()) {
+                levels.push((x_lo, x_hi, profile.val, val_color));
+            }
+        }
+    }
+
+    VpOverlayDraw {
         hist_rects,
         levels,
     }

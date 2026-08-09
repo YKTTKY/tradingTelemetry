@@ -112,7 +112,7 @@ pub struct IndicatorConfig {
     pub ma_type: Option<String>,
     #[serde(default)]
     pub length: Option<i64>,
-    // Session Volume Profile
+    // Session / Fixed Range Volume Profile
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -131,6 +131,13 @@ pub struct IndicatorConfig {
     pub vah: Option<LevelStyle>,
     #[serde(default)]
     pub val: Option<LevelStyle>,
+    // Fixed Range VP anchors (unix seconds)
+    #[serde(default)]
+    pub start: Option<i64>,
+    #[serde(default)]
+    pub end: Option<i64>,
+    #[serde(default)]
+    pub extend_to_right: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -138,6 +145,26 @@ fn default_true() -> bool {
 }
 
 impl IndicatorConfig {
+    fn vp_level_defaults() -> (Option<LevelStyle>, Option<LevelStyle>, Option<LevelStyle>) {
+        (
+            Some(LevelStyle {
+                enabled: true,
+                color: Some("yellow".into()),
+                opacity: Some(1.0),
+            }),
+            Some(LevelStyle {
+                enabled: true,
+                color: Some("lime".into()),
+                opacity: Some(1.0),
+            }),
+            Some(LevelStyle {
+                enabled: true,
+                color: Some("red".into()),
+                opacity: Some(1.0),
+            }),
+        )
+    }
+
     pub fn ma(id: impl Into<String>, ma_type: &str, length: i64) -> Self {
         Self {
             id: id.into(),
@@ -154,6 +181,9 @@ impl IndicatorConfig {
             poc: None,
             vah: None,
             val: None,
+            start: None,
+            end: None,
+            extend_to_right: None,
         }
     }
 
@@ -173,10 +203,14 @@ impl IndicatorConfig {
             poc: None,
             vah: None,
             val: None,
+            start: None,
+            end: None,
+            extend_to_right: None,
         }
     }
 
     pub fn session_vp_default(id: impl Into<String>) -> Self {
+        let (poc, vah, val) = Self::vp_level_defaults();
         Self {
             id: id.into(),
             indicator_type: "session_vp".into(),
@@ -192,21 +226,44 @@ impl IndicatorConfig {
                 color: Some("steelblue".into()),
                 opacity: Some(0.35),
             }),
-            poc: Some(LevelStyle {
-                enabled: true,
-                color: Some("yellow".into()),
-                opacity: Some(1.0),
+            poc,
+            vah,
+            val,
+            start: None,
+            end: None,
+            extend_to_right: None,
+        }
+    }
+
+    /// Fixed Range VP defaults: rows 200, VA 70%, extend off; anchors supplied by caller.
+    pub fn fixed_range_vp_default(id: impl Into<String>, start: i64, end: i64) -> Self {
+        let (poc, vah, val) = Self::vp_level_defaults();
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        Self {
+            id: id.into(),
+            indicator_type: "fixed_range_vp".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: None,
+            box_width: Some(30.0),
+            placement: Some("right".into()),
+            rows: Some(200),
+            value_area_volume: Some(70.0),
+            histogram: Some(HistogramStyle {
+                color: Some("steelblue".into()),
+                opacity: Some(0.35),
             }),
-            vah: Some(LevelStyle {
-                enabled: true,
-                color: Some("lime".into()),
-                opacity: Some(1.0),
-            }),
-            val: Some(LevelStyle {
-                enabled: true,
-                color: Some("red".into()),
-                opacity: Some(1.0),
-            }),
+            poc,
+            vah,
+            val,
+            start: Some(start),
+            end: Some(end),
+            extend_to_right: Some(false),
         }
     }
 }
@@ -219,9 +276,24 @@ pub struct VpBin {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct SessionVpProfile {
-    pub session_start: i64,
-    pub session_end: i64,
+pub struct VpProfile {
+    /// Session VP day bounds.
+    #[serde(default)]
+    pub session_start: Option<i64>,
+    #[serde(default)]
+    pub session_end: Option<i64>,
+    /// Fixed Range VP anchors / effective window.
+    #[serde(default)]
+    pub range_start: Option<i64>,
+    #[serde(default)]
+    pub range_end: Option<i64>,
+    #[serde(default)]
+    pub anchor_end: Option<i64>,
+    /// Where POC/VAH/VAL lines draw to (may project past anchor_end when extend is on).
+    #[serde(default)]
+    pub levels_end: Option<i64>,
+    #[serde(default)]
+    pub extend_to_right: Option<bool>,
     #[serde(default)]
     pub high: f64,
     #[serde(default)]
@@ -246,9 +318,9 @@ pub struct IndicatorSeriesData {
     pub ma_type: Option<String>,
     #[serde(default)]
     pub length: Option<i64>,
-    /// Session / range volume profiles (type = session_vp, …).
+    /// Session / Fixed Range volume profiles.
     #[serde(default)]
-    pub profiles: Vec<SessionVpProfile>,
+    pub profiles: Vec<VpProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

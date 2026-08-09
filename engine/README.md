@@ -41,7 +41,7 @@ Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution
 | `GET /v1/snapshot` | Bootstrap snapshot: `feed` + `workspace` (layout + charts + watchlists + per-chart indicator configs) + `quotes` + hot `indicators` series |
 | `POST /v1/workspace` | Set `layout_mode` (`single` \| `dual-vertical`); persists to disk |
 | `POST /v1/chart/interest` | Chart interest: historical OHLCV for `instrument` + `timeframe` (+ optional `chart_id`); arms live updates; persists selection; returns indicator series when configured |
-| `POST /v1/indicators` | Full-replace indicator list for one `chart_id` (MA ≤3, Volume ≤1, Session VP ≤1); rejects over-limit; persists; returns configs + series |
+| `POST /v1/indicators` | Full-replace indicator list for one `chart_id` (MA ≤3, Volume ≤1, Session VP ≤1, Fixed Range VP ≤4); rejects over-limit; persists; returns configs + series |
 | `POST /v1/watchlist/active` | Switch active watchlist (`watchlist_id`); persists |
 | `POST /v1/watchlist/add` | Add `symbol` to the active watchlist; persists; returns workspace + quotes |
 | `POST /v1/watchlist/remove` | Remove `symbol` from the active watchlist; persists |
@@ -76,7 +76,7 @@ Example snapshot:
 }
 ```
 
-**Indicators:** Charts open **naked** (`indicators: []`) until configured. `POST /v1/indicators` applies a full list for one chart only (dual charts are independent). Limits are **rejected** (HTTP 422), not clamped: **MA ≤ 3** lines, **Volume ≤ 1**, **Session VP ≤ 1**. MA lines support `ma_type` `sma`|`ema` and `length`; default stack lengths are **10 / 60 / 200**. Volume is a per-bar histogram series. **Session Volume Profile** (`type: session_vp`) is mode **All** only (one profile per day). Session clocks America/New_York: equities/ETFs **16:00 → next day 16:00**; CME **ES/NQ** **prior day 18:00 → 17:00**. Defaults: `rows` **500**, `value_area_volume` **70**, `box_width` **30**, `placement` `right`; histogram + toggleable POC/VAH/VAL styling. Series payload is `profiles[]` with `session_start`/`session_end`, equal-price `bins`, and `poc`/`vah`/`val`. Configs restore from the workspace file; series recompute on interest and live bar updates (`indicator_update` WS frames).
+**Indicators:** Charts open **naked** (`indicators: []`) until configured. `POST /v1/indicators` applies a full list for one chart only (dual charts are independent). Limits are **rejected** (HTTP 422), not clamped: **MA ≤ 3** lines, **Volume ≤ 1**, **Session VP ≤ 1**, **Fixed Range VP ≤ 4**. MA lines support `ma_type` `sma`|`ema` and `length`; default stack lengths are **10 / 60 / 200**. Volume is a per-bar histogram series. **Session Volume Profile** (`type: session_vp`) is mode **All** only (one profile per day). Session clocks America/New_York: equities/ETFs **16:00 → next day 16:00**; CME **ES/NQ** **prior day 18:00 → 17:00**. Defaults: `rows` **500**, `value_area_volume` **70**, `box_width` **30**, `placement` `right`; histogram + toggleable POC/VAH/VAL styling. Series payload is `profiles[]` with `session_start`/`session_end`, equal-price `bins`, and `poc`/`vah`/`val`. **Fixed Range Volume Profile** (`type: fixed_range_vp`) uses two unix time anchors `start`/`end` (required). `extend_to_right` (default false) when **on** both accumulates bars past `end` and projects POC/VAH/VAL via `levels_end` past the original window; when **off**, only the closed `[start, end]` window counts and levels stay within it. Defaults: `rows` **200**, `value_area_volume` **70**, `box_width` **30**, `placement` `right`. Series `profiles[]` include `range_start`, `range_end`, `anchor_end`, `levels_end`, `extend_to_right`, bins, and levels. Configs restore from the workspace file; series recompute on interest and live bar updates (`indicator_update` WS frames).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/indicators \
@@ -86,7 +86,8 @@ curl -s -X POST http://127.0.0.1:8765/v1/indicators \
     {"id":"ma60","type":"ma","enabled":true,"ma_type":"sma","length":60},
     {"id":"ma200","type":"ma","enabled":true,"ma_type":"sma","length":200},
     {"id":"vol","type":"volume","enabled":true},
-    {"id":"svp","type":"session_vp","enabled":true,"mode":"all","rows":500,"value_area_volume":70,"box_width":30,"placement":"right"}
+    {"id":"svp","type":"session_vp","enabled":true,"mode":"all","rows":500,"value_area_volume":70,"box_width":30,"placement":"right"},
+    {"id":"frvp1","type":"fixed_range_vp","enabled":true,"start":1719842400,"end":1719864000,"extend_to_right":false,"rows":200,"value_area_volume":70,"box_width":30,"placement":"right"}
   ]}'
 ```
 

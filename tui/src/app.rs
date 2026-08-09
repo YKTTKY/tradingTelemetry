@@ -87,6 +87,7 @@ pub struct PendingIndicatorsApply {
 
 pub const MAX_MA_LINES: usize = 3;
 pub const MAX_SESSION_VP: usize = 1;
+pub const MAX_FIXED_RANGE_VP: usize = 4;
 pub const DEFAULT_MA_LENGTHS: [i64; 3] = [10, 60, 200];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +189,19 @@ impl Chart {
             .iter()
             .find(|i| i.indicator_type == "session_vp" && i.enabled)
             .and_then(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
+    }
+
+    /// Enabled Fixed Range VP instances with their series (max 4 configured).
+    pub fn enabled_fixed_range_vps(&self) -> Vec<(&IndicatorConfig, &IndicatorSeriesData)> {
+        self.indicators
+            .iter()
+            .filter(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
+            .filter_map(|cfg| {
+                self.indicator_series
+                    .get(&cfg.id)
+                    .map(|s| (cfg, s))
+            })
+            .collect()
     }
 }
 
@@ -708,6 +722,39 @@ impl App {
         self.arm_indicators_apply();
     }
 
+    /// Add Fixed Range Volume Profile (max 4). Anchors default to first/last bar ts.
+    pub fn indicator_add_fixed_range_vp(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let count = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "fixed_range_vp")
+            .count();
+        if count >= MAX_FIXED_RANGE_VP {
+            return;
+        }
+        let (start, end, has_bars) = match &chart.series {
+            ChartSeriesState::Available { bars } if !bars.is_empty() => {
+                let start = bars.first().map(|b| b.ts).unwrap_or(0);
+                let end = bars.last().map(|b| b.ts).unwrap_or(start);
+                (start, end.max(start), true)
+            }
+            // Placeholder until bars arrive; apply_chart_series backfills anchors.
+            _ => (0, 0, false),
+        };
+        let id = format!("frvp{}", count + 1);
+        chart
+            .indicators
+            .push(IndicatorConfig::fixed_range_vp_default(id, start, end));
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        if has_bars {
+            self.arm_indicators_apply();
+        }
+    }
+
     pub fn indicator_toggle_selected(&mut self) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
@@ -759,7 +806,7 @@ impl App {
         self.arm_indicators_apply();
     }
 
-    /// Cycle placement left/right when Session VP is selected; else MA type.
+    /// Cycle placement left/right when a VP is selected; else MA type.
     pub fn indicator_cycle_style(&mut self) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
@@ -770,7 +817,7 @@ impl App {
         }
         let idx = self.indicator_selected.min(n - 1);
         let itype = self.focused_chart().indicators[idx].indicator_type.clone();
-        if itype == "session_vp" {
+        if itype == "session_vp" || itype == "fixed_range_vp" {
             let cfg = &mut self.focused_chart_mut().indicators[idx];
             let next = match cfg.placement.as_deref() {
                 Some("left") => "right",
@@ -781,6 +828,90 @@ impl App {
             return;
         }
         self.indicator_cycle_ma_type();
+    }
+
+    /// Toggle extend-to-right on the selected Fixed Range VP.
+    pub fn indicator_toggle_frvp_extend(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        let cfg = &mut self.focused_chart_mut().indicators[idx];
+        if cfg.indicator_type != "fixed_range_vp" {
+            return;
+        }
+        let cur = cfg.extend_to_right.unwrap_or(false);
+        cfg.extend_to_right = Some(!cur);
+        self.arm_indicators_apply();
+    }
+
+    /// Nudge Fixed Range start (`which=0`) or end (`which=1`) by one bar step.
+    pub fn indicator_nudge_frvp_anchor(&mut self, which: u8, delta: i32) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) || delta == 0 {
+            return;
+        }
+        let n = self.focused_chart().indicators.len();
+        if n == 0 {
+            return;
+        }
+        let idx = self.indicator_selected.min(n - 1);
+        if self.focused_chart().indicators[idx].indicator_type != "fixed_range_vp" {
+            return;
+        }
+        let bar_ts: Vec<i64> = match &self.focused_chart().series {
+            ChartSeriesState::Available { bars } if !bars.is_empty() => {
+                bars.iter().map(|b| b.ts).collect()
+            }
+            _ => return,
+        };
+        let cfg = &mut self.focused_chart_mut().indicators[idx];
+        let start = cfg.start.unwrap_or(bar_ts[0]);
+        let end = cfg.end.unwrap_or(*bar_ts.last().unwrap_or(&start));
+        let nearest = |ts: i64| -> usize {
+            let mut best_i = 0usize;
+            let mut best_d = (bar_ts[0] - ts).abs();
+            for (i, &t) in bar_ts.iter().enumerate().skip(1) {
+                let d = (t - ts).abs();
+                if d < best_d {
+                    best_d = d;
+                    best_i = i;
+                }
+            }
+            best_i
+        };
+        let clamp_i = |i: i32| -> usize {
+            i.clamp(0, (bar_ts.len() as i32 - 1).max(0)) as usize
+        };
+        match which {
+            0 => {
+                let i = clamp_i(nearest(start) as i32 + delta);
+                let mut new_start = bar_ts[i];
+                if new_start > end {
+                    new_start = end;
+                }
+                if Some(new_start) == cfg.start {
+                    return;
+                }
+                cfg.start = Some(new_start);
+            }
+            1 => {
+                let i = clamp_i(nearest(end) as i32 + delta);
+                let mut new_end = bar_ts[i];
+                if new_end < start {
+                    new_end = start;
+                }
+                if Some(new_end) == cfg.end {
+                    return;
+                }
+                cfg.end = Some(new_end);
+            }
+            _ => return,
+        }
+        self.arm_indicators_apply();
     }
 
     pub fn indicator_adjust_length(&mut self, delta: i64) {
@@ -803,7 +934,7 @@ impl App {
             self.arm_indicators_apply();
             return;
         }
-        if cfg.indicator_type == "session_vp" {
+        if cfg.indicator_type == "session_vp" || cfg.indicator_type == "fixed_range_vp" {
             // +/- adjusts box width %; [ ] still used for timeframe in panel path.
             let cur = cfg.box_width.unwrap_or(30.0);
             let next = (cur + delta as f64 * 5.0).clamp(5.0, 100.0);
@@ -815,7 +946,7 @@ impl App {
         }
     }
 
-    /// Toggle POC / VAH / VAL when Session VP is selected (`which`: 0/1/2).
+    /// Toggle POC / VAH / VAL when a VP is selected (`which`: 0/1/2).
     pub fn indicator_toggle_vp_level(&mut self, which: u8) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
@@ -826,7 +957,7 @@ impl App {
         }
         let idx = self.indicator_selected.min(n - 1);
         let cfg = &mut self.focused_chart_mut().indicators[idx];
-        if cfg.indicator_type != "session_vp" {
+        if cfg.indicator_type != "session_vp" && cfg.indicator_type != "fixed_range_vp" {
             return;
         }
         let slot = match which {
@@ -1090,11 +1221,50 @@ impl App {
             return;
         }
         // Interest always carries the engine's config list (may be empty = naked).
+        // Keep local draft Fixed Range rows that were not yet applied (e.g. added before bars).
+        let local_pending_frvp: Vec<IndicatorConfig> = chart
+            .indicators
+            .iter()
+            .filter(|i| {
+                i.indicator_type == "fixed_range_vp"
+                    && !series.indicators.iter().any(|e| e.id == i.id)
+            })
+            .cloned()
+            .collect();
         chart.indicators = series.indicators;
+        chart.indicators.extend(local_pending_frvp);
         chart.indicator_series = series.series;
         match series.status.as_str() {
             "ok" => {
                 chart.series = ChartSeriesState::Available { bars: series.bars };
+                // Backfill placeholder (0,0) anchors to first/last bar and persist.
+                let (first_ts, last_ts) = match &chart.series {
+                    ChartSeriesState::Available { bars } if !bars.is_empty() => {
+                        let s = bars.first().map(|b| b.ts).unwrap_or(0);
+                        let e = bars.last().map(|b| b.ts).unwrap_or(s).max(s);
+                        (s, e)
+                    }
+                    _ => return,
+                };
+                let mut need_apply = false;
+                for ind in &mut chart.indicators {
+                    if ind.indicator_type == "fixed_range_vp"
+                        && ind.start.unwrap_or(0) == 0
+                        && ind.end.unwrap_or(0) == 0
+                    {
+                        ind.start = Some(first_ts);
+                        ind.end = Some(last_ts);
+                        need_apply = true;
+                    }
+                }
+                if need_apply {
+                    let chart_id = chart.id.clone();
+                    let indicators = chart.indicators.clone();
+                    self.pending_indicators = Some(PendingIndicatorsApply {
+                        chart_id,
+                        indicators,
+                    });
+                }
             }
             "unavailable" => {
                 chart.series = ChartSeriesState::Unavailable;

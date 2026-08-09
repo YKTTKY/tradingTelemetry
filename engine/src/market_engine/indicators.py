@@ -1,4 +1,4 @@
-"""Per-chart indicator configs, limits, and MA/Volume/Session-VP compute."""
+"""Per-chart indicator configs, limits, and MA/Volume/VP compute."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from market_engine.vendor import Bar
 
-IndicatorType = Literal["ma", "volume", "session_vp"]
+IndicatorType = Literal["ma", "volume", "session_vp", "fixed_range_vp"]
 MaType = Literal["sma", "ema"]
 SessionClock = Literal["equity", "cme_equity_index"]
 Placement = Literal["left", "right"]
@@ -17,9 +17,11 @@ Placement = Literal["left", "right"]
 MAX_MA_LINES = 3
 MAX_VOLUME = 1
 MAX_SESSION_VP = 1
+MAX_FIXED_RANGE_VP = 4
 DEFAULT_MA_STACK_LENGTHS: tuple[int, int, int] = (10, 60, 200)
 
 DEFAULT_SESSION_VP_ROWS = 500
+DEFAULT_FIXED_RANGE_VP_ROWS = 200
 DEFAULT_VALUE_AREA_VOLUME = 70.0
 DEFAULT_BOX_WIDTH = 30.0
 DEFAULT_PLACEMENT: Placement = "right"
@@ -42,7 +44,7 @@ class IndicatorConfig:
     enabled: bool = True
     ma_type: MaType | None = None
     length: int | None = None
-    # Session VP
+    # Session / Fixed Range VP shared styling
     mode: str | None = None
     box_width: float | None = None
     placement: str | None = None
@@ -52,6 +54,10 @@ class IndicatorConfig:
     poc: dict[str, Any] | None = None
     vah: dict[str, Any] | None = None
     val: dict[str, Any] | None = None
+    # Fixed Range VP anchors
+    start: int | None = None
+    end: int | None = None
+    extend_to_right: bool | None = None
 
     def to_public(self) -> dict[str, Any]:
         if self.type == "ma":
@@ -67,6 +73,33 @@ class IndicatorConfig:
                 "id": self.id,
                 "type": "volume",
                 "enabled": self.enabled,
+            }
+        if self.type == "fixed_range_vp":
+            return {
+                "id": self.id,
+                "type": "fixed_range_vp",
+                "enabled": self.enabled,
+                "start": int(self.start if self.start is not None else 0),
+                "end": int(self.end if self.end is not None else 0),
+                "extend_to_right": bool(self.extend_to_right)
+                if self.extend_to_right is not None
+                else False,
+                "box_width": float(
+                    self.box_width if self.box_width is not None else DEFAULT_BOX_WIDTH
+                ),
+                "placement": self.placement or DEFAULT_PLACEMENT,
+                "rows": int(
+                    self.rows if self.rows is not None else DEFAULT_FIXED_RANGE_VP_ROWS
+                ),
+                "value_area_volume": float(
+                    self.value_area_volume
+                    if self.value_area_volume is not None
+                    else DEFAULT_VALUE_AREA_VOLUME
+                ),
+                "histogram": dict(self.histogram or DEFAULT_HISTOGRAM),
+                "poc": dict(self.poc or DEFAULT_POC),
+                "vah": dict(self.vah or DEFAULT_VAH),
+                "val": dict(self.val or DEFAULT_VAL),
             }
         # session_vp
         return {
@@ -218,6 +251,69 @@ def parse_indicator_dict(raw: dict[str, Any]) -> IndicatorConfig:
             val=_parse_style_level(raw.get("val"), DEFAULT_VAL),
         )
 
+    if itype == "fixed_range_vp":
+        if "start" not in raw or raw["start"] is None:
+            raise ValueError("fixed_range_vp start (time anchor) is required")
+        if "end" not in raw or raw["end"] is None:
+            raise ValueError("fixed_range_vp end (time anchor) is required")
+        try:
+            start = int(raw["start"])
+            end = int(raw["end"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed_range_vp start and end must be unix timestamps") from exc
+        if start > end:
+            raise ValueError("fixed_range_vp start must be <= end")
+        extend = bool(raw.get("extend_to_right", False))
+        placement = str(raw.get("placement", DEFAULT_PLACEMENT)).strip().lower()
+        if placement not in ("left", "right"):
+            raise ValueError("fixed_range_vp placement must be 'left' or 'right'")
+        try:
+            rows = int(
+                raw["rows"]
+                if "rows" in raw and raw["rows"] is not None
+                else DEFAULT_FIXED_RANGE_VP_ROWS
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed_range_vp rows must be a positive integer") from exc
+        if rows < 1:
+            raise ValueError("fixed_range_vp rows must be >= 1")
+        try:
+            box_width = float(
+                raw["box_width"]
+                if "box_width" in raw and raw["box_width"] is not None
+                else DEFAULT_BOX_WIDTH
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed_range_vp box_width must be a number") from exc
+        if box_width <= 0 or box_width > 100:
+            raise ValueError("fixed_range_vp box_width must be in (0, 100]")
+        try:
+            va = float(
+                raw["value_area_volume"]
+                if "value_area_volume" in raw and raw["value_area_volume"] is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fixed_range_vp value_area_volume must be a number") from exc
+        if va <= 0 or va > 100:
+            raise ValueError("fixed_range_vp value_area_volume must be in (0, 100]")
+        return IndicatorConfig(
+            id=iid,
+            type="fixed_range_vp",
+            enabled=enabled,
+            start=start,
+            end=end,
+            extend_to_right=extend,
+            box_width=box_width,
+            placement=placement,
+            rows=rows,
+            value_area_volume=va,
+            histogram=_parse_histogram_style(raw.get("histogram")),
+            poc=_parse_style_level(raw.get("poc"), DEFAULT_POC),
+            vah=_parse_style_level(raw.get("vah"), DEFAULT_VAH),
+            val=_parse_style_level(raw.get("val"), DEFAULT_VAL),
+        )
+
     raise ValueError(f"unsupported indicator type: {itype!r}")
 
 
@@ -226,6 +322,7 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     ma_count = sum(1 for c in configs if c.type == "ma")
     vol_count = sum(1 for c in configs if c.type == "volume")
     svp_count = sum(1 for c in configs if c.type == "session_vp")
+    frvp_count = sum(1 for c in configs if c.type == "fixed_range_vp")
     if ma_count > MAX_MA_LINES:
         raise ValueError(
             f"ma limit exceeded: max {MAX_MA_LINES} lines per chart, got {ma_count}"
@@ -237,6 +334,10 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     if svp_count > MAX_SESSION_VP:
         raise ValueError(
             f"session_vp limit exceeded: max {MAX_SESSION_VP} instance per chart, got {svp_count}"
+        )
+    if frvp_count > MAX_FIXED_RANGE_VP:
+        raise ValueError(
+            f"fixed_range_vp limit exceeded: max {MAX_FIXED_RANGE_VP} instances per chart, got {frvp_count}"
         )
     ids = [c.id for c in configs]
     if len(ids) != len(set(ids)):
@@ -280,6 +381,7 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
         ma_n = 0
         vol_n = 0
         svp_n = 0
+        frvp_n = 0
         seen: set[str] = set()
         for c in out:
             if c.id in seen:
@@ -296,6 +398,10 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
                 if svp_n >= MAX_SESSION_VP:
                     continue
                 svp_n += 1
+            elif c.type == "fixed_range_vp":
+                if frvp_n >= MAX_FIXED_RANGE_VP:
+                    continue
+                frvp_n += 1
             seen.add(c.id)
             trimmed.append(c)
         return trimmed
@@ -513,6 +619,63 @@ def compute_session_vp(
     return profiles
 
 
+def compute_fixed_range_vp(
+    bars: list[Bar] | tuple[Bar, ...],
+    *,
+    start: int,
+    end: int,
+    extend_to_right: bool,
+    rows: int,
+    value_area_volume: float,
+) -> list[dict[str, Any]]:
+    """One profile between two time anchors; optional live build past end.
+
+    When extend_to_right is off: only bars with open in [start, end] count, and
+    POC/VAH/VAL levels end at the user end anchor (no projection past the window).
+
+    When on: bars from start forward (including past end) accumulate into the
+    profile, and levels_end projects to the latest contributing bar so confluence
+    remains visible on newer candles.
+    """
+    if start > end:
+        return []
+
+    if extend_to_right:
+        window_bars = [b for b in bars if int(b.ts) >= start]
+    else:
+        window_bars = [b for b in bars if start <= int(b.ts) <= end]
+
+    if not window_bars:
+        return []
+
+    built = build_volume_profile(
+        window_bars,
+        rows=rows,
+        value_area_volume=value_area_volume,
+    )
+    if built is None:
+        return []
+
+    last_ts = max(int(b.ts) for b in window_bars)
+    if extend_to_right:
+        range_end = max(end, last_ts)
+        levels_end = range_end
+    else:
+        range_end = end
+        levels_end = end
+
+    return [
+        {
+            "range_start": start,
+            "range_end": range_end,
+            "anchor_end": end,
+            "levels_end": levels_end,
+            "extend_to_right": extend_to_right,
+            **built,
+        }
+    ]
+
+
 def compute_series(
     configs: list[IndicatorConfig],
     bars: list[Bar] | tuple[Bar, ...],
@@ -558,6 +721,30 @@ def compute_series(
             )
             series[cfg.id] = {
                 "type": "session_vp",
+                "profiles": profiles,
+            }
+        elif cfg.type == "fixed_range_vp":
+            rows = int(
+                cfg.rows if cfg.rows is not None else DEFAULT_FIXED_RANGE_VP_ROWS
+            )
+            va = float(
+                cfg.value_area_volume
+                if cfg.value_area_volume is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+            start = int(cfg.start if cfg.start is not None else 0)
+            end = int(cfg.end if cfg.end is not None else 0)
+            extend = bool(cfg.extend_to_right) if cfg.extend_to_right is not None else False
+            profiles = compute_fixed_range_vp(
+                bars,
+                start=start,
+                end=end,
+                extend_to_right=extend,
+                rows=rows,
+                value_area_volume=va,
+            )
+            series[cfg.id] = {
+                "type": "fixed_range_vp",
                 "profiles": profiles,
             }
     return series
