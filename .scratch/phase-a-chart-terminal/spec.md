@@ -1,6 +1,6 @@
 # Phase A — Chart Terminal (v1 first ship)
 
-Status: ready-for-agent
+Status: done
 
 ## Problem Statement
 
