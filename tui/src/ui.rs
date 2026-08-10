@@ -111,13 +111,14 @@ fn draw_help_popup(frame: &mut Frame) {
         row("x / d", "Remove selected symbol"),
         section("Indicator panel"),
         row("↑ / ↓", "Select indicator row"),
-        row("Space", "Enable / disable selected"),
+        row("Space / Enter", "Enable / disable selected (incl. Fixed Range + Anchored)"),
         row("m", "Add MA stack (SMA 10 / 60 / 200)"),
         row("v", "Add Volume (max 1)"),
         row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
         row("f", "Add Fixed Range VP (max 4) → pin placement on chart"),
-        row("a", "Add Anchored VP (max 2) → single pin (forward to now)"),
-        row("r / Enter", "Re-place FRVP pins or AVP anchor (when selected)"),
+        row("a", "Add Anchored VP (max 2; cash open 09:30 NY default)"),
+        row("r", "Re-place FRVP pins or AVP anchor (when selected)"),
+        row("c", "Clear all indicators except Volume"),
         row("e", "Fixed Range: toggle extend-to-right"),
         row("9", "Anchored VP: snap anchor to 09:30 America/New_York"),
         row(", / .", "Nudge FRVP start or AVP anchor bar-by-bar"),
@@ -302,7 +303,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::Yellow))
     } else if panel_open {
         Paragraph::new(format!(
-            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  a AVP  ·  r/Enter re-pin  ·  9 cash  ·  Space  ·  s  ·  +/-  ·  1/2/3  ·  x  ·  o/Esc",
+            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  a AVP  ·  r re-pin  ·  c clear  ·  Space/Enter on/off  ·  9 cash  ·  x  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
@@ -325,7 +326,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m MA · v Volume · p Session VP · f Fixed Range · a Anchored VP)",
+            "(naked — m MA · v Volume · p Session VP · f Fixed Range · a Anchored · c clear-keep-vol)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -388,7 +389,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                         "pins✓"
                     };
                     format!(
-                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins} {}  (Enter/r re-pin)",
+                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins} {}  (Space/Enter on/off · r re-pin)",
                         vp_levels(ind)
                     )
                 }
@@ -396,13 +397,13 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     let rows = ind.rows.unwrap_or(500);
                     let place = ind.placement.as_deref().unwrap_or("right");
                     let bw = ind.box_width.unwrap_or(30.0) as i64;
-                    let pin = if !ind.enabled || ind.anchor.is_none() {
+                    let pin = if ind.anchor.is_none() {
                         "pin?"
                     } else {
                         "pin✓"
                     };
                     format!(
-                        "{mark}[{on}] Anchored VP rows={rows} w={bw}% {place} {pin} {}  (Enter/r re-pin · 9 cash open)",
+                        "{mark}[{on}] Anchored VP rows={rows} w={bw}% {place} {pin} {}  (Space/Enter on/off · r re-pin · 9 cash)",
                         vp_levels(ind)
                     )
                 }

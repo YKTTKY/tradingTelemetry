@@ -207,26 +207,15 @@ fn handle_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Up => app.indicator_select_delta(-1),
             KeyCode::Down => app.indicator_select_delta(1),
-            KeyCode::Char(' ') => app.indicator_toggle_selected(),
-            KeyCode::Enter => {
-                // Enter on FRVP/AVP re-places pins; otherwise toggles enabled.
-                let itype = app
-                    .focused_chart()
-                    .indicators
-                    .get(app.indicator_selected)
-                    .map(|i| i.indicator_type.as_str())
-                    .unwrap_or("");
-                match itype {
-                    "fixed_range_vp" => app.indicator_replace_frvp_pins(),
-                    "anchored_vp" => app.indicator_replace_avp_pin(),
-                    _ => app.indicator_toggle_selected(),
-                }
-            }
+            // Space / Enter: enable/disable selected (including FRVP + AVP).
+            // Re-pin is only on `r` so Enter never jumps into pin placement.
+            KeyCode::Char(' ') | KeyCode::Enter => app.indicator_toggle_selected(),
             KeyCode::Char('m') | KeyCode::Char('M') => app.indicator_add_default_ma_stack(),
             KeyCode::Char('v') | KeyCode::Char('V') => app.indicator_add_volume(),
             KeyCode::Char('p') | KeyCode::Char('P') => app.indicator_add_session_vp(),
             KeyCode::Char('f') | KeyCode::Char('F') => app.indicator_add_fixed_range_vp(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.indicator_add_anchored_vp(),
+            KeyCode::Char('c') | KeyCode::Char('C') => app.indicator_clear_except_volume(),
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 let itype = app
                     .focused_chart()
@@ -236,7 +225,8 @@ fn handle_key(app: &mut App, code: KeyCode) {
                     .unwrap_or("");
                 match itype {
                     "anchored_vp" => app.indicator_replace_avp_pin(),
-                    _ => app.indicator_replace_frvp_pins(),
+                    "fixed_range_vp" => app.indicator_replace_frvp_pins(),
+                    _ => {}
                 }
             }
             KeyCode::Char('e') | KeyCode::Char('E') => app.indicator_toggle_frvp_extend(),

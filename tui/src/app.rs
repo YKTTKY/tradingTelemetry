@@ -1074,7 +1074,8 @@ impl App {
                     cfg.enabled = true;
                 }
                 self.frvp_place = None;
-                self.input_mode = InputMode::Normal;
+                // Return to the indicator panel after both pins lock.
+                self.input_mode = InputMode::IndicatorPanel;
                 self.focused = chart_idx;
                 self.arm_indicators_apply();
             }
@@ -1083,7 +1084,7 @@ impl App {
 
     pub fn frvp_place_cancel(&mut self) {
         let Some(place) = self.frvp_place.take() else {
-            self.input_mode = InputMode::Normal;
+            self.input_mode = InputMode::IndicatorPanel;
             return;
         };
         if place.is_new {
@@ -1093,16 +1094,15 @@ impl App {
             }
             self.clamp_indicator_selection();
         }
-        self.input_mode = InputMode::Normal;
+        self.input_mode = InputMode::IndicatorPanel;
     }
 
-    /// Add Anchored Volume Profile (max 2) and enter single-pin placement.
+    /// Add Anchored Volume Profile (max 2) with cash-open 09:30 NY default.
     ///
-    /// Does **not** POST until the pin is confirmed with Enter.
-    /// Typical default: cash open 09:30 America/New_York on the last bar's NY day —
-    /// cursor seeds near that time when bars allow.
+    /// Stays in the indicator panel and applies immediately so the row is
+    /// visible. Use `r` to re-place the anchor pin on the chart if needed.
     pub fn indicator_add_anchored_vp(&mut self) {
-        if !matches!(self.input_mode, InputMode::IndicatorPanel | InputMode::Normal) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
         }
         if matches!(
@@ -1117,7 +1117,7 @@ impl App {
         };
         if bar_count == 0 {
             self.last_indicator_error =
-                Some("Anchored VP needs bars on the chart before placing the anchor".into());
+                Some("Anchored VP needs bars on the chart (load history first)".into());
             return;
         }
         let chart = self.focused_chart_mut();
@@ -1133,37 +1133,45 @@ impl App {
             return;
         }
         let id = format!("avp{}", count + 1);
-        let (provisional_ts, seed_cursor) = match &chart.series {
+        // Prefer cash open 09:30 NY on the last bar's day; fall back to first bar.
+        let anchor_ts = match &chart.series {
             ChartSeriesState::Available { bars } if !bars.is_empty() => {
                 let last_ts = bars.last().map(|b| b.ts).unwrap_or(0);
                 let cash = cash_open_ny(last_ts);
-                let cursor = bars
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, b)| (b.ts - cash).abs())
-                    .map(|(i, _)| i)
-                    .unwrap_or(bars.len().saturating_sub(1));
-                (cash, cursor)
+                // If cash open is after the whole series, use the first bar.
+                if cash > last_ts {
+                    bars.first().map(|b| b.ts).unwrap_or(cash)
+                } else {
+                    cash
+                }
             }
-            _ => (0, 0),
+            _ => 0,
         };
-        let chart_id = chart.id.clone();
         chart
             .indicators
-            .push(IndicatorConfig::anchored_vp_default(id.clone(), provisional_ts));
-        // Disable until pin locks so we don't draw a junk full-span profile.
-        if let Some(last) = chart.indicators.last_mut() {
-            last.enabled = false;
-        }
+            .push(IndicatorConfig::anchored_vp_default(id, anchor_ts));
         self.indicator_selected = chart.indicators.len().saturating_sub(1);
-        self.avp_place = Some(AvpPlaceState {
-            chart_id,
-            indicator_id: id,
-            cursor_bar: seed_cursor,
-            is_new: true,
-        });
-        self.input_mode = InputMode::AvpPlacing;
         self.last_indicator_error = None;
+        self.arm_indicators_apply();
+    }
+
+    /// Remove every indicator on the focused chart except Volume instances.
+    pub fn indicator_clear_except_volume(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let before = chart.indicators.len();
+        chart.indicators.retain(|i| i.indicator_type == "volume");
+        // Drop hot series for removed ids.
+        let keep: std::collections::HashSet<String> =
+            chart.indicators.iter().map(|i| i.id.clone()).collect();
+        chart.indicator_series.retain(|id, _| keep.contains(id));
+        if chart.indicators.len() == before {
+            return;
+        }
+        self.clamp_indicator_selection();
+        self.arm_indicators_apply();
     }
 
     /// Re-place the anchor pin for the selected Anchored VP (`r` / Enter in panel).
@@ -1295,14 +1303,15 @@ impl App {
             cfg.enabled = true;
         }
         self.avp_place = None;
-        self.input_mode = InputMode::Normal;
+        // Return to the indicator panel so the AVP row stays visible after pin lock.
+        self.input_mode = InputMode::IndicatorPanel;
         self.focused = chart_idx;
         self.arm_indicators_apply();
     }
 
     pub fn avp_place_cancel(&mut self) {
         let Some(place) = self.avp_place.take() else {
-            self.input_mode = InputMode::Normal;
+            self.input_mode = InputMode::IndicatorPanel;
             return;
         };
         if place.is_new {
@@ -1312,7 +1321,7 @@ impl App {
             }
             self.clamp_indicator_selection();
         }
-        self.input_mode = InputMode::Normal;
+        self.input_mode = InputMode::IndicatorPanel;
     }
 
     /// Nudge Anchored VP anchor by one bar step when selected in the panel.
@@ -2716,7 +2725,51 @@ mod tests {
     }
 
     #[test]
-    fn anchored_vp_single_pin_placement_locks_and_applies() {
+    fn anchored_vp_add_stays_in_panel_and_applies_with_cash_open() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        // 2024-07-01 10:00 ET bars so cash open 09:30 is on that day.
+        let bars: Vec<OhlcvBar> = (0..5)
+            .map(|i| OhlcvBar {
+                ts: 1_719_842_400 + i * 60,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+            })
+            .collect();
+        // Chart default is SPY@1D — interest response must match or bars are ignored.
+        app.focused_chart_mut().timeframe = "1m".into();
+        app.apply_chart_series(ChartInterestResponse {
+            status: "ok".into(),
+            instrument: "SPY".into(),
+            timeframe: "1m".into(),
+            chart_id: Some("primary".into()),
+            bars: bars.clone(),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_add_anchored_vp();
+        // Immediate apply — stay in panel; no forced pin mode.
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+        assert!(app.avp_place.is_none());
+        let av = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .find(|i| i.indicator_type == "anchored_vp")
+            .expect("avp added");
+        assert!(av.enabled);
+        assert_eq!(av.rows, Some(500));
+        assert_eq!(av.anchor, Some(cash_open_ny(bars[0].ts)));
+        assert!(app.pending_indicators.is_some());
+    }
+
+    #[test]
+    fn anchored_vp_re_pin_returns_to_panel_on_confirm() {
         let mut app = App::default();
         app.enter_workspace();
         app.chart_load_started();
@@ -2741,22 +2794,14 @@ mod tests {
         });
         app.input_mode = InputMode::IndicatorPanel;
         app.indicator_add_anchored_vp();
+        app.pending_indicators = None;
+        app.indicator_replace_avp_pin();
         assert_eq!(app.input_mode, InputMode::AvpPlacing);
-        assert!(app.avp_place.is_some());
-        let av = app
-            .focused_chart()
-            .indicators
-            .iter()
-            .find(|i| i.indicator_type == "anchored_vp")
-            .expect("avp added");
-        assert!(!av.enabled);
-        assert!(app.pending_indicators.is_none());
-
-        app.avp_place_move(-100); // clamp to 0
+        app.avp_place_move(-100);
         app.avp_place_move(2);
         app.avp_place_confirm();
         assert!(app.avp_place.is_none());
-        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
         let av = app
             .focused_chart()
             .indicators
@@ -2765,50 +2810,28 @@ mod tests {
             .expect("avp still present");
         assert!(av.enabled);
         assert_eq!(av.anchor, Some(bars[2].ts));
-        assert_eq!(av.rows, Some(500));
         assert!(app.pending_indicators.is_some());
     }
 
     #[test]
-    fn anchored_vp_cancel_drops_new_draft() {
+    fn clear_except_volume_keeps_only_volume() {
         let mut app = App::default();
         app.enter_workspace();
-        app.chart_load_started();
-        app.apply_chart_series(ChartInterestResponse {
-            status: "ok".into(),
-            instrument: "SPY".into(),
-            timeframe: "1D".into(),
-            chart_id: Some("primary".into()),
-            bars: vec![OhlcvBar {
-                ts: 1_700_000_000,
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.5,
-                volume: 1_000.0,
-            }],
-            indicators: vec![],
-            series: HashMap::new(),
-        });
         app.input_mode = InputMode::IndicatorPanel;
-        app.indicator_add_anchored_vp();
-        assert_eq!(
-            app.focused_chart()
-                .indicators
-                .iter()
-                .filter(|i| i.indicator_type == "anchored_vp")
-                .count(),
-            1
-        );
-        app.avp_place_cancel();
-        assert!(app.avp_place.is_none());
-        assert_eq!(app.input_mode, InputMode::Normal);
-        assert!(
-            app.focused_chart()
-                .indicators
-                .iter()
-                .all(|i| i.indicator_type != "anchored_vp")
-        );
+        let chart = app.focused_chart_mut();
+        chart.indicators.push(IndicatorConfig::ma("ma10", "sma", 10));
+        chart.indicators.push(IndicatorConfig::volume("volume"));
+        chart
+            .indicators
+            .push(IndicatorConfig::session_vp_default("svp"));
+        chart
+            .indicators
+            .push(IndicatorConfig::anchored_vp_default("avp", 1_700_000_000));
+        app.indicator_clear_except_volume();
+        let inds = &app.focused_chart().indicators;
+        assert_eq!(inds.len(), 1);
+        assert_eq!(inds[0].indicator_type, "volume");
+        assert!(app.pending_indicators.is_some());
     }
 
     #[test]
@@ -2863,7 +2886,7 @@ mod tests {
         app.frvp_place_move(1);
         app.frvp_place_confirm();
         assert!(app.frvp_place.is_none());
-        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
         let fr = app
             .focused_chart()
             .indicators
@@ -2902,7 +2925,7 @@ mod tests {
         assert_eq!(app.focused_chart().indicators.len(), 1);
         app.frvp_place_cancel();
         assert!(app.focused_chart().indicators.is_empty());
-        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
     }
 
     fn dual_workspace() -> WorkspaceSnapshot {
