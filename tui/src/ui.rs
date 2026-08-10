@@ -116,8 +116,11 @@ fn draw_help_popup(frame: &mut Frame) {
         row("v", "Add Volume (max 1)"),
         row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
         row("f", "Add Fixed Range VP (max 4) → pin placement on chart"),
-        row("r / Enter", "Re-place Fixed Range pins (when FRVP selected)"),
+        row("a", "Add Anchored VP (max 2) → single pin (forward to now)"),
+        row("r / Enter", "Re-place FRVP pins or AVP anchor (when selected)"),
         row("e", "Fixed Range: toggle extend-to-right"),
+        row("9", "Anchored VP: snap anchor to 09:30 America/New_York"),
+        row(", / .", "Nudge FRVP start or AVP anchor bar-by-bar"),
         row("s", "MA: SMA↔EMA · VP: left↔right place"),
         row("+ / -", "MA: length · VP: box width %"),
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
@@ -128,6 +131,12 @@ fn draw_help_popup(frame: &mut Frame) {
         row("[ / ]", "Jump pin cursor 10 bars"),
         row("Enter", "Lock start pin, then lock end pin"),
         row("Esc", "Cancel placement (drops new FRVP)"),
+        section("Anchored VP pin placement"),
+        row("← / →", "Move anchor pin bar-by-bar (h/l also)"),
+        row("[ / ]", "Jump pin cursor 10 bars"),
+        row("9", "Snap to cash open 09:30 America/New_York"),
+        row("Enter", "Lock anchor (profile builds to now)"),
+        row("Esc", "Cancel placement (drops new AVP)"),
         section("Text prompts"),
         row("Enter", "Apply instrument or watchlist add"),
         row("Esc", "Cancel prompt"),
@@ -169,11 +178,10 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let panel_open = matches!(app.input_mode, InputMode::IndicatorPanel);
-    let placing = matches!(app.input_mode, InputMode::FrvpPlacing);
     let prompt_h = match &app.input_mode {
         InputMode::InstrumentPrompt { .. } | InputMode::WatchlistAddPrompt { .. } => 3,
         InputMode::IndicatorPanel => 10,
-        InputMode::FrvpPlacing => 3,
+        InputMode::FrvpPlacing | InputMode::AvpPlacing => 3,
         InputMode::Normal => 0,
     };
     let chunks = Layout::default()
@@ -252,6 +260,23 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             );
             frame.render_widget(prompt, chunks[2]);
         }
+        InputMode::AvpPlacing => {
+            let prompt = Paragraph::new(
+                "ANCHOR pin  ·  Yellow ▼ on candle  ·  profile builds from here → now\n←/→ move bar  ·  [/] ±10  ·  9 cash open 09:30 NY  ·  Enter lock  ·  Esc cancel",
+            )
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow))
+                    .title(" Anchored VP · place anchor on chart "),
+            );
+            frame.render_widget(prompt, chunks[2]);
+        }
         InputMode::Normal => {}
     }
 
@@ -265,14 +290,19 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .active_watchlist()
         .map(|w| w.name.as_str())
         .unwrap_or("—");
-    let help = if placing {
+    let help = if matches!(app.input_mode, InputMode::FrvpPlacing) {
         Paragraph::new(
             "Fixed Range pins  ·  ←/→ bar  ·  [/] jump  ·  Enter lock  ·  Esc cancel  ·  ? help",
         )
         .style(Style::default().fg(Color::Yellow))
+    } else if matches!(app.input_mode, InputMode::AvpPlacing) {
+        Paragraph::new(
+            "Anchored pin  ·  ←/→ bar  ·  [/] jump  ·  9 cash open  ·  Enter lock  ·  Esc cancel  ·  ? help",
+        )
+        .style(Style::default().fg(Color::Yellow))
     } else if panel_open {
         Paragraph::new(format!(
-            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  r/Enter re-pin  ·  Space  ·  s place  ·  +/-  ·  1/2/3  ·  x  ·  o/Esc",
+            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  a AVP  ·  r/Enter re-pin  ·  9 cash  ·  Space  ·  s  ·  +/-  ·  1/2/3  ·  x  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
@@ -295,7 +325,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m MA · v Volume · p Session VP · f Fixed Range VP)",
+            "(naked — m MA · v Volume · p Session VP · f Fixed Range · a Anchored VP)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -359,6 +389,20 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     };
                     format!(
                         "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins} {}  (Enter/r re-pin)",
+                        vp_levels(ind)
+                    )
+                }
+                "anchored_vp" => {
+                    let rows = ind.rows.unwrap_or(500);
+                    let place = ind.placement.as_deref().unwrap_or("right");
+                    let bw = ind.box_width.unwrap_or(30.0) as i64;
+                    let pin = if !ind.enabled || ind.anchor.is_none() {
+                        "pin?"
+                    } else {
+                        "pin✓"
+                    };
+                    format!(
+                        "{mark}[{on}] Anchored VP rows={rows} w={bw}% {place} {pin} {}  (Enter/r re-pin · 9 cash open)",
                         vp_levels(ind)
                     )
                 }
@@ -648,11 +692,23 @@ fn draw_candles(
     let ma_hint = ma_legend(&ma_lines);
     let svp = chart.enabled_session_vp();
     let frvps = chart.enabled_fixed_range_vps();
-    let vp_hint = match (svp.is_some(), !frvps.is_empty()) {
-        (true, true) => "  VP+FR",
-        (true, false) => "  VP",
-        (false, true) => "  FRVP",
-        (false, false) => "",
+    let avps = chart.enabled_anchored_vps();
+    let vp_hint = {
+        let mut tags: Vec<&str> = Vec::new();
+        if svp.is_some() {
+            tags.push("VP");
+        }
+        if !frvps.is_empty() {
+            tags.push("FR");
+        }
+        if !avps.is_empty() {
+            tags.push("AV");
+        }
+        if tags.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", tags.join("+"))
+        }
     };
     let subtitle = format!(
         " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
@@ -696,13 +752,16 @@ fn draw_candles(
         ma_segments.push((color, pts));
     }
 
-    // Precompute Session + Fixed Range VP drawable primitives in chart x/y space.
+    // Precompute Session + Fixed Range + Anchored VP drawable primitives in chart x/y space.
     let mut vp_draw = build_session_vp_draw(svp, visible, n);
     let fr_draw = build_fixed_range_vp_draw(&frvps, visible, n);
     vp_draw.hist_rects.extend(fr_draw.hist_rects);
     vp_draw.levels.extend(fr_draw.levels);
+    let av_draw = build_anchored_vp_draw(&avps, visible, n);
+    vp_draw.hist_rects.extend(av_draw.hist_rects);
+    vp_draw.levels.extend(av_draw.levels);
 
-    // Pin markers: placement cursor + locked start + set range anchors on enabled FRVPs.
+    // Pin markers: placement cursor + locked anchors on enabled FRVPs / AVPs.
     let pin_labels = collect_frvp_pin_labels(
         app,
         chart,
@@ -863,7 +922,31 @@ fn collect_frvp_pin_labels(
         }
     }
 
-    // Live placement session for this chart.
+    // Locked anchors for enabled Anchored VP instances.
+    for cfg in chart
+        .indicators
+        .iter()
+        .filter(|i| i.indicator_type == "anchored_vp" && i.enabled)
+    {
+        if let Some(ts) = cfg.anchor {
+            if let Some(i) = nearest_idx(ts) {
+                if let Some((x, bar)) = bar_x(i) {
+                    out.push((x, pin_y(bar), "◆".into(), Color::LightCyan));
+                }
+            }
+        }
+    }
+
+    // Live Anchored VP placement cursor.
+    if let Some(place) = app.avp_place.as_ref() {
+        if place.chart_id == chart.id {
+            if let Some((x, bar)) = bar_x(place.cursor_bar) {
+                out.push((x, pin_y(bar), "▼".into(), Color::Yellow));
+            }
+        }
+    }
+
+    // Live Fixed Range placement session for this chart.
     if let Some(place) = app.frvp_place.as_ref() {
         if place.chart_id == chart.id {
             if let Some(start_i) = place.start_bar {
@@ -1181,6 +1264,155 @@ fn build_fixed_range_vp_draw(
             }
 
             // Levels: from range start to levels_end (projects past anchor when extend on).
+            let x_lo = hist_lo;
+            let x_hi = levels_hi.max(hist_hi);
+            if poc_on && level_visible(cfg.poc.as_ref()) {
+                levels.push((x_lo, x_hi, profile.poc, poc_color));
+            }
+            if vah_on && level_visible(cfg.vah.as_ref()) {
+                levels.push((x_lo, x_hi, profile.vah, vah_color));
+            }
+            if val_on && level_visible(cfg.val.as_ref()) {
+                levels.push((x_lo, x_hi, profile.val, val_color));
+            }
+        }
+    }
+
+    VpOverlayDraw {
+        hist_rects,
+        levels,
+    }
+}
+
+fn build_anchored_vp_draw(
+    avps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+    visible: &[OhlcvBar],
+    n: f64,
+) -> VpOverlayDraw {
+    // Anchored VP is always "extend to now": reuse Fixed Range-style draw with
+    // range_start=anchor and range_end/levels_end from the engine profile.
+    // Map cfg.anchor into the same fields FRVP expects via a thin adapter.
+    let empty = VpOverlayDraw {
+        hist_rects: Vec::new(),
+        levels: Vec::new(),
+    };
+    if avps.is_empty() || visible.is_empty() {
+        return empty;
+    }
+
+    let vis_start = visible.first().map(|b| b.ts).unwrap_or(0);
+    let vis_end = visible.last().map(|b| b.ts).unwrap_or(0);
+
+    let ts_to_x = |ts: i64| -> f64 {
+        if visible.len() == 1 {
+            return 0.5;
+        }
+        let mut best_i = 0usize;
+        let mut best_d = (visible[0].ts - ts).abs();
+        for (i, b) in visible.iter().enumerate().skip(1) {
+            let d = (b.ts - ts).abs();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        best_i as f64 + 0.5
+    };
+
+    let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
+        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+    };
+
+    let mut hist_rects: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
+    let mut levels: Vec<(f64, f64, f64, Color)> = Vec::new();
+
+    for (cfg, series) in avps {
+        if series.profiles.is_empty() {
+            continue;
+        }
+        let box_width_pct = cfg.box_width.unwrap_or(30.0).clamp(1.0, 100.0) / 100.0;
+        let placement_right = cfg.placement.as_deref().unwrap_or("right") != "left";
+        let hist_style = cfg.histogram.as_ref();
+        let hist_color = hist_color_for_opacity(
+            hist_style.and_then(|h| h.color.as_deref()),
+            hist_style.and_then(|h| h.opacity),
+        );
+        let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
+        let poc_color =
+            named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
+        let vah_color =
+            named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
+        let val_color =
+            named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+
+        for profile in &series.profiles {
+            let range_start = profile
+                .range_start
+                .or(profile.anchor)
+                .or(cfg.anchor)
+                .unwrap_or(vis_start);
+            let range_end = profile.range_end.unwrap_or(vis_end);
+            let levels_end = profile
+                .levels_end
+                .or(profile.range_end)
+                .unwrap_or(range_end);
+            if range_end < vis_start || range_start > vis_end {
+                continue;
+            }
+            let x_start = ts_to_x(range_start);
+            let x_hist_end = ts_to_x(range_end);
+            let x_levels_end = ts_to_x(levels_end);
+            let (hist_lo, hist_hi) = if x_hist_end >= x_start {
+                (
+                    x_start.min(n - 0.5).max(0.0),
+                    x_hist_end.min(n).max(0.5),
+                )
+            } else {
+                (
+                    x_hist_end.min(n - 0.5).max(0.0),
+                    x_start.min(n).max(0.5),
+                )
+            };
+            let levels_hi = x_levels_end.min(n).max(hist_hi);
+            let span = (hist_hi - hist_lo).max(1.0);
+            let box_w = span * box_width_pct;
+            let hist_x0 = if placement_right {
+                hist_hi - box_w
+            } else {
+                hist_lo
+            };
+
+            if let Some(hcolor) = hist_color {
+                let max_vol = profile
+                    .bins
+                    .iter()
+                    .map(|b| b.volume)
+                    .fold(0.0_f64, f64::max)
+                    .max(f64::EPSILON);
+                let bin_count = profile.bins.len();
+                let step = (bin_count / 80).max(1);
+                for (i, bin) in profile.bins.iter().enumerate() {
+                    if i % step != 0 && i + 1 != bin_count {
+                        continue;
+                    }
+                    if bin.volume <= 0.0 {
+                        continue;
+                    }
+                    let frac = (bin.volume / max_vol).clamp(0.0, 1.0);
+                    let bar_w = box_w * frac;
+                    let x = if placement_right {
+                        hist_x0 + box_w - bar_w
+                    } else {
+                        hist_x0
+                    };
+                    let y = bin.price_low;
+                    let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
+                    hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+                }
+            }
+
             let x_lo = hist_lo;
             let x_hi = levels_hi.max(hist_hi);
             if poc_on && level_visible(cfg.poc.as_ref()) {

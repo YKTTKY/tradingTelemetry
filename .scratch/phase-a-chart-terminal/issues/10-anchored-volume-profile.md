@@ -6,12 +6,12 @@
 
 **Status:** ready-for-agent
 
-- [ ] Anchored VP addable via indicator panel; max 2 per chart enforced
-- [ ] Profile builds from one anchor forward to current/latest bars
-- [ ] Defaults: rows 500, value area 70%; POC/VAH/VAL toggleable with style
-- [ ] Anchor settable without full TV drawing suite (form/keyboard/preset acceptable)
-- [ ] Overlay render; settings restore with workspace
-- [ ] Contract tests cover anchor window and levels with fake bars
+- [x] Anchored VP addable via indicator panel; max 2 per chart enforced
+- [x] Profile builds from one anchor forward to current/latest bars
+- [x] Defaults: rows 500, value area 70%; POC/VAH/VAL toggleable with style
+- [x] Anchor settable without full TV drawing suite (form/keyboard/preset acceptable)
+- [x] Overlay render; settings restore with workspace
+- [x] Contract tests cover anchor window and levels with fake bars
 
 ## Notes
 

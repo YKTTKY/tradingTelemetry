@@ -138,6 +138,9 @@ pub struct IndicatorConfig {
     pub end: Option<i64>,
     #[serde(default)]
     pub extend_to_right: Option<bool>,
+    /// Anchored VP single time anchor (unix seconds, forward to now).
+    #[serde(default)]
+    pub anchor: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -184,6 +187,7 @@ impl IndicatorConfig {
             start: None,
             end: None,
             extend_to_right: None,
+            anchor: None,
         }
     }
 
@@ -206,6 +210,7 @@ impl IndicatorConfig {
             start: None,
             end: None,
             extend_to_right: None,
+            anchor: None,
         }
     }
 
@@ -232,6 +237,7 @@ impl IndicatorConfig {
             start: None,
             end: None,
             extend_to_right: None,
+            anchor: None,
         }
     }
 
@@ -264,6 +270,35 @@ impl IndicatorConfig {
             start: Some(start),
             end: Some(end),
             extend_to_right: Some(false),
+            anchor: None,
+        }
+    }
+
+    /// Anchored VP defaults: rows 500, VA 70%; single `anchor` supplied by caller.
+    pub fn anchored_vp_default(id: impl Into<String>, anchor: i64) -> Self {
+        let (poc, vah, val) = Self::vp_level_defaults();
+        Self {
+            id: id.into(),
+            indicator_type: "anchored_vp".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: None,
+            box_width: Some(30.0),
+            placement: Some("right".into()),
+            rows: Some(500),
+            value_area_volume: Some(70.0),
+            histogram: Some(HistogramStyle {
+                color: Some("steelblue".into()),
+                opacity: Some(0.35),
+            }),
+            poc,
+            vah,
+            val,
+            start: None,
+            end: None,
+            extend_to_right: None,
+            anchor: Some(anchor),
         }
     }
 }
@@ -282,13 +317,16 @@ pub struct VpProfile {
     pub session_start: Option<i64>,
     #[serde(default)]
     pub session_end: Option<i64>,
-    /// Fixed Range VP anchors / effective window.
+    /// Fixed Range / Anchored VP anchors / effective window.
     #[serde(default)]
     pub range_start: Option<i64>,
     #[serde(default)]
     pub range_end: Option<i64>,
     #[serde(default)]
     pub anchor_end: Option<i64>,
+    /// Anchored VP: the single time anchor (also mirrored as range_start).
+    #[serde(default)]
+    pub anchor: Option<i64>,
     /// Where POC/VAH/VAL lines draw to (may project past anchor_end when extend is on).
     #[serde(default)]
     pub levels_end: Option<i64>,

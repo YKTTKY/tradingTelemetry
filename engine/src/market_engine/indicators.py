@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from market_engine.vendor import Bar
 
-IndicatorType = Literal["ma", "volume", "session_vp", "fixed_range_vp"]
+IndicatorType = Literal["ma", "volume", "session_vp", "fixed_range_vp", "anchored_vp"]
 MaType = Literal["sma", "ema"]
 SessionClock = Literal["equity", "cme_equity_index"]
 Placement = Literal["left", "right"]
@@ -18,10 +18,12 @@ MAX_MA_LINES = 3
 MAX_VOLUME = 1
 MAX_SESSION_VP = 1
 MAX_FIXED_RANGE_VP = 4
+MAX_ANCHORED_VP = 2
 DEFAULT_MA_STACK_LENGTHS: tuple[int, int, int] = (10, 60, 200)
 
 DEFAULT_SESSION_VP_ROWS = 500
 DEFAULT_FIXED_RANGE_VP_ROWS = 200
+DEFAULT_ANCHORED_VP_ROWS = 500
 DEFAULT_VALUE_AREA_VOLUME = 70.0
 DEFAULT_BOX_WIDTH = 30.0
 DEFAULT_PLACEMENT: Placement = "right"
@@ -58,6 +60,8 @@ class IndicatorConfig:
     start: int | None = None
     end: int | None = None
     extend_to_right: bool | None = None
+    # Anchored VP single time anchor (forward to now)
+    anchor: int | None = None
 
     def to_public(self) -> dict[str, Any]:
         if self.type == "ma":
@@ -90,6 +94,29 @@ class IndicatorConfig:
                 "placement": self.placement or DEFAULT_PLACEMENT,
                 "rows": int(
                     self.rows if self.rows is not None else DEFAULT_FIXED_RANGE_VP_ROWS
+                ),
+                "value_area_volume": float(
+                    self.value_area_volume
+                    if self.value_area_volume is not None
+                    else DEFAULT_VALUE_AREA_VOLUME
+                ),
+                "histogram": dict(self.histogram or DEFAULT_HISTOGRAM),
+                "poc": dict(self.poc or DEFAULT_POC),
+                "vah": dict(self.vah or DEFAULT_VAH),
+                "val": dict(self.val or DEFAULT_VAL),
+            }
+        if self.type == "anchored_vp":
+            return {
+                "id": self.id,
+                "type": "anchored_vp",
+                "enabled": self.enabled,
+                "anchor": int(self.anchor if self.anchor is not None else 0),
+                "box_width": float(
+                    self.box_width if self.box_width is not None else DEFAULT_BOX_WIDTH
+                ),
+                "placement": self.placement or DEFAULT_PLACEMENT,
+                "rows": int(
+                    self.rows if self.rows is not None else DEFAULT_ANCHORED_VP_ROWS
                 ),
                 "value_area_volume": float(
                     self.value_area_volume
@@ -314,6 +341,61 @@ def parse_indicator_dict(raw: dict[str, Any]) -> IndicatorConfig:
             val=_parse_style_level(raw.get("val"), DEFAULT_VAL),
         )
 
+    if itype == "anchored_vp":
+        if "anchor" not in raw or raw["anchor"] is None:
+            raise ValueError("anchored_vp anchor (time anchor) is required")
+        try:
+            anchor = int(raw["anchor"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("anchored_vp anchor must be a unix timestamp") from exc
+        placement = str(raw.get("placement", DEFAULT_PLACEMENT)).strip().lower()
+        if placement not in ("left", "right"):
+            raise ValueError("anchored_vp placement must be 'left' or 'right'")
+        try:
+            rows = int(
+                raw["rows"]
+                if "rows" in raw and raw["rows"] is not None
+                else DEFAULT_ANCHORED_VP_ROWS
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("anchored_vp rows must be a positive integer") from exc
+        if rows < 1:
+            raise ValueError("anchored_vp rows must be >= 1")
+        try:
+            box_width = float(
+                raw["box_width"]
+                if "box_width" in raw and raw["box_width"] is not None
+                else DEFAULT_BOX_WIDTH
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("anchored_vp box_width must be a number") from exc
+        if box_width <= 0 or box_width > 100:
+            raise ValueError("anchored_vp box_width must be in (0, 100]")
+        try:
+            va = float(
+                raw["value_area_volume"]
+                if "value_area_volume" in raw and raw["value_area_volume"] is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("anchored_vp value_area_volume must be a number") from exc
+        if va <= 0 or va > 100:
+            raise ValueError("anchored_vp value_area_volume must be in (0, 100]")
+        return IndicatorConfig(
+            id=iid,
+            type="anchored_vp",
+            enabled=enabled,
+            anchor=anchor,
+            box_width=box_width,
+            placement=placement,
+            rows=rows,
+            value_area_volume=va,
+            histogram=_parse_histogram_style(raw.get("histogram")),
+            poc=_parse_style_level(raw.get("poc"), DEFAULT_POC),
+            vah=_parse_style_level(raw.get("vah"), DEFAULT_VAH),
+            val=_parse_style_level(raw.get("val"), DEFAULT_VAL),
+        )
+
     raise ValueError(f"unsupported indicator type: {itype!r}")
 
 
@@ -323,6 +405,7 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     vol_count = sum(1 for c in configs if c.type == "volume")
     svp_count = sum(1 for c in configs if c.type == "session_vp")
     frvp_count = sum(1 for c in configs if c.type == "fixed_range_vp")
+    avp_count = sum(1 for c in configs if c.type == "anchored_vp")
     if ma_count > MAX_MA_LINES:
         raise ValueError(
             f"ma limit exceeded: max {MAX_MA_LINES} lines per chart, got {ma_count}"
@@ -338,6 +421,10 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     if frvp_count > MAX_FIXED_RANGE_VP:
         raise ValueError(
             f"fixed_range_vp limit exceeded: max {MAX_FIXED_RANGE_VP} instances per chart, got {frvp_count}"
+        )
+    if avp_count > MAX_ANCHORED_VP:
+        raise ValueError(
+            f"anchored_vp limit exceeded: max {MAX_ANCHORED_VP} instances per chart, got {avp_count}"
         )
     ids = [c.id for c in configs]
     if len(ids) != len(set(ids)):
@@ -382,6 +469,7 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
         vol_n = 0
         svp_n = 0
         frvp_n = 0
+        avp_n = 0
         seen: set[str] = set()
         for c in out:
             if c.id in seen:
@@ -402,6 +490,10 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
                 if frvp_n >= MAX_FIXED_RANGE_VP:
                     continue
                 frvp_n += 1
+            elif c.type == "anchored_vp":
+                if avp_n >= MAX_ANCHORED_VP:
+                    continue
+                avp_n += 1
             seen.add(c.id)
             trimmed.append(c)
         return trimmed
@@ -676,6 +768,42 @@ def compute_fixed_range_vp(
     ]
 
 
+def compute_anchored_vp(
+    bars: list[Bar] | tuple[Bar, ...],
+    *,
+    anchor: int,
+    rows: int,
+    value_area_volume: float,
+) -> list[dict[str, Any]]:
+    """One profile from a single time anchor forward to the latest bar (now).
+
+    All bars with open ts >= anchor contribute. POC/VAH/VAL levels project to the
+    latest contributing bar so confluence stays live as new bars print.
+    """
+    window_bars = [b for b in bars if int(b.ts) >= anchor]
+    if not window_bars:
+        return []
+
+    built = build_volume_profile(
+        window_bars,
+        rows=rows,
+        value_area_volume=value_area_volume,
+    )
+    if built is None:
+        return []
+
+    last_ts = max(int(b.ts) for b in window_bars)
+    return [
+        {
+            "anchor": anchor,
+            "range_start": anchor,
+            "range_end": last_ts,
+            "levels_end": last_ts,
+            **built,
+        }
+    ]
+
+
 def compute_series(
     configs: list[IndicatorConfig],
     bars: list[Bar] | tuple[Bar, ...],
@@ -745,6 +873,26 @@ def compute_series(
             )
             series[cfg.id] = {
                 "type": "fixed_range_vp",
+                "profiles": profiles,
+            }
+        elif cfg.type == "anchored_vp":
+            rows = int(
+                cfg.rows if cfg.rows is not None else DEFAULT_ANCHORED_VP_ROWS
+            )
+            va = float(
+                cfg.value_area_volume
+                if cfg.value_area_volume is not None
+                else DEFAULT_VALUE_AREA_VOLUME
+            )
+            anchor = int(cfg.anchor if cfg.anchor is not None else 0)
+            profiles = compute_anchored_vp(
+                bars,
+                anchor=anchor,
+                rows=rows,
+                value_area_volume=va,
+            )
+            series[cfg.id] = {
+                "type": "anchored_vp",
                 "profiles": profiles,
             }
     return series
