@@ -215,6 +215,8 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('p') | KeyCode::Char('P') => app.indicator_add_session_vp(),
             KeyCode::Char('f') | KeyCode::Char('F') => app.indicator_add_fixed_range_vp(),
             KeyCode::Char('a') | KeyCode::Char('A') => app.indicator_add_anchored_vp(),
+            KeyCode::Char('y') | KeyCode::Char('Y') => app.indicator_add_gex(),
+            KeyCode::Char('g') | KeyCode::Char('G') => app.indicator_add_garch(),
             KeyCode::Char('c') | KeyCode::Char('C') => app.indicator_clear_except_volume(),
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 let itype = app

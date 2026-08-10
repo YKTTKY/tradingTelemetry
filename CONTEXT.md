@@ -153,7 +153,7 @@ Order-flow visualization of buy/sell aggression. **Out of v1** (candidate for la
 - **Indicators:** first-ever chart open is **naked** (no indicators). After that, **restore last-used indicators and their settings per chart**. Indicator panel adds / toggles / configures; configuration is **per-chart** in dual layout.
 - **v1 indicator set (intent):** MA; Volume; Volume Profile variants (**Session**, **Fixed Range**, **Anchored**); **GEX** and **GARCH** only if data/compute available. **Delta bubbles:** not v1.
 - **VP strategy use:** confluence on **VAH / POC / VAL**; Fixed Range often weekly (current + previous week); Anchored often from **09:30 America/New_York** for US intraday.
-- **Max indicator instances per chart (v1):** Session VP **1** · Fixed Range VP **4** · Anchored VP **2** · MA lines **3** · Volume **1**. Dual layout: each chart has its own counts.
+- **Max indicator instances per chart (v1):** Session VP **1** · Fixed Range VP **4** · Anchored VP **2** · MA lines **3** · Volume **1** · GEX **1** · GARCH **1**. Dual layout: each chart has its own counts.
 - **MA:** per-line type **SMA or EMA**; default lengths **10 / 60 / 200** when the user adds the default stack (or first three lines).
 
 ### Session Volume Profile — v1 parameters

@@ -62,11 +62,35 @@ class HistoryResult:
         }
 
 
+@dataclass(frozen=True)
+class OptionContract:
+    """One options contract input for GEX (gamma exposure) computation."""
+
+    strike: float
+    right: str  # "C" / "P" (call / put); longer forms accepted at seed boundary
+    open_interest: float
+    gamma: float
+
+
+@dataclass(frozen=True)
+class OptionsChainResult:
+    """Options chain for GEX, or explicit unavailability (no invented exposures)."""
+
+    instrument: str
+    available: bool
+    spot: float | None = None
+    contracts: tuple[OptionContract, ...] = ()
+
+
 TickHandler = Callable[[Tick], None]
 
 
 class MarketDataVendor(Protocol):
-    """Vendor adapter: history fetch + per-instrument live tick subscription."""
+    """Vendor adapter: history fetch + per-instrument live tick subscription.
+
+    Options chains are optional: adapters that do not implement
+    ``fetch_options_chain`` are treated as options-unavailable for GEX.
+    """
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult: ...
 
@@ -281,6 +305,8 @@ class FakeVendor:
         self._auto_instruments: set[str] = set()
         # Mutable overlay on module fixtures (tests may seed VIX etc.).
         self._extra_history: dict[tuple[str, str], tuple[Bar, ...]] = {}
+        # Optional options chains for GEX success fixtures (default: none).
+        self._options_chains: dict[str, OptionsChainResult] = {}
 
     def seed_history(
         self,
@@ -312,6 +338,31 @@ class FakeVendor:
         key = (instrument.strip().upper(), timeframe.strip())
         ordered = tuple(sorted(bars, key=lambda b: b.ts))
         self._extra_history[key] = ordered
+
+    def seed_options_chain(
+        self,
+        instrument: str,
+        *,
+        spot: float,
+        contracts: tuple[OptionContract, ...] | list[OptionContract],
+    ) -> None:
+        """Test/control hook: register a deterministic options chain for GEX."""
+        key = instrument.strip().upper()
+        ordered = tuple(contracts)
+        self._options_chains[key] = OptionsChainResult(
+            instrument=key,
+            available=bool(ordered) and spot > 0,
+            spot=float(spot),
+            contracts=ordered,
+        )
+
+    def fetch_options_chain(self, instrument: str) -> OptionsChainResult:
+        """Return seeded options chain, or explicit unavailable (no invented GEX)."""
+        key = instrument.strip().upper()
+        chain = self._options_chains.get(key)
+        if chain is None:
+            return OptionsChainResult(instrument=key, available=False)
+        return chain
 
     def resolves(self, instrument: str, timeframe: str = "1D") -> bool:
         """True when the vendor can serve history for the pair."""

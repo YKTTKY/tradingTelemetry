@@ -1,15 +1,18 @@
-"""Per-chart indicator configs, limits, and MA/Volume/VP compute."""
+"""Per-chart indicator configs, limits, and MA/Volume/VP/GEX/GARCH compute."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from market_engine.vendor import Bar
+from market_engine.vendor import Bar, OptionsChainResult
 
-IndicatorType = Literal["ma", "volume", "session_vp", "fixed_range_vp", "anchored_vp"]
+IndicatorType = Literal[
+    "ma", "volume", "session_vp", "fixed_range_vp", "anchored_vp", "gex", "garch"
+]
 MaType = Literal["sma", "ema"]
 SessionClock = Literal["equity", "cme_equity_index"]
 Placement = Literal["left", "right"]
@@ -19,7 +22,17 @@ MAX_VOLUME = 1
 MAX_SESSION_VP = 1
 MAX_FIXED_RANGE_VP = 4
 MAX_ANCHORED_VP = 2
+MAX_GEX = 1
+MAX_GARCH = 1
 DEFAULT_MA_STACK_LENGTHS: tuple[int, int, int] = (10, 60, 200)
+
+# GARCH(1,1): fixed alpha/beta with variance targeting. Need enough closes for a
+# stable unconditional variance; short series → explicit unavailable (no fakes).
+MIN_GARCH_BARS = 50
+GARCH_ALPHA = 0.1
+GARCH_BETA = 0.85
+# Options contract multiplier (equity/ETF standard) for GEX dollar gamma.
+GEX_CONTRACT_MULTIPLIER = 100.0
 
 DEFAULT_SESSION_VP_ROWS = 500
 DEFAULT_FIXED_RANGE_VP_ROWS = 200
@@ -76,6 +89,18 @@ class IndicatorConfig:
             return {
                 "id": self.id,
                 "type": "volume",
+                "enabled": self.enabled,
+            }
+        if self.type == "gex":
+            return {
+                "id": self.id,
+                "type": "gex",
+                "enabled": self.enabled,
+            }
+        if self.type == "garch":
+            return {
+                "id": self.id,
+                "type": "garch",
                 "enabled": self.enabled,
             }
         if self.type == "fixed_range_vp":
@@ -225,6 +250,12 @@ def parse_indicator_dict(raw: dict[str, Any]) -> IndicatorConfig:
 
     if itype == "volume":
         return IndicatorConfig(id=iid, type="volume", enabled=enabled)
+
+    if itype == "gex":
+        return IndicatorConfig(id=iid, type="gex", enabled=enabled)
+
+    if itype == "garch":
+        return IndicatorConfig(id=iid, type="garch", enabled=enabled)
 
     if itype == "session_vp":
         mode = str(raw.get("mode", "all")).strip().lower()
@@ -406,6 +437,8 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     svp_count = sum(1 for c in configs if c.type == "session_vp")
     frvp_count = sum(1 for c in configs if c.type == "fixed_range_vp")
     avp_count = sum(1 for c in configs if c.type == "anchored_vp")
+    gex_count = sum(1 for c in configs if c.type == "gex")
+    garch_count = sum(1 for c in configs if c.type == "garch")
     if ma_count > MAX_MA_LINES:
         raise ValueError(
             f"ma limit exceeded: max {MAX_MA_LINES} lines per chart, got {ma_count}"
@@ -425,6 +458,14 @@ def validate_indicator_list(configs: list[IndicatorConfig]) -> None:
     if avp_count > MAX_ANCHORED_VP:
         raise ValueError(
             f"anchored_vp limit exceeded: max {MAX_ANCHORED_VP} instances per chart, got {avp_count}"
+        )
+    if gex_count > MAX_GEX:
+        raise ValueError(
+            f"gex limit exceeded: max {MAX_GEX} instance per chart, got {gex_count}"
+        )
+    if garch_count > MAX_GARCH:
+        raise ValueError(
+            f"garch limit exceeded: max {MAX_GARCH} instance per chart, got {garch_count}"
         )
     ids = [c.id for c in configs]
     if len(ids) != len(set(ids)):
@@ -470,6 +511,8 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
         svp_n = 0
         frvp_n = 0
         avp_n = 0
+        gex_n = 0
+        garch_n = 0
         seen: set[str] = set()
         for c in out:
             if c.id in seen:
@@ -494,6 +537,14 @@ def indicators_from_storage(raw: Any) -> list[IndicatorConfig]:
                 if avp_n >= MAX_ANCHORED_VP:
                     continue
                 avp_n += 1
+            elif c.type == "gex":
+                if gex_n >= MAX_GEX:
+                    continue
+                gex_n += 1
+            elif c.type == "garch":
+                if garch_n >= MAX_GARCH:
+                    continue
+                garch_n += 1
             seen.add(c.id)
             trimmed.append(c)
         return trimmed
@@ -804,13 +855,178 @@ def compute_anchored_vp(
     ]
 
 
+def compute_garch(
+    closes: list[float] | tuple[float, ...],
+) -> dict[str, Any]:
+    """GARCH(1,1) conditional volatility, or explicit unavailable.
+
+    Uses variance targeting with fixed alpha/beta. When history is shorter than
+    ``MIN_GARCH_BARS`` or variance is non-positive, returns status unavailable
+    with no invented values.
+    """
+    n = len(closes)
+    if n < MIN_GARCH_BARS:
+        return {
+            "type": "garch",
+            "status": "unavailable",
+            "reason": "insufficient_history",
+        }
+    try:
+        returns: list[float] = []
+        for i in range(1, n):
+            prev = float(closes[i - 1])
+            cur = float(closes[i])
+            if prev <= 0 or cur <= 0:
+                return {
+                    "type": "garch",
+                    "status": "unavailable",
+                    "reason": "compute_failed",
+                }
+            returns.append(math.log(cur / prev))
+        if not returns:
+            return {
+                "type": "garch",
+                "status": "unavailable",
+                "reason": "insufficient_history",
+            }
+        uvar = sum(r * r for r in returns) / len(returns)
+        if uvar <= 0 or not math.isfinite(uvar):
+            return {
+                "type": "garch",
+                "status": "unavailable",
+                "reason": "unstable_estimate",
+            }
+        alpha = GARCH_ALPHA
+        beta = GARCH_BETA
+        if alpha + beta >= 1.0:
+            return {
+                "type": "garch",
+                "status": "unavailable",
+                "reason": "unstable_estimate",
+            }
+        omega = uvar * (1.0 - alpha - beta)
+        values: list[float | None] = [None] * n
+        h = uvar
+        for i, r in enumerate(returns, start=1):
+            h = omega + alpha * (r * r) + beta * h
+            if h < 0 or not math.isfinite(h):
+                return {
+                    "type": "garch",
+                    "status": "unavailable",
+                    "reason": "compute_failed",
+                }
+            values[i] = math.sqrt(h)
+        return {
+            "type": "garch",
+            "status": "ok",
+            "values": values,
+            "params": {
+                "omega": omega,
+                "alpha": alpha,
+                "beta": beta,
+                "unconditional_var": uvar,
+            },
+        }
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return {
+            "type": "garch",
+            "status": "unavailable",
+            "reason": "compute_failed",
+        }
+
+
+def compute_gex(options: OptionsChainResult | None) -> dict[str, Any]:
+    """Net + per-strike GEX from an options chain, or explicit unavailable.
+
+    Call gamma exposure is signed positive; put exposure negative (dealer-long
+    customer convention for net GEX sign). Scale is OI × gamma × 100 × spot² × 1%.
+    Never invents levels when options data is missing or empty.
+    """
+    if options is None or not options.available:
+        return {
+            "type": "gex",
+            "status": "unavailable",
+            "reason": "options_data_missing",
+            "net_gex": None,
+            "spot": None,
+            "levels": [],
+            "values": [],
+        }
+    spot = options.spot
+    contracts = options.contracts
+    if spot is None or spot <= 0 or not contracts:
+        return {
+            "type": "gex",
+            "status": "unavailable",
+            "reason": "options_data_missing",
+            "net_gex": None,
+            "spot": None,
+            "levels": [],
+            "values": [],
+        }
+    try:
+        by_strike: dict[float, float] = {}
+        net = 0.0
+        scale = GEX_CONTRACT_MULTIPLIER * (float(spot) ** 2) * 0.01
+        for c in contracts:
+            right = str(c.right).strip().upper()
+            if right.startswith("C"):
+                sign = 1.0
+            elif right.startswith("P"):
+                sign = -1.0
+            else:
+                continue
+            oi = float(c.open_interest)
+            gamma = float(c.gamma)
+            if not math.isfinite(oi) or not math.isfinite(gamma):
+                continue
+            gex_i = sign * oi * gamma * scale
+            if not math.isfinite(gex_i):
+                continue
+            strike = float(c.strike)
+            by_strike[strike] = by_strike.get(strike, 0.0) + gex_i
+            net += gex_i
+        if not by_strike or not math.isfinite(net):
+            return {
+                "type": "gex",
+                "status": "unavailable",
+                "reason": "compute_failed",
+                "net_gex": None,
+                "spot": None,
+                "levels": [],
+                "values": [],
+            }
+        levels = [
+            {"strike": strike, "gex": gex}
+            for strike, gex in sorted(by_strike.items(), key=lambda kv: kv[0])
+        ]
+        return {
+            "type": "gex",
+            "status": "ok",
+            "spot": float(spot),
+            "net_gex": net,
+            "levels": levels,
+        }
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "type": "gex",
+            "status": "unavailable",
+            "reason": "compute_failed",
+            "net_gex": None,
+            "spot": None,
+            "levels": [],
+            "values": [],
+        }
+
+
 def compute_series(
     configs: list[IndicatorConfig],
     bars: list[Bar] | tuple[Bar, ...],
     *,
     instrument: str = "",
+    options: OptionsChainResult | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Compute enabled indicator series aligned to bar index (or VP profiles)."""
+    """Compute enabled indicator series aligned to bar index (or VP/GEX/GARCH)."""
     closes = [b.close for b in bars]
     volumes = [b.volume for b in bars]
     series: dict[str, dict[str, Any]] = {}
@@ -895,6 +1111,10 @@ def compute_series(
                 "type": "anchored_vp",
                 "profiles": profiles,
             }
+        elif cfg.type == "gex":
+            series[cfg.id] = compute_gex(options)
+        elif cfg.type == "garch":
+            series[cfg.id] = compute_garch(closes)
     return series
 
 
@@ -918,9 +1138,12 @@ class IndicatorService:
         bars: list[Bar] | tuple[Bar, ...],
         *,
         instrument: str = "",
+        options: OptionsChainResult | None = None,
     ) -> dict[str, dict[str, Any]]:
         configs = self._configs.get(chart_id, [])
-        series = compute_series(configs, bars, instrument=instrument)
+        series = compute_series(
+            configs, bars, instrument=instrument, options=options
+        )
         self._series[chart_id] = series
         return series
 

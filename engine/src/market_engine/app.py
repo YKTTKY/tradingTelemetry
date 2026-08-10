@@ -18,7 +18,12 @@ from market_engine.feed import FeedState, default_feed_state
 from market_engine.indicators import IndicatorService, parse_indicators_payload
 from market_engine.publish import ConflatingHub
 from market_engine.quotes import QuoteService
-from market_engine.vendor import Bar, MarketDataVendor, default_vendor
+from market_engine.vendor import (
+    Bar,
+    MarketDataVendor,
+    OptionsChainResult,
+    default_vendor,
+)
 from market_engine.workspace import VALID_LAYOUTS, WorkspaceStore
 
 
@@ -53,6 +58,22 @@ def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     return bool(result.available)
 
 
+def _vendor_options_chain(
+    vendor: MarketDataVendor, instrument: str
+) -> OptionsChainResult | None:
+    """Fetch options chain when the adapter implements it; else treat as missing."""
+    fetcher = getattr(vendor, "fetch_options_chain", None)
+    if not callable(fetcher):
+        return None
+    try:
+        result = fetcher(instrument)
+    except Exception:
+        return OptionsChainResult(instrument=instrument, available=False)
+    if isinstance(result, OptionsChainResult):
+        return result
+    return OptionsChainResult(instrument=instrument, available=False)
+
+
 def create_app(
     feed: FeedState | None = None,
     vendor: MarketDataVendor | None = None,
@@ -83,7 +104,10 @@ def create_app(
             indicators.clear_series(chart_id)
             return
         instrument, timeframe = meta
-        series = indicators.recompute(chart_id, bars, instrument=instrument)
+        options = _vendor_options_chain(market_vendor, instrument)
+        series = indicators.recompute(
+            chart_id, bars, instrument=instrument, options=options
+        )
         hub.note_indicator_update(
             {
                 "chart_id": chart_id,
@@ -154,7 +178,12 @@ def create_app(
         meta = charts.slot_meta(chart_id)
         if bars is not None:
             instrument = meta[0] if meta is not None else ""
-            series = indicators.recompute(chart_id, bars, instrument=instrument)
+            options = (
+                _vendor_options_chain(market_vendor, instrument) if instrument else None
+            )
+            series = indicators.recompute(
+                chart_id, bars, instrument=instrument, options=options
+            )
         else:
             series = {}
             indicators.clear_series(chart_id)
@@ -217,8 +246,12 @@ def create_app(
         response["indicators"] = [c.to_public() for c in configs]
         if result.available:
             bars = charts.bars_for(chart_id) or []
+            options = _vendor_options_chain(market_vendor, result.instrument)
             response["series"] = indicators.recompute(
-                chart_id, bars, instrument=result.instrument
+                chart_id,
+                bars,
+                instrument=result.instrument,
+                options=options,
             )
         else:
             indicators.clear_series(chart_id)

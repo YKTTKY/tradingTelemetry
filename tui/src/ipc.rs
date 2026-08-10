@@ -143,6 +143,12 @@ pub struct IndicatorConfig {
     pub anchor: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct GexLevel {
+    pub strike: f64,
+    pub gex: f64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -301,6 +307,54 @@ impl IndicatorConfig {
             anchor: Some(anchor),
         }
     }
+
+    /// Optional GEX — only meaningful when engine has options data.
+    pub fn gex(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            indicator_type: "gex".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: None,
+            box_width: None,
+            placement: None,
+            rows: None,
+            value_area_volume: None,
+            histogram: None,
+            poc: None,
+            vah: None,
+            val: None,
+            start: None,
+            end: None,
+            extend_to_right: None,
+            anchor: None,
+        }
+    }
+
+    /// Optional GARCH — only meaningful when history supports a stable estimate.
+    pub fn garch(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            indicator_type: "garch".into(),
+            enabled: true,
+            ma_type: None,
+            length: None,
+            mode: None,
+            box_width: None,
+            placement: None,
+            rows: None,
+            value_area_volume: None,
+            histogram: None,
+            poc: None,
+            vah: None,
+            val: None,
+            start: None,
+            end: None,
+            extend_to_right: None,
+            anchor: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -349,7 +403,13 @@ pub struct VpProfile {
 pub struct IndicatorSeriesData {
     #[serde(rename = "type")]
     pub series_type: String,
-    /// Per-bar values for MA / Volume (empty for profile overlays).
+    /// "ok" | "unavailable" for optional indicators (GEX / GARCH); absent for MA/VP.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Machine reason when status is unavailable (e.g. options_data_missing).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Per-bar values for MA / Volume / GARCH (empty for profile overlays / GEX).
     #[serde(default)]
     pub values: Vec<Option<f64>>,
     #[serde(default)]
@@ -359,6 +419,15 @@ pub struct IndicatorSeriesData {
     /// Session / Fixed Range volume profiles.
     #[serde(default)]
     pub profiles: Vec<VpProfile>,
+    /// GEX net exposure when status is ok.
+    #[serde(default)]
+    pub net_gex: Option<f64>,
+    /// Underlying spot used for GEX when status is ok.
+    #[serde(default)]
+    pub spot: Option<f64>,
+    /// Per-strike GEX levels when status is ok.
+    #[serde(default)]
+    pub levels: Vec<GexLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

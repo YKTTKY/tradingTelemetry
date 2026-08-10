@@ -229,6 +229,8 @@ pub const MAX_MA_LINES: usize = 3;
 pub const MAX_SESSION_VP: usize = 1;
 pub const MAX_FIXED_RANGE_VP: usize = 4;
 pub const MAX_ANCHORED_VP: usize = 2;
+pub const MAX_GEX: usize = 1;
+pub const MAX_GARCH: usize = 1;
 pub const DEFAULT_MA_LENGTHS: [i64; 3] = [10, 60, 200];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +358,24 @@ impl Chart {
                     .map(|s| (cfg, s))
             })
             .collect()
+    }
+
+    /// Enabled GARCH series when status is ok (no invented path when unavailable).
+    pub fn enabled_garch(&self) -> Option<(&IndicatorConfig, &IndicatorSeriesData)> {
+        self.indicators
+            .iter()
+            .find(|i| i.indicator_type == "garch" && i.enabled)
+            .and_then(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
+            .filter(|(_, s)| s.status.as_deref() == Some("ok") && !s.values.is_empty())
+    }
+
+    /// Enabled GEX series when status is ok (no invented levels when unavailable).
+    pub fn enabled_gex(&self) -> Option<(&IndicatorConfig, &IndicatorSeriesData)> {
+        self.indicators
+            .iter()
+            .find(|i| i.indicator_type == "gex" && i.enabled)
+            .and_then(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
+            .filter(|(_, s)| s.status.as_deref() == Some("ok"))
     }
 }
 
@@ -1150,6 +1170,50 @@ impl App {
         chart
             .indicators
             .push(IndicatorConfig::anchored_vp_default(id, anchor_ts));
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.last_indicator_error = None;
+        self.arm_indicators_apply();
+    }
+
+    /// Add optional GEX (max 1). Engine marks series unavailable without options data.
+    pub fn indicator_add_gex(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let count = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "gex")
+            .count();
+        if count >= MAX_GEX {
+            self.last_indicator_error =
+                Some(format!("GEX limit is {MAX_GEX} per chart"));
+            return;
+        }
+        chart.indicators.push(IndicatorConfig::gex("gex"));
+        self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.last_indicator_error = None;
+        self.arm_indicators_apply();
+    }
+
+    /// Add optional GARCH (max 1). Engine marks series unavailable without enough history.
+    pub fn indicator_add_garch(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let count = chart
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "garch")
+            .count();
+        if count >= MAX_GARCH {
+            self.last_indicator_error =
+                Some(format!("GARCH limit is {MAX_GARCH} per chart"));
+            return;
+        }
+        chart.indicators.push(IndicatorConfig::garch("garch"));
         self.indicator_selected = chart.indicators.len().saturating_sub(1);
         self.last_indicator_error = None;
         self.arm_indicators_apply();

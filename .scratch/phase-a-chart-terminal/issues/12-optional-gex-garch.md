@@ -4,14 +4,14 @@
 
 **Blocked by:** 07 — Indicator panel + MA + Volume (naked → restore)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] GEX is offered only when options data + computation succeed; otherwise unavailable without breaking the chart
-- [ ] GARCH is offered only when history allows a stable estimate; otherwise unavailable
-- [ ] Never display invented GEX/GARCH series
-- [ ] Indicator panel surfaces unavailable state clearly when the user tries to enable them without inputs
-- [ ] Success path (when fake or real inputs allow) delivers payload/render consistent with other indicators
-- [ ] Contract tests cover at least the unavailable path; success path tested when a deterministic fixture exists
+- [x] GEX is offered only when options data + computation succeed; otherwise unavailable without breaking the chart
+- [x] GARCH is offered only when history allows a stable estimate; otherwise unavailable
+- [x] Never display invented GEX/GARCH series
+- [x] Indicator panel surfaces unavailable state clearly when the user tries to enable them without inputs
+- [x] Success path (when fake or real inputs allow) delivers payload/render consistent with other indicators
+- [x] Contract tests cover at least the unavailable path; success path tested when a deterministic fixture exists
 
 ## Notes
 

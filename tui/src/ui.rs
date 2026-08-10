@@ -117,6 +117,8 @@ fn draw_help_popup(frame: &mut Frame) {
         row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
         row("f", "Add Fixed Range VP (max 4) → pin placement on chart"),
         row("a", "Add Anchored VP (max 2; cash open 09:30 NY default)"),
+        row("y", "Add GEX (optional; unavailable without options data)"),
+        row("g", "Add GARCH (optional; unavailable without enough history)"),
         row("r", "Re-place FRVP pins or AVP anchor (when selected)"),
         row("c", "Clear all indicators except Volume"),
         row("e", "Fixed Range: toggle extend-to-right"),
@@ -326,7 +328,7 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m MA · v Volume · p Session VP · f Fixed Range · a Anchored · c clear-keep-vol)",
+            "(naked — m MA · v Vol · p SVP · f FRVP · a AVP · y GEX · g GARCH · c clear-keep-vol)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -334,6 +336,32 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
             let selected = i == app.indicator_selected.min(chart.indicators.len() - 1);
             let mark = if selected { "› " } else { "  " };
             let on = if ind.enabled { "on " } else { "off" };
+            let optional_status = |id: &str| -> String {
+                match chart.indicator_series.get(id) {
+                    Some(s) if s.status.as_deref() == Some("unavailable") => {
+                        let reason = match s.reason.as_deref() {
+                            Some("options_data_missing") | Some("options_data_unavailable") => {
+                                "no options data"
+                            }
+                            Some("insufficient_history") => "insufficient history",
+                            Some("unstable_estimate") => "unstable estimate",
+                            Some("compute_failed") => "compute failed",
+                            Some(other) => other,
+                            None => "unavailable",
+                        };
+                        format!(" · UNAVAILABLE ({reason})")
+                    }
+                    Some(s) if s.status.as_deref() == Some("ok") && s.series_type == "gex" => {
+                        match s.net_gex {
+                            Some(net) => format!(" · ok net_gex={net:.0}"),
+                            None => " · ok".into(),
+                        }
+                    }
+                    Some(s) if s.status.as_deref() == Some("ok") => " · ok".into(),
+                    Some(_) | None if ind.enabled => " · …".into(),
+                    _ => String::new(),
+                }
+            };
             let vp_levels = |ind: &crate::ipc::IndicatorConfig| {
                 format!(
                     "POC{} VAH{} VAL{}",
@@ -407,12 +435,27 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                         vp_levels(ind)
                     )
                 }
+                "gex" => format!(
+                    "{mark}[{on}] GEX{}  (y add · needs options)",
+                    optional_status(&ind.id)
+                ),
+                "garch" => format!(
+                    "{mark}[{on}] GARCH{}  (g add · needs history)",
+                    optional_status(&ind.id)
+                ),
                 other => format!("{mark}[{on}] {other}"),
             };
+            let unavailable = chart
+                .indicator_series
+                .get(&ind.id)
+                .and_then(|s| s.status.as_deref())
+                == Some("unavailable");
             let style = if selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(if unavailable { Color::Yellow } else { Color::Cyan })
                     .add_modifier(Modifier::BOLD)
+            } else if unavailable && ind.enabled {
+                Style::default().fg(Color::Yellow)
             } else if ind.enabled {
                 Style::default()
             } else {
@@ -694,6 +737,8 @@ fn draw_candles(
     let svp = chart.enabled_session_vp();
     let frvps = chart.enabled_fixed_range_vps();
     let avps = chart.enabled_anchored_vps();
+    let gex = chart.enabled_gex();
+    let garch = chart.enabled_garch();
     let vp_hint = {
         let mut tags: Vec<&str> = Vec::new();
         if svp.is_some() {
@@ -711,8 +756,34 @@ fn draw_candles(
             format!("  {}", tags.join("+"))
         }
     };
+    // Only annotate successful optional series — never invent GEX/GARCH when unavailable.
+    let optional_hint = {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some((_, series)) = gex {
+            if let Some(net) = series.net_gex {
+                parts.push(format!("GEX={net:.0}"));
+            } else {
+                parts.push("GEX".into());
+            }
+        }
+        if let Some((_, series)) = garch {
+            let tip = series
+                .values
+                .iter()
+                .rev()
+                .find_map(|v| *v)
+                .map(|v| format!("GARCH={v:.4}"))
+                .unwrap_or_else(|| "GARCH".into());
+            parts.push(tip);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", parts.join(" "))
+        }
+    };
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}{}",
         last.open,
         last.high,
         last.low,
@@ -725,6 +796,7 @@ fn draw_candles(
         },
         ma_hint,
         vp_hint,
+        optional_hint,
     );
 
     let block = Block::default()
