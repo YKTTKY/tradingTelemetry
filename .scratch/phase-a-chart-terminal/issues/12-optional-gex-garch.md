@@ -18,3 +18,8 @@
 - Parent spec: `.scratch/phase-a-chart-terminal/spec.md`
 - Optional for Phase A ship — must not block chart terminal MVP if data is hard to fixture
 - Recommended last in the execution sequence
+
+## Follow-up
+
+- **GEX — come back later.** Indicator plumbing works (config apply, max 1, unavailable without invented values, fixture success path via FakeVendor `seed_options_chain`). **Live options chain data is not available from the vendor** (LSE adapter has no options surface), so production GEX stays `status: unavailable` / `options_data_missing` until a real options source is wired. Revisit GEX when vendor options (or another chain provider) is available.
+- GARCH is usable when bar history is long enough (≥50 closes); no vendor options dependency.
