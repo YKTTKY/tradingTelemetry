@@ -215,6 +215,39 @@ pub enum InputMode {
     AvpPlacing,
 }
 
+/// Which side of the indicator panel receives ↑↓ / Enter / side-specific keys.
+///
+/// Model 2: **Available** (left catalog) | **Current** (right instances).
+/// Default active list is **Current**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndicatorListSide {
+    Available,
+    #[default]
+    Current,
+}
+
+/// In-panel editor for per-type overlay strength (Available · `c`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeStyleEditState {
+    pub indicator_type: String,
+    /// Draft strength in \[0, 1\]; persisted only on confirm.
+    pub strength: f64,
+}
+
+/// Catalog rows for the Available list: `(type_key, display label)`.
+pub const AVAILABLE_INDICATOR_TYPES: &[(&str, &str)] = &[
+    ("ma", "MA (SMA / EMA)"),
+    ("volume", "Volume"),
+    ("session_vp", "Session VP"),
+    ("fixed_range_vp", "Fixed Range VP"),
+    ("anchored_vp", "Anchored VP"),
+    ("gex", "GEX"),
+    ("garch", "GARCH"),
+];
+
+/// Step for type-style overlay strength nudge in the popup.
+pub const TYPE_STYLE_STRENGTH_STEP: f64 = 0.05;
+
 /// Pending HTTP mutation against the engine watchlist API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingWatchlistOp {
@@ -517,8 +550,14 @@ pub struct App {
     pub pending_indicators: Option<PendingIndicatorsApply>,
     /// When Some, main loop POSTs type styles for that chart.
     pub pending_type_styles: Option<PendingTypeStylesApply>,
-    /// Selected row in the indicator panel list.
+    /// Selected row in the **Current** indicators list.
     pub indicator_selected: usize,
+    /// Selected row in the **Available** catalog list.
+    pub indicator_available_selected: usize,
+    /// Active side of the indicator panel (Tab switches; default Current).
+    pub indicator_list_side: IndicatorListSide,
+    /// When Some, type-style (overlay strength) popup is open over the panel.
+    pub type_style_edit: Option<TypeStyleEditState>,
     pub input_mode: InputMode,
     /// Active Fixed Range two-pin placement (when `input_mode == FrvpPlacing`).
     pub frvp_place: Option<FrvpPlaceState>,
@@ -554,6 +593,9 @@ impl Default for App {
             pending_indicators: None,
             pending_type_styles: None,
             indicator_selected: 0,
+            indicator_available_selected: 0,
+            indicator_list_side: IndicatorListSide::Current,
+            type_style_edit: None,
             input_mode: InputMode::Normal,
             frvp_place: None,
             avp_place: None,
@@ -976,9 +1018,14 @@ impl App {
         match self.input_mode {
             InputMode::Normal => {
                 self.input_mode = InputMode::IndicatorPanel;
+                // Model 2: default active list is Current when the panel opens.
+                self.indicator_list_side = IndicatorListSide::Current;
+                self.type_style_edit = None;
                 self.clamp_indicator_selection();
+                self.clamp_available_selection();
             }
             InputMode::IndicatorPanel => {
+                self.type_style_edit = None;
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -987,7 +1034,28 @@ impl App {
 
     pub fn close_indicator_panel(&mut self) {
         if matches!(self.input_mode, InputMode::IndicatorPanel) {
+            self.type_style_edit = None;
             self.input_mode = InputMode::Normal;
+        }
+    }
+
+    /// Tab: switch Available ↔ Current while the indicator panel owns focus.
+    ///
+    /// Does **not** cycle dual-layout chart focus (panel owns Tab).
+    pub fn indicator_toggle_list_side(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.type_style_edit.is_some() {
+            return;
+        }
+        self.indicator_list_side = match self.indicator_list_side {
+            IndicatorListSide::Available => IndicatorListSide::Current,
+            IndicatorListSide::Current => IndicatorListSide::Available,
+        };
+        match self.indicator_list_side {
+            IndicatorListSide::Available => self.clamp_available_selection(),
+            IndicatorListSide::Current => self.clamp_indicator_selection(),
         }
     }
 
@@ -995,16 +1063,144 @@ impl App {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
         }
-        let n = self.focused_chart().indicators.len();
-        if n == 0 {
-            self.indicator_selected = 0;
+        if self.type_style_edit.is_some() {
             return;
         }
-        let cur = self.indicator_selected.min(n - 1) as i32;
-        self.indicator_selected = (cur + delta).rem_euclid(n as i32) as usize;
+        match self.indicator_list_side {
+            IndicatorListSide::Available => {
+                let n = AVAILABLE_INDICATOR_TYPES.len();
+                if n == 0 {
+                    self.indicator_available_selected = 0;
+                    return;
+                }
+                let cur = self.indicator_available_selected.min(n - 1) as i32;
+                self.indicator_available_selected = (cur + delta).rem_euclid(n as i32) as usize;
+            }
+            IndicatorListSide::Current => {
+                let n = self.focused_chart().indicators.len();
+                if n == 0 {
+                    self.indicator_selected = 0;
+                    return;
+                }
+                let cur = self.indicator_selected.min(n - 1) as i32;
+                self.indicator_selected = (cur + delta).rem_euclid(n as i32) as usize;
+            }
+        }
     }
 
-    /// Set overlay strength on a chart and arm engine persist (ticket 05 UI will call this).
+    fn clamp_available_selection(&mut self) {
+        let n = AVAILABLE_INDICATOR_TYPES.len();
+        if n == 0 {
+            self.indicator_available_selected = 0;
+        } else if self.indicator_available_selected >= n {
+            self.indicator_available_selected = n - 1;
+        }
+    }
+
+    /// Enter/Space on the active list: Available adds; Current toggles on/off.
+    pub fn indicator_activate_selected(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.type_style_edit.is_some() {
+            return;
+        }
+        match self.indicator_list_side {
+            IndicatorListSide::Available => self.indicator_add_selected_available(),
+            IndicatorListSide::Current => self.indicator_toggle_selected(),
+        }
+    }
+
+    /// Add the catalog type selected on Available (respects Phase A max counts).
+    pub fn indicator_add_selected_available(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.indicator_list_side != IndicatorListSide::Available {
+            return;
+        }
+        let Some(&(type_key, _)) = AVAILABLE_INDICATOR_TYPES.get(self.indicator_available_selected)
+        else {
+            return;
+        };
+        match type_key {
+            "ma" => self.indicator_add_default_ma_stack(),
+            "volume" => self.indicator_add_volume(),
+            "session_vp" => self.indicator_add_session_vp(),
+            "fixed_range_vp" => self.indicator_add_fixed_range_vp(),
+            "anchored_vp" => self.indicator_add_anchored_vp(),
+            "gex" => self.indicator_add_gex(),
+            "garch" => self.indicator_add_garch(),
+            _ => {}
+        }
+    }
+
+    /// Open type-style popup for the Available selection (overlay strength).
+    pub fn indicator_open_type_style(&mut self) {
+        if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.indicator_list_side != IndicatorListSide::Available {
+            return;
+        }
+        if self.type_style_edit.is_some() {
+            return;
+        }
+        let Some(&(type_key, _)) = AVAILABLE_INDICATOR_TYPES.get(self.indicator_available_selected)
+        else {
+            return;
+        };
+        // Volume is a sub-pane (no price overlay); type style still stored for consistency
+        // but only overlay types meaningfully affect paint.
+        let strength = self.focused_chart().overlay_strength(type_key);
+        self.type_style_edit = Some(TypeStyleEditState {
+            indicator_type: type_key.to_string(),
+            strength,
+        });
+    }
+
+    pub fn type_style_nudge(&mut self, delta_steps: i32) {
+        let Some(edit) = self.type_style_edit.as_mut() else {
+            return;
+        };
+        let next = edit.strength + (delta_steps as f64) * TYPE_STYLE_STRENGTH_STEP;
+        edit.strength = clamp_strength(next);
+    }
+
+    /// Confirm draft type style → focused chart + engine persist.
+    pub fn type_style_confirm(&mut self) {
+        let Some(edit) = self.type_style_edit.take() else {
+            return;
+        };
+        let chart_id = self.focused_chart().id.clone();
+        self.set_chart_overlay_strength(&chart_id, &edit.indicator_type, edit.strength);
+    }
+
+    pub fn type_style_cancel(&mut self) {
+        self.type_style_edit = None;
+    }
+
+    /// Count of instances of `type_key` on the focused chart (for Available max hints).
+    pub fn focused_indicator_type_count(&self, type_key: &str) -> usize {
+        self.focused_chart()
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == type_key)
+            .count()
+    }
+
+    /// Phase A max instances for a catalog type (`None` = unbounded / unknown).
+    pub fn max_for_indicator_type(type_key: &str) -> Option<usize> {
+        match type_key {
+            "ma" => Some(MAX_MA_LINES),
+            "volume" | "session_vp" | "gex" | "garch" => Some(1),
+            "fixed_range_vp" => Some(MAX_FIXED_RANGE_VP),
+            "anchored_vp" => Some(MAX_ANCHORED_VP),
+            _ => None,
+        }
+    }
+
+    /// Set overlay strength on a chart and arm engine persist.
     pub fn set_chart_overlay_strength(
         &mut self,
         chart_id: &str,
@@ -1063,6 +1259,7 @@ impl App {
             .filter(|i| i.indicator_type == "ma")
             .count();
         if ma_count >= MAX_MA_LINES {
+            self.last_indicator_error = Some(format!("max {MAX_MA_LINES} MA lines per chart"));
             return;
         }
         let mut added = false;
@@ -1104,8 +1301,10 @@ impl App {
             }
         }
         if !added {
+            self.last_indicator_error = Some(format!("max {MAX_MA_LINES} MA lines per chart"));
             return;
         }
+        self.last_indicator_error = None;
         self.clamp_indicator_selection();
         self.arm_indicators_apply();
     }
@@ -1121,10 +1320,12 @@ impl App {
             .iter()
             .any(|i| i.indicator_type == "volume")
         {
+            self.last_indicator_error = Some("max 1 Volume per chart".into());
             return;
         }
         chart.indicators.push(IndicatorConfig::volume("volume"));
         self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.last_indicator_error = None;
         self.arm_indicators_apply();
     }
 
@@ -1140,12 +1341,14 @@ impl App {
             .filter(|i| i.indicator_type == "session_vp")
             .count();
         if count >= MAX_SESSION_VP {
+            self.last_indicator_error = Some(format!("max {MAX_SESSION_VP} Session VP per chart"));
             return;
         }
         chart
             .indicators
             .push(IndicatorConfig::session_vp_default("session_vp"));
         self.indicator_selected = chart.indicators.len().saturating_sub(1);
+        self.last_indicator_error = None;
         self.arm_indicators_apply();
     }
 
@@ -1473,8 +1676,17 @@ impl App {
     }
 
     /// Remove every indicator on the focused chart except Volume instances.
+    /// Clear all indicators except Volume.
+    ///
+    /// Model 2: bound to **Shift+C / `c` on Current only** (Available `c` is type style).
     pub fn indicator_clear_except_volume(&mut self) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.indicator_list_side != IndicatorListSide::Current {
+            return;
+        }
+        if self.type_style_edit.is_some() {
             return;
         }
         let chart = self.focused_chart_mut();
@@ -1715,6 +1927,13 @@ impl App {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
             return;
         }
+        // Instance on/off is a Current-list action.
+        if self.indicator_list_side != IndicatorListSide::Current {
+            return;
+        }
+        if self.type_style_edit.is_some() {
+            return;
+        }
         let n = self.focused_chart().indicators.len();
         if n == 0 {
             return;
@@ -1727,6 +1946,12 @@ impl App {
 
     pub fn indicator_remove_selected(&mut self) {
         if !matches!(self.input_mode, InputMode::IndicatorPanel) {
+            return;
+        }
+        if self.indicator_list_side != IndicatorListSide::Current {
+            return;
+        }
+        if self.type_style_edit.is_some() {
             return;
         }
         let n = self.focused_chart().indicators.len();
@@ -3904,6 +4129,196 @@ mod tests {
         app.frvp_place_cancel();
         assert!(app.focused_chart().indicators.is_empty());
         assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+    }
+
+    // --- Indicator panel Model 2 (Available | Current) -----------------------
+
+    #[test]
+    fn indicator_panel_opens_with_current_list_active() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.toggle_indicator_panel();
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+        assert_eq!(app.indicator_list_side, IndicatorListSide::Current);
+    }
+
+    #[test]
+    fn indicator_tab_switches_available_and_current() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        assert_eq!(app.indicator_list_side, IndicatorListSide::Current);
+        app.indicator_toggle_list_side();
+        assert_eq!(app.indicator_list_side, IndicatorListSide::Available);
+        app.indicator_toggle_list_side();
+        assert_eq!(app.indicator_list_side, IndicatorListSide::Current);
+    }
+
+    #[test]
+    fn available_enter_adds_selected_type_respecting_max() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Available;
+        // volume is catalog index 1
+        app.indicator_available_selected = 1;
+        app.indicator_activate_selected();
+        assert_eq!(app.focused_chart().indicators.len(), 1);
+        assert_eq!(app.focused_chart().indicators[0].indicator_type, "volume");
+        assert!(app.pending_indicators.is_some());
+        // max 1 volume — second add is a no-op
+        app.pending_indicators = None;
+        app.indicator_activate_selected();
+        assert_eq!(app.focused_chart().indicators.len(), 1);
+        assert!(app.pending_indicators.is_none());
+    }
+
+    #[test]
+    fn available_ma_add_fills_default_stack_up_to_max() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.indicator_available_selected = 0; // ma
+        app.indicator_activate_selected();
+        let mas: Vec<_> = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .filter(|i| i.indicator_type == "ma")
+            .collect();
+        assert_eq!(mas.len(), MAX_MA_LINES);
+        app.pending_indicators = None;
+        app.indicator_activate_selected();
+        assert_eq!(
+            app.focused_chart()
+                .indicators
+                .iter()
+                .filter(|i| i.indicator_type == "ma")
+                .count(),
+            MAX_MA_LINES
+        );
+        assert!(app.pending_indicators.is_none());
+    }
+
+    #[test]
+    fn available_c_opens_type_style_confirm_persists_strength() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.indicator_available_selected = 0; // ma
+        app.indicator_open_type_style();
+        let edit = app.type_style_edit.as_ref().expect("popup open");
+        assert_eq!(edit.indicator_type, "ma");
+        assert!((edit.strength - DEFAULT_MA_STRENGTH).abs() < 1e-9);
+
+        app.type_style_nudge(-4); // 0.05 * 4
+        let draft = app.type_style_edit.as_ref().unwrap().strength;
+        assert!((draft - (DEFAULT_MA_STRENGTH - 0.20)).abs() < 1e-9);
+        // Cancel does not persist.
+        app.type_style_cancel();
+        assert!(app.type_style_edit.is_none());
+        assert!((app.focused_chart().overlay_strength("ma") - DEFAULT_MA_STRENGTH).abs() < 1e-9);
+        assert!(app.pending_type_styles.is_none());
+
+        app.indicator_open_type_style();
+        app.type_style_nudge(-4);
+        app.type_style_confirm();
+        assert!(app.type_style_edit.is_none());
+        assert!((app.focused_chart().overlay_strength("ma") - (DEFAULT_MA_STRENGTH - 0.20)).abs() < 1e-9);
+        let pending = app.pending_type_styles.expect("armed for engine");
+        assert_eq!(pending.chart_id, "primary");
+        assert!(
+            (pending
+                .type_styles
+                .get("ma")
+                .map(|s| s.overlay_strength)
+                .unwrap()
+                - (DEFAULT_MA_STRENGTH - 0.20))
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn type_style_not_opened_from_current_list() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Current;
+        app.indicator_open_type_style();
+        assert!(app.type_style_edit.is_none());
+    }
+
+    #[test]
+    fn current_activate_toggles_on_off_available_does_not() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Current;
+        app.focused_chart_mut()
+            .indicators
+            .push(IndicatorConfig::volume("volume"));
+        assert!(app.focused_chart().indicators[0].enabled);
+        app.indicator_activate_selected();
+        assert!(!app.focused_chart().indicators[0].enabled);
+
+        // On Available, activate adds (not toggle of Current row).
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.indicator_available_selected = 2; // session_vp
+        app.indicator_activate_selected();
+        assert!(
+            app.focused_chart()
+                .indicators
+                .iter()
+                .any(|i| i.indicator_type == "session_vp")
+        );
+    }
+
+    #[test]
+    fn clear_except_volume_only_on_current_side() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        let chart = app.focused_chart_mut();
+        chart.indicators.push(IndicatorConfig::ma("ma10", "sma", 10));
+        chart.indicators.push(IndicatorConfig::volume("volume"));
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.indicator_clear_except_volume();
+        assert_eq!(app.focused_chart().indicators.len(), 2);
+        assert!(app.pending_indicators.is_none());
+
+        app.indicator_list_side = IndicatorListSide::Current;
+        app.indicator_clear_except_volume();
+        assert_eq!(app.focused_chart().indicators.len(), 1);
+        assert_eq!(app.focused_chart().indicators[0].indicator_type, "volume");
+        assert!(app.pending_indicators.is_some());
+    }
+
+    #[test]
+    fn indicator_select_delta_routes_by_active_list() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_list_side = IndicatorListSide::Available;
+        app.indicator_available_selected = 0;
+        app.indicator_select_delta(2);
+        assert_eq!(app.indicator_available_selected, 2);
+
+        app.indicator_list_side = IndicatorListSide::Current;
+        app.focused_chart_mut()
+            .indicators
+            .push(IndicatorConfig::volume("volume"));
+        app.focused_chart_mut()
+            .indicators
+            .push(IndicatorConfig::ma("ma10", "sma", 10));
+        app.indicator_selected = 0;
+        app.indicator_select_delta(1);
+        assert_eq!(app.indicator_selected, 1);
+        // Available selection unchanged while navigating Current.
+        assert_eq!(app.indicator_available_selected, 2);
     }
 
     fn dual_workspace() -> WorkspaceSnapshot {

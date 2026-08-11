@@ -18,8 +18,8 @@ use tui_candlestick_chart::{
 };
 
 use crate::app::{
-    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, InputMode, LayoutMode, Screen,
-    UNAVAILABLE_COPY,
+    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, IndicatorListSide, InputMode,
+    LayoutMode, Screen, AVAILABLE_INDICATOR_TYPES, UNAVAILABLE_COPY,
 };
 use crate::ipc::{OhlcvBar, QuoteRow};
 use crate::overlay::{
@@ -35,6 +35,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if app.help_open {
         draw_help_popup(frame);
+    }
+    if app.type_style_edit.is_some() && !app.help_open {
+        draw_type_style_popup(frame, app);
     }
 }
 
@@ -76,7 +79,7 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
 fn draw_help_popup(frame: &mut Frame) {
     let area = frame.area();
     // Tall enough for the full menu; shrink on small terminals (content clips).
-    let popup_h = area.height.saturating_sub(2).clamp(16, 38);
+    let popup_h = area.height.saturating_sub(2).clamp(18, 44);
     let popup = centered_rect(area, 74, popup_h);
     frame.render_widget(Clear, popup);
 
@@ -126,27 +129,30 @@ fn draw_help_popup(frame: &mut Frame) {
         row("r", "Rename active watchlist sheet"),
         row("a", "Add symbol to active list"),
         row("x / d", "Remove selected symbol"),
-        section("Indicator panel (owns keys; watchlist inactive)"),
-        row("↑ / ↓", "Select indicator row (not watchlist)"),
+        section("Indicator panel · Available | Current (owns keys; watchlist inactive)"),
+        row("Tab", "Switch active list Available ↔ Current (default Current)"),
+        row("↑ / ↓", "Move within the active list (not watchlist)"),
         row("← / →", "Not pan — panel owns focus while open"),
-        row("Space / Enter", "Enable / disable selected (incl. Fixed Range + Anchored)"),
-        row("m", "Add MA stack (SMA 10 / 60 / 200)"),
-        row("v", "Add Volume (max 1)"),
-        row("p", "Add Session VP (max 1; note: p = prev list outside panel)"),
-        row("f", "Add Fixed Range VP (max 4) → pin placement on chart"),
-        row("a", "Add Anchored VP (max 2; cash open 09:30 NY default)"),
-        row("y", "Add GEX (optional; unavailable without options data)"),
-        row("g", "Add GARCH (optional; unavailable without enough history)"),
+        section("Available (left · catalog)"),
+        row("Space / Enter", "Add selected type (respects max counts)"),
+        row("c", "Type style popup — overlay strength for that type on this chart"),
+        row("m v p f a y g", "Quick-add shortcuts (MA · Vol · SVP · FRVP · AVP · GEX · GARCH)"),
+        section("Current (right · instances)"),
+        row("Space / Enter", "Enable / disable selected instance"),
+        row("x", "Remove selected indicator"),
         row("r", "Re-place FRVP pins or AVP anchor (when selected)"),
-        row("c", "Clear all indicators except Volume"),
+        row("c / Shift+C", "Clear all indicators except Volume"),
         row("e", "Fixed Range: toggle extend-to-right"),
         row("9", "Anchored VP: snap anchor to 09:30 America/New_York"),
         row(", / .", "Nudge FRVP start or AVP anchor bar-by-bar"),
         row("s", "MA: SMA↔EMA · VP: left↔right place"),
         row("+ / -", "MA: length · VP: box width %"),
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
-        row("x", "Remove selected indicator"),
         row("o / Esc", "Close indicator panel"),
+        section("Type style popup (from Available · c)"),
+        row("← / → or +/-", "Nudge overlay strength (0–1)"),
+        row("Enter", "Apply strength to all instances of that type on focused chart"),
+        row("Esc", "Cancel without saving"),
         section("Fixed Range pin placement (← → move pin, not pan)"),
         row("← / →", "Move pin cursor bar-by-bar (h/l also)"),
         row("[ / ]", "Jump pin cursor 10 bars"),
@@ -203,7 +209,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         InputMode::InstrumentPrompt { .. }
         | InputMode::WatchlistAddPrompt { .. }
         | InputMode::WatchlistRenamePrompt { .. } => 3,
-        InputMode::IndicatorPanel => 10,
+        InputMode::IndicatorPanel => 12,
         InputMode::FrvpPlacing | InputMode::AvpPlacing => 3,
         InputMode::Normal => 0,
     };
@@ -332,8 +338,12 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         )
         .style(Style::default().fg(Color::Yellow))
     } else if panel_open {
+        let side = match app.indicator_list_side {
+            IndicatorListSide::Available => "Available",
+            IndicatorListSide::Current => "Current",
+        };
         Paragraph::new(format!(
-            "Indicators · {}  ·  ? help  ·  m MA  ·  v Vol  ·  p SVP  ·  f FRVP  ·  a AVP  ·  r re-pin  ·  c clear  ·  Space/Enter on/off  ·  9 cash  ·  x  ·  o/Esc",
+            "Indicators · {} · active:{side}  ·  Tab switch  ·  ? help  ·  Avail: Enter add · c style  ·  Curr: Space on/off · r re-pin · c/C clear · x  ·  o/Esc",
             focused.title(),
         ))
         .style(Style::default().fg(Color::DarkGray))
@@ -353,15 +363,98 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
 
 fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
     let chart = app.focused_chart();
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+
+    draw_available_list(frame, cols[0], app);
+    draw_current_list(frame, cols[1], app, chart);
+}
+
+fn draw_available_list(frame: &mut Frame, area: Rect, app: &App) {
+    let active = app.indicator_list_side == IndicatorListSide::Available;
+    let sel = app
+        .indicator_available_selected
+        .min(AVAILABLE_INDICATOR_TYPES.len().saturating_sub(1));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        if active {
+            "Enter/Sp add · c type style"
+        } else {
+            "Tab to focus this list"
+        },
+        Style::default().fg(Color::DarkGray),
+    )));
+    for (i, (type_key, label)) in AVAILABLE_INDICATOR_TYPES.iter().enumerate() {
+        let selected = active && i == sel;
+        let mark = if selected { "› " } else { "  " };
+        let count = app.focused_indicator_type_count(type_key);
+        let max = App::max_for_indicator_type(type_key);
+        let counts = match max {
+            Some(m) => format!(" [{count}/{m}]"),
+            None => {
+                if count > 0 {
+                    format!(" [{count}]")
+                } else {
+                    String::new()
+                }
+            }
+        };
+        let strength = app.focused_chart().overlay_strength(type_key);
+        let strength_note = if *type_key == "volume" {
+            String::new()
+        } else {
+            format!(" · str {strength:.2}")
+        };
+        let at_max = max.is_some_and(|m| count >= m);
+        let row = format!("{mark}{label}{counts}{strength_note}");
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if at_max {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+    let border = if active {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = if active {
+        " Available · active "
+    } else {
+        " Available "
+    };
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(border)
+            .title(title),
+    );
+    frame.render_widget(body, area);
+}
+
+fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
+    let active = app.indicator_list_side == IndicatorListSide::Current;
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chart.indicators.is_empty() {
         lines.push(Line::from(Span::styled(
-            "(naked — m MA · v Vol · p SVP · f FRVP · a AVP · y GEX · g GARCH · c clear-keep-vol)",
+            if active {
+                "(naked — Tab → Available · Enter to add)"
+            } else {
+                "(naked)"
+            },
             Style::default().fg(Color::DarkGray),
         )));
     } else {
         for (i, ind) in chart.indicators.iter().enumerate() {
-            let selected = i == app.indicator_selected.min(chart.indicators.len() - 1);
+            let selected =
+                active && i == app.indicator_selected.min(chart.indicators.len() - 1);
             let mark = if selected { "› " } else { "  " };
             let on = if ind.enabled { "on " } else { "off" };
             let optional_status = |id: &str| -> String {
@@ -478,11 +571,11 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     )
                 }
                 "gex" => format!(
-                    "{mark}[{on}] GEX{}  (y add · needs options)",
+                    "{mark}[{on}] GEX{}  (needs options)",
                     optional_status(&ind.id)
                 ),
                 "garch" => format!(
-                    "{mark}[{on}] GARCH{}  (g add · needs history)",
+                    "{mark}[{on}] GARCH{}  (needs history)",
                     optional_status(&ind.id)
                 ),
                 other => format!("{mark}[{on}] {other}"),
@@ -494,7 +587,11 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                 == Some("unavailable");
             let style = if selected {
                 Style::default()
-                    .fg(if unavailable { Color::Yellow } else { Color::Cyan })
+                    .fg(if unavailable {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    })
                     .add_modifier(Modifier::BOLD)
             } else if unavailable && ind.enabled {
                 Style::default().fg(Color::Yellow)
@@ -506,12 +603,75 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(label, style)));
         }
     }
+    let border = if active {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let title = if active {
+        format!(" Current · active · {} ", chart.title())
+    } else {
+        format!(" Current · {} ", chart.title())
+    };
     let body = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Indicators · {} ", chart.title())),
+            .border_style(border)
+            .title(title),
     );
     frame.render_widget(body, area);
+}
+
+fn draw_type_style_popup(frame: &mut Frame, app: &App) {
+    let Some(edit) = app.type_style_edit.as_ref() else {
+        return;
+    };
+    let area = frame.area();
+    let popup = centered_rect(area, 56, 9);
+    frame.render_widget(Clear, popup);
+
+    let type_label = AVAILABLE_INDICATOR_TYPES
+        .iter()
+        .find(|(k, _)| *k == edit.indicator_type)
+        .map(|(_, l)| *l)
+        .unwrap_or(edit.indicator_type.as_str());
+    let pct = (edit.strength * 100.0).round() as i64;
+    let bar_w = 20usize;
+    let filled = ((edit.strength * bar_w as f64).round() as usize).min(bar_w);
+    let bar = format!(
+        "[{}{}]",
+        "█".repeat(filled),
+        "·".repeat(bar_w.saturating_sub(filled))
+    );
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" Type style · {type_label} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "  Overlay strength  {bar}  {pct}%  ({:.2})",
+            edit.strength
+        )),
+        Line::from(Span::styled(
+            "  Applies to all instances of this type on the focused chart",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ←/→ or +/- adjust   Enter apply   Esc cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Overlay strength "),
+    );
+    frame.render_widget(body, popup);
 }
 
 fn draw_watchlist(frame: &mut Frame, area: Rect, app: &App) {

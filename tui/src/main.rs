@@ -10,7 +10,7 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, InputMode, PendingWatchlistOp, Screen};
+use app::{App, IndicatorListSide, InputMode, PendingWatchlistOp, Screen};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -233,80 +233,147 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(c) => app.prompt_push_char(c),
             _ => {}
         },
-        InputMode::IndicatorPanel => match code {
-            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
-            KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
-                app.close_indicator_panel();
-            }
-            KeyCode::Up => app.indicator_select_delta(-1),
-            KeyCode::Down => app.indicator_select_delta(1),
-            // Space / Enter: enable/disable selected (including FRVP + AVP).
-            // Re-pin is only on `r` so Enter never jumps into pin placement.
-            KeyCode::Char(' ') | KeyCode::Enter => app.indicator_toggle_selected(),
-            KeyCode::Char('m') | KeyCode::Char('M') => app.indicator_add_default_ma_stack(),
-            KeyCode::Char('v') | KeyCode::Char('V') => app.indicator_add_volume(),
-            KeyCode::Char('p') | KeyCode::Char('P') => app.indicator_add_session_vp(),
-            KeyCode::Char('f') | KeyCode::Char('F') => app.indicator_add_fixed_range_vp(),
-            KeyCode::Char('a') | KeyCode::Char('A') => app.indicator_add_anchored_vp(),
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.indicator_add_gex(),
-            KeyCode::Char('g') | KeyCode::Char('G') => app.indicator_add_garch(),
-            KeyCode::Char('c') | KeyCode::Char('C') => app.indicator_clear_except_volume(),
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                let itype = app
-                    .focused_chart()
-                    .indicators
-                    .get(app.indicator_selected)
-                    .map(|i| i.indicator_type.as_str())
-                    .unwrap_or("");
-                match itype {
-                    "anchored_vp" => app.indicator_replace_avp_pin(),
-                    "fixed_range_vp" => app.indicator_replace_frvp_pins(),
+        InputMode::IndicatorPanel => {
+            // Type-style popup (Available · `c`) owns keys until confirm/cancel.
+            if app.type_style_edit.is_some() {
+                match code {
+                    KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => {
+                        app.toggle_help()
+                    }
+                    KeyCode::Esc => app.type_style_cancel(),
+                    KeyCode::Enter => app.type_style_confirm(),
+                    KeyCode::Left | KeyCode::Char('-') | KeyCode::Char('_') => {
+                        app.type_style_nudge(-1)
+                    }
+                    KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
+                        app.type_style_nudge(1)
+                    }
+                    KeyCode::Char('q') => app.quit(),
                     _ => {}
                 }
+                return;
             }
-            KeyCode::Char('e') | KeyCode::Char('E') => app.indicator_toggle_frvp_extend(),
-            KeyCode::Char('9') => app.indicator_snap_avp_cash_open(),
-            KeyCode::Char(',') => {
-                let itype = app
-                    .focused_chart()
-                    .indicators
-                    .get(app.indicator_selected)
-                    .map(|i| i.indicator_type.as_str())
-                    .unwrap_or("");
-                if itype == "anchored_vp" {
-                    app.indicator_nudge_avp_anchor(-1);
-                } else {
-                    app.indicator_nudge_frvp_anchor(0, -1);
+            match code {
+                KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
+                KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
+                    app.close_indicator_panel();
                 }
-            }
-            KeyCode::Char('.') => {
-                let itype = app
-                    .focused_chart()
-                    .indicators
-                    .get(app.indicator_selected)
-                    .map(|i| i.indicator_type.as_str())
-                    .unwrap_or("");
-                if itype == "anchored_vp" {
-                    app.indicator_nudge_avp_anchor(1);
-                } else {
-                    app.indicator_nudge_frvp_anchor(0, 1);
+                // Tab switches Available ↔ Current (not dual chart focus).
+                KeyCode::Tab => app.indicator_toggle_list_side(),
+                KeyCode::Up => app.indicator_select_delta(-1),
+                KeyCode::Down => app.indicator_select_delta(1),
+                // Space / Enter: Available = add; Current = on/off.
+                // Re-pin stays on `r` so Enter never jumps into pin placement.
+                KeyCode::Char(' ') | KeyCode::Enter => app.indicator_activate_selected(),
+                KeyCode::Char('c') => match app.indicator_list_side {
+                    IndicatorListSide::Available => app.indicator_open_type_style(),
+                    // Current: clear-all (also Shift+C below).
+                    IndicatorListSide::Current => app.indicator_clear_except_volume(),
+                },
+                KeyCode::Char('C') => {
+                    // Documented clear-all binding: Shift+C on Current.
+                    if app.indicator_list_side == IndicatorListSide::Current {
+                        app.indicator_clear_except_volume();
+                    }
                 }
+                // Power-user letter add shortcuts still work while the panel is open.
+                KeyCode::Char('m') | KeyCode::Char('M') => app.indicator_add_default_ma_stack(),
+                KeyCode::Char('v') | KeyCode::Char('V') => app.indicator_add_volume(),
+                KeyCode::Char('p') | KeyCode::Char('P') => app.indicator_add_session_vp(),
+                KeyCode::Char('f') | KeyCode::Char('F') => app.indicator_add_fixed_range_vp(),
+                KeyCode::Char('a') | KeyCode::Char('A') => app.indicator_add_anchored_vp(),
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.indicator_add_gex(),
+                KeyCode::Char('g') | KeyCode::Char('G') => app.indicator_add_garch(),
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    let itype = app
+                        .focused_chart()
+                        .indicators
+                        .get(app.indicator_selected)
+                        .map(|i| i.indicator_type.as_str())
+                        .unwrap_or("");
+                    match itype {
+                        "anchored_vp" => app.indicator_replace_avp_pin(),
+                        "fixed_range_vp" => app.indicator_replace_frvp_pins(),
+                        _ => {}
+                    }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    app.indicator_toggle_frvp_extend()
+                }
+                KeyCode::Char('9') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_snap_avp_cash_open()
+                }
+                KeyCode::Char(',') if app.indicator_list_side == IndicatorListSide::Current => {
+                    let itype = app
+                        .focused_chart()
+                        .indicators
+                        .get(app.indicator_selected)
+                        .map(|i| i.indicator_type.as_str())
+                        .unwrap_or("");
+                    if itype == "anchored_vp" {
+                        app.indicator_nudge_avp_anchor(-1);
+                    } else {
+                        app.indicator_nudge_frvp_anchor(0, -1);
+                    }
+                }
+                KeyCode::Char('.') if app.indicator_list_side == IndicatorListSide::Current => {
+                    let itype = app
+                        .focused_chart()
+                        .indicators
+                        .get(app.indicator_selected)
+                        .map(|i| i.indicator_type.as_str())
+                        .unwrap_or("");
+                    if itype == "anchored_vp" {
+                        app.indicator_nudge_avp_anchor(1);
+                    } else {
+                        app.indicator_nudge_frvp_anchor(0, 1);
+                    }
+                }
+                KeyCode::Char('<') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_nudge_frvp_anchor(1, -1)
+                }
+                KeyCode::Char('>') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_nudge_frvp_anchor(1, 1)
+                }
+                KeyCode::Char('x') | KeyCode::Char('X')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    app.indicator_remove_selected()
+                }
+                KeyCode::Char('s') | KeyCode::Char('S')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    app.indicator_cycle_style()
+                }
+                KeyCode::Char(']') => app.cycle_timeframe(1),
+                KeyCode::Char('[') => app.cycle_timeframe(-1),
+                KeyCode::Char('+') | KeyCode::Char('=')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    app.indicator_adjust_length(1)
+                }
+                KeyCode::Char('-') | KeyCode::Char('_')
+                    if app.indicator_list_side == IndicatorListSide::Current =>
+                {
+                    app.indicator_adjust_length(-1)
+                }
+                KeyCode::Char('1') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_toggle_vp_level(0)
+                }
+                KeyCode::Char('2') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_toggle_vp_level(1)
+                }
+                KeyCode::Char('3') if app.indicator_list_side == IndicatorListSide::Current => {
+                    app.indicator_toggle_vp_level(2)
+                }
+                KeyCode::Char('q') => app.quit(),
+                _ => {}
             }
-            KeyCode::Char('<') => app.indicator_nudge_frvp_anchor(1, -1),
-            KeyCode::Char('>') => app.indicator_nudge_frvp_anchor(1, 1),
-            KeyCode::Char('x') | KeyCode::Char('X') => app.indicator_remove_selected(),
-            KeyCode::Char('s') | KeyCode::Char('S') => app.indicator_cycle_style(),
-            KeyCode::Char(']') => app.cycle_timeframe(1),
-            KeyCode::Char('[') => app.cycle_timeframe(-1),
-            KeyCode::Char('+') | KeyCode::Char('=') => app.indicator_adjust_length(1),
-            KeyCode::Char('-') | KeyCode::Char('_') => app.indicator_adjust_length(-1),
-            KeyCode::Char('1') => app.indicator_toggle_vp_level(0),
-            KeyCode::Char('2') => app.indicator_toggle_vp_level(1),
-            KeyCode::Char('3') => app.indicator_toggle_vp_level(2),
-            KeyCode::Tab => app.focus_next(),
-            KeyCode::Char('q') => app.quit(),
-            _ => {}
-        },
+        }
         InputMode::FrvpPlacing => match code {
             // `?` only for help — h/l are vim-style pin nudges here.
             KeyCode::Char('?') => app.toggle_help(),
