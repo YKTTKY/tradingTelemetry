@@ -1089,15 +1089,36 @@ struct VpOverlayDraw {
 
 fn named_color(name: Option<&str>, fallback: Color) -> Color {
     match name.map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("yellow") | Some("gold") => Color::Yellow,
-        Some("green") | Some("lime") => Color::Green,
-        Some("red") | Some("magenta") => Color::Red,
-        Some("cyan") | Some("steelblue") | Some("blue") => Color::Cyan,
+        Some("yellow") | Some("gold") => Color::Rgb(255, 210, 40),
+        Some("green") | Some("lime") => Color::Rgb(50, 220, 100),
+        Some("red") | Some("magenta") => Color::Rgb(240, 70, 80),
+        Some("cyan") | Some("steelblue") => Color::Rgb(70, 110, 160),
+        Some("blue") | Some("dodgerblue") | Some("deepskyblue") => Color::Rgb(80, 160, 255),
         Some("white") => Color::White,
         Some("gray") | Some("grey") | Some("darkgray") | Some("darkgrey") => Color::DarkGray,
-        Some("lightblue") => Color::LightBlue,
-        Some("lightgreen") => Color::LightGreen,
+        Some("lightblue") => Color::Rgb(100, 180, 255),
+        Some("lightgreen") => Color::Rgb(80, 230, 120),
         _ => fallback,
+    }
+}
+
+/// Product defaults: POC blue, VAH green, VAL red (always visually distinct).
+fn vp_level_color(kind: &str, configured: Option<&str>) -> Color {
+    // Map legacy/default config names onto the product palette; honor only explicit customs.
+    match kind {
+        "poc" => match configured.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("yellow") | Some("gold") | None => Color::Rgb(80, 160, 255), // blue
+            other => named_color(other, Color::Rgb(80, 160, 255)),
+        },
+        "vah" => match configured.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("lime") | Some("green") | None => Color::Rgb(50, 220, 100), // green
+            other => named_color(other, Color::Rgb(50, 220, 100)),
+        },
+        "val" => match configured.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("red") | Some("magenta") | None => Color::Rgb(240, 70, 80), // red
+            other => named_color(other, Color::Rgb(240, 70, 80)),
+        },
+        _ => Color::White,
     }
 }
 
@@ -1172,9 +1193,9 @@ fn build_session_vp_draw(
     let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
     let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
     let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
-    let poc_color = named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
-    let vah_color = named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
-    let val_color = named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+    let poc_color = vp_level_color("poc", cfg.poc.as_ref().and_then(|s| s.color.as_deref()));
+    let vah_color = vp_level_color("vah", cfg.vah.as_ref().and_then(|s| s.color.as_deref()));
+    let val_color = vp_level_color("val", cfg.val.as_ref().and_then(|s| s.color.as_deref()));
     // Skip levels when opacity is explicitly 0.
     let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
         style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
@@ -1329,12 +1350,9 @@ fn build_fixed_range_vp_draw(
         let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
         let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
         let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
-        let poc_color =
-            named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
-        let vah_color =
-            named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
-        let val_color =
-            named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+        let poc_color = vp_level_color("poc", cfg.poc.as_ref().and_then(|s| s.color.as_deref()));
+        let vah_color = vp_level_color("vah", cfg.vah.as_ref().and_then(|s| s.color.as_deref()));
+        let val_color = vp_level_color("val", cfg.val.as_ref().and_then(|s| s.color.as_deref()));
 
         for profile in &series.profiles {
             let range_start = profile
@@ -1488,12 +1506,9 @@ fn build_anchored_vp_draw(
         let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
         let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
         let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
-        let poc_color =
-            named_color(cfg.poc.as_ref().and_then(|s| s.color.as_deref()), Color::Yellow);
-        let vah_color =
-            named_color(cfg.vah.as_ref().and_then(|s| s.color.as_deref()), Color::Green);
-        let val_color =
-            named_color(cfg.val.as_ref().and_then(|s| s.color.as_deref()), Color::Red);
+        let poc_color = vp_level_color("poc", cfg.poc.as_ref().and_then(|s| s.color.as_deref()));
+        let vah_color = vp_level_color("vah", cfg.vah.as_ref().and_then(|s| s.color.as_deref()));
+        let val_color = vp_level_color("val", cfg.val.as_ref().and_then(|s| s.color.as_deref()));
 
         for profile in &series.profiles {
             let range_start = profile

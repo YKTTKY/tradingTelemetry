@@ -864,7 +864,15 @@ impl App {
     }
 
     fn arm_indicators_apply(&mut self) {
-        let chart = self.focused_chart();
+        let id = self.focused_chart().id.clone();
+        self.arm_indicators_apply_for(&id);
+    }
+
+    /// Arm indicator apply for an explicit chart (FRVP/AVP pin completion).
+    fn arm_indicators_apply_for(&mut self, chart_id: &str) {
+        let Some(chart) = self.charts.iter().find(|c| c.id == chart_id) else {
+            return;
+        };
         self.pending_indicators = Some(PendingIndicatorsApply {
             chart_id: chart.id.clone(),
             indicators: chart.indicators.clone(),
@@ -1158,20 +1166,29 @@ impl App {
                 let start_ts = bars[lo].ts;
                 let end_ts = bars[hi].ts;
                 let ind_id = place.indicator_id.clone();
-                if let Some(cfg) = self.charts[chart_idx]
+                let chart_id = place.chart_id.clone();
+                let found = self.charts[chart_idx]
                     .indicators
                     .iter_mut()
-                    .find(|c| c.id == ind_id)
-                {
+                    .find(|c| c.id == ind_id);
+                if let Some(cfg) = found {
                     cfg.start = Some(start_ts);
                     cfg.end = Some(end_ts);
                     cfg.enabled = true;
+                } else {
+                    // Draft was wiped mid-placement (interest race) — recreate so pin work is not lost.
+                    let mut cfg =
+                        IndicatorConfig::fixed_range_vp_default(ind_id, start_ts, end_ts);
+                    cfg.enabled = true;
+                    self.charts[chart_idx].indicators.push(cfg);
                 }
                 self.frvp_place = None;
                 // Return to the indicator panel after both pins lock.
                 self.input_mode = InputMode::IndicatorPanel;
                 self.focused = chart_idx;
-                self.arm_indicators_apply();
+                // Apply for the chart that owns the pins (not just "focused" if focus drifted).
+                self.arm_indicators_apply_for(&chart_id);
+                self.last_indicator_error = None;
             }
         }
     }
@@ -2011,14 +2028,19 @@ impl App {
         if series.instrument != chart.instrument || series.timeframe != chart.timeframe {
             return;
         }
-        // Interest carries the engine config list. Keep local drafts still being placed
-        // (not yet POSTed) so a chart reload does not wipe an in-progress pin session.
+        // Interest carries the engine config list. Keep local FRVP/AVP that the
+        // engine does not yet know about (in-progress pin drafts OR just-confirmed
+        // pins whose POST has not completed / interest raced ahead of apply).
         let local_pending_pins: Vec<IndicatorConfig> = chart
             .indicators
             .iter()
             .filter(|i| {
-                (i.indicator_type == "fixed_range_vp" || i.indicator_type == "anchored_vp")
-                    && !series.indicators.iter().any(|e| e.id == i.id)
+                let is_pin_type =
+                    i.indicator_type == "fixed_range_vp" || i.indicator_type == "anchored_vp";
+                if !is_pin_type {
+                    return false;
+                }
+                !series.indicators.iter().any(|e| e.id == i.id)
             })
             .cloned()
             .collect();
@@ -3097,6 +3119,73 @@ mod tests {
         assert_eq!(fr.start, Some(bars[1].ts));
         assert_eq!(fr.end, Some(bars[3].ts));
         assert!(app.pending_indicators.is_some());
+        let pending = app.pending_indicators.as_ref().unwrap();
+        assert_eq!(pending.chart_id, "primary");
+        assert!(
+            pending
+                .indicators
+                .iter()
+                .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled),
+            "armed apply must include enabled FRVP"
+        );
+    }
+
+    #[test]
+    fn frvp_survives_chart_interest_race_after_confirm() {
+        // After both pins lock, a stale interest response without FRVP must not drop it.
+        let mut app = App::default();
+        app.enter_workspace();
+        app.chart_load_started();
+        let bars: Vec<OhlcvBar> = (0..8)
+            .map(|i| OhlcvBar {
+                ts: 1_700_000_000 + i * 60,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1_000.0,
+            })
+            .collect();
+        app.apply_chart_series(ChartInterestResponse {
+            status: "ok".into(),
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            chart_id: Some("primary".into()),
+            bars: bars.clone(),
+            indicators: vec![IndicatorConfig::volume("volume")],
+            series: HashMap::new(),
+        });
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_add_fixed_range_vp();
+        app.frvp_place_move(-100);
+        app.frvp_place_confirm(); // start
+        app.frvp_place_move(3);
+        app.frvp_place_confirm(); // end
+        assert!(
+            app.focused_chart()
+                .indicators
+                .iter()
+                .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
+        );
+
+        // Stale interest: engine still only knows volume (POST not completed).
+        app.apply_chart_series(ChartInterestResponse {
+            status: "ok".into(),
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            chart_id: Some("primary".into()),
+            bars: bars.clone(),
+            indicators: vec![IndicatorConfig::volume("volume")],
+            series: HashMap::new(),
+        });
+        let fr = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .find(|i| i.indicator_type == "fixed_range_vp")
+            .expect("FRVP must survive interest race");
+        assert!(fr.enabled);
+        assert!(fr.start.is_some() && fr.end.is_some());
     }
 
     #[test]

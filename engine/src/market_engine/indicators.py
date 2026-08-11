@@ -41,7 +41,8 @@ DEFAULT_VALUE_AREA_VOLUME = 70.0
 DEFAULT_BOX_WIDTH = 30.0
 DEFAULT_PLACEMENT: Placement = "right"
 DEFAULT_HISTOGRAM: dict[str, Any] = {"color": "steelblue", "opacity": 0.35}
-DEFAULT_POC: dict[str, Any] = {"enabled": True, "color": "yellow", "opacity": 1.0}
+# Product palette: POC blue, VAH green, VAL red (TUI maps names → distinct RGB).
+DEFAULT_POC: dict[str, Any] = {"enabled": True, "color": "blue", "opacity": 1.0}
 DEFAULT_VAH: dict[str, Any] = {"enabled": True, "color": "lime", "opacity": 1.0}
 DEFAULT_VAL: dict[str, Any] = {"enabled": True, "color": "red", "opacity": 1.0}
 

@@ -168,13 +168,8 @@ pub fn paint_overlays(
         }
         paint_level(buf, view, area, level, s);
     }
-    for line in &layers.lines {
-        let s = resolve_strength(&line.type_key, strengths);
-        if s <= 0.0 {
-            continue;
-        }
-        paint_line(buf, view, area, line, s);
-    }
+    // MA: Braille sub-cell strokes (smooth curves) merged onto candles without a wipe.
+    paint_lines_braille(buf, view, area, &layers.lines, strengths);
     for pin in &layers.pins {
         paint_pin(buf, view, area, pin);
     }
@@ -221,17 +216,6 @@ fn is_candle_glyph(sym: &str) -> bool {
 
 fn is_empty_glyph(sym: &str) -> bool {
     sym.is_empty() || sym == " " || sym == "\u{00a0}" || sym == "·" || sym == "x"
-}
-
-fn paint_cell_fg(buf: &mut Buffer, x: u16, y: u16, over: Color, strength: f64, symbol: Option<&str>) {
-    let under = under_fg(buf, x, y);
-    let fg = blend_color(under, over, strength);
-    let cell = &mut buf[(x, y)];
-    if let Some(sym) = symbol {
-        // Continuous overlays may win the glyph so the stroke stays continuous.
-        cell.set_symbol(sym);
-    }
-    cell.set_style(Style::default().fg(fg));
 }
 
 /// Soft VP hist like TradingView: tint empty cells with ░; never replace candle glyphs.
@@ -307,8 +291,8 @@ fn paint_level(
     };
     let c0 = level.x0.min(level.x1).floor() as i64;
     let c1 = level.x0.max(level.x1).ceil() as i64;
-    // Slightly stronger than hist so POC/VAH/VAL read as lines, not a wash.
-    let level_strength = strength.clamp(0.35, 1.0);
+    // Levels are strategy lines — keep them vivid (don't wash into candle green/red).
+    let level_strength = strength.max(0.8);
     for col in c0..=c1 {
         let Some(cx) = local_x_to_col(view, col as f64 + 0.5) else {
             continue;
@@ -321,86 +305,135 @@ fn paint_level(
         let sym = cell.symbol().to_string();
         let fg = blend_color(under, level.color, level_strength);
         if is_candle_glyph(&sym) {
-            // Keep candle body; tint so the level still reads through.
+            // Keep candle body; strong tint so VAH/POC/VAL still read.
             cell.set_style(Style::default().fg(fg));
         } else {
-            // Empty / hist: dashed level like TV.
-            cell.set_symbol("╌");
-            cell.set_style(Style::default().fg(fg));
+            // Empty / hist: solid-ish dash in the level color.
+            cell.set_symbol("─");
+            cell.set_style(Style::default().fg(level.color));
         }
     }
 }
 
-/// Line-drawing glyph for a segment step (screen y grows downward).
-fn line_glyph(dx: i32, dy: i32) -> &'static str {
-    if dx == 0 && dy == 0 {
-        return "·";
-    }
-    if dy == 0 {
-        return "─";
-    }
-    if dx == 0 {
-        return "│";
-    }
-    // Screen coords: +y is down. Rising price (negative dy) while +dx → ╱
-    if (dx > 0 && dy < 0) || (dx < 0 && dy > 0) {
-        "╱"
-    } else {
-        "╲"
-    }
+// --- Braille MA (smooth curves at 2×4 sub-cell resolution) -------------------
+
+/// Unicode Braille bit order (ratatui / standard):
+/// ```text
+///  0x01 0x08
+///  0x02 0x10
+///  0x04 0x20
+///  0x40 0x80
+/// ```
+const BRAILLE_DOTS: [[u8; 2]; 4] = [
+    [0x01, 0x08],
+    [0x02, 0x10],
+    [0x04, 0x20],
+    [0x40, 0x80],
+];
+
+fn braille_char(mask: u8) -> char {
+    char::from_u32(0x2800 + mask as u32).unwrap_or('\u{2800}')
 }
 
-fn paint_line(
+/// Paint MA polylines as Braille strokes (smooth vs cell ─╱╲ stairs), then merge
+/// onto the candle buffer so undrawn cells keep candle glyphs.
+fn paint_lines_braille(
     buf: &mut Buffer,
     view: &ChartView,
     area: Rect,
-    line: &OverlayLine,
-    strength: f64,
+    lines: &[OverlayLine],
+    strengths: &std::collections::HashMap<String, f64>,
 ) {
-    for w in line.points.windows(2) {
-        let (x1, p1) = w[0];
-        let (x2, p2) = w[1];
-        // Skip large gaps (missing MA samples / non-adjacent bars).
-        if (x2 - x1).abs() > 1.5 + f64::EPSILON {
+    if lines.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = area.width as usize;
+    let h = area.height as usize;
+    // mask + last color per cell (local 0..w, 0..h)
+    let mut masks = vec![0u8; w * h];
+    let mut colors: Vec<Option<Color>> = vec![None; w * h];
+    let mut cell_strength = vec![0.0_f64; w * h];
+
+    let y_min = view.y_min;
+    let y_max = view.y_max;
+    let y_span = (y_max - y_min).max(f64::EPSILON);
+    let pw = view.price_width() as f64;
+    let ph = view.price_height() as f64;
+    if pw <= 0.0 || ph <= 0.0 {
+        return;
+    }
+
+    // Map local canvas x / price → braille dot coordinates (origin top-left of candle area).
+    let to_dot = |x: f64, price: f64| -> (f64, f64) {
+        let dx = (x / pw) * (pw * 2.0); // 2 dots per cell horizontally
+        // price high → top (small y_dot)
+        let dy = ((y_max - price) / y_span) * (ph * 4.0); // 4 dots per cell vertically
+        (dx, dy)
+    };
+
+    for line in lines {
+        let s = resolve_strength(&line.type_key, strengths);
+        if s <= 0.0 {
             continue;
         }
-        let Some(c1) = local_x_to_col(view, x1) else {
-            continue;
-        };
-        let Some(c2) = local_x_to_col(view, x2) else {
-            continue;
-        };
-        let Some(r1) = price_to_row_clamped(view, p1) else {
-            continue;
-        };
-        let Some(r2) = price_to_row_clamped(view, p2) else {
-            continue;
-        };
-        let cells = bresenham_u16(c1, r1, c2, r2);
-        if cells.is_empty() {
-            continue;
-        }
-        for i in 0..cells.len() {
-            let (cx, cy) = cells[i];
-            if !cell_in_area(area, cx, cy) {
+        for win in line.points.windows(2) {
+            let (x1, p1) = win[0];
+            let (x2, p2) = win[1];
+            if (x2 - x1).abs() > 1.5 + f64::EPSILON {
                 continue;
             }
-            let (dx, dy) = if i + 1 < cells.len() {
-                (
-                    cells[i + 1].0 as i32 - cx as i32,
-                    cells[i + 1].1 as i32 - cy as i32,
-                )
-            } else if i > 0 {
-                (
-                    cx as i32 - cells[i - 1].0 as i32,
-                    cy as i32 - cells[i - 1].1 as i32,
-                )
-            } else {
-                (c2 as i32 - c1 as i32, r2 as i32 - r1 as i32)
-            };
-            let glyph = line_glyph(dx, dy);
-            // MA may win the cell so the stroke stays continuous (spec).
-            paint_cell_fg(buf, cx, cy, line.color, strength, Some(glyph));
+            let (d0x, d0y) = to_dot(x1, p1);
+            let (d1x, d1y) = to_dot(x2, p2);
+            // Dense samples along segment for continuous Braille stroke.
+            let steps = ((d1x - d0x).abs().max((d1y - d0y).abs()).ceil() as usize)
+                .max(1)
+                .saturating_mul(2);
+            for i in 0..=steps {
+                let t = i as f64 / steps as f64;
+                let dx = d0x + (d1x - d0x) * t;
+                let dy = d0y + (d1y - d0y) * t;
+                if dx < 0.0 || dy < 0.0 {
+                    continue;
+                }
+                let cell_x = (dx / 2.0).floor() as isize;
+                let cell_y = (dy / 4.0).floor() as isize;
+                if cell_x < 0 || cell_y < 0 || cell_x as usize >= w || cell_y as usize >= h {
+                    continue;
+                }
+                let sub_x = (dx.floor() as i64).rem_euclid(2) as usize;
+                let sub_y = (dy.floor() as i64).rem_euclid(4) as usize;
+                let bit = BRAILLE_DOTS[sub_y.min(3)][sub_x.min(1)];
+                let idx = cell_y as usize * w + cell_x as usize;
+                masks[idx] |= bit;
+                colors[idx] = Some(line.color);
+                cell_strength[idx] = s;
+            }
+        }
+    }
+
+    for cy in 0..h {
+        for cx in 0..w {
+            let idx = cy * w + cx;
+            let mask = masks[idx];
+            if mask == 0 {
+                continue;
+            }
+            let abs_x = area.x + cx as u16;
+            let abs_y = area.y + cy as u16;
+            if !cell_in_area(area, abs_x, abs_y) {
+                continue;
+            }
+            let over = colors[idx].unwrap_or(Color::Cyan);
+            let s = cell_strength[idx];
+            let under = under_fg(buf, abs_x, abs_y);
+            let fg = blend_color(under, over, s);
+            let cell = &mut buf[(abs_x, abs_y)];
+            // MA may win the glyph for continuous stroke (Braille curve).
+            let ch = braille_char(mask);
+            let mut sbuf = [0u8; 4];
+            let sym = ch.encode_utf8(&mut sbuf);
+            cell.set_symbol(sym);
+            cell.set_style(Style::default().fg(fg));
         }
     }
 }
@@ -422,38 +455,6 @@ fn paint_pin(buf: &mut Buffer, view: &ChartView, area: Rect, pin: &OverlayPin) {
             .fg(pin.color)
             .add_modifier(Modifier::BOLD),
     );
-}
-
-/// Integer Bresenham line in terminal cell coordinates.
-fn bresenham_u16(x0: u16, y0: u16, x1: u16, y1: u16) -> Vec<(u16, u16)> {
-    let mut out = Vec::new();
-    let mut x0 = x0 as i32;
-    let mut y0 = y0 as i32;
-    let x1 = x1 as i32;
-    let y1 = y1 as i32;
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    loop {
-        if x0 >= 0 && y0 >= 0 {
-            out.push((x0 as u16, y0 as u16));
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -555,10 +556,11 @@ mod tests {
         paint_overlays(&mut buf, &view, &layers, &strengths);
 
         let cell = &buf[(seed_x, seed_y)];
-        // MA paints last among hist/level/line and may win with a continuous stroke glyph.
+        // MA paints last as Braille stroke and may win the glyph.
+        let ch = cell.symbol().chars().next().unwrap_or(' ');
         assert!(
-            matches!(cell.symbol(), "─" | "│" | "╱" | "╲" | "·"),
-            "expected line glyph, got {:?}",
+            ('\u{2800}'..='\u{28FF}').contains(&ch),
+            "expected Braille MA glyph, got {:?}",
             cell.symbol()
         );
         // Yellow named → RGB approx; strength 1.0 should recolor fully.
@@ -570,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn ma_horizontal_uses_continuous_dash_not_dot() {
+    fn ma_horizontal_uses_braille_not_ascii_stairs() {
         let view = sample_view();
         let area = view.candle_area();
         let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
@@ -585,8 +587,19 @@ mod tests {
         paint_overlays(&mut buf, &view, &layers, &strengths);
         let y = view.price_to_row(150.0).unwrap();
         let x0 = area.x + 15;
-        assert_eq!(buf[(x0, y)].symbol(), "─");
-        assert_eq!(buf[(x0 + 1, y)].symbol(), "─");
+        let ch0 = buf[(x0, y)].symbol().chars().next().unwrap_or(' ');
+        let ch1 = buf[(x0 + 1, y)].symbol().chars().next().unwrap_or(' ');
+        assert!(
+            ('\u{2800}'..='\u{28FF}').contains(&ch0),
+            "expected Braille, got {ch0:?}"
+        );
+        assert!(
+            ('\u{2800}'..='\u{28FF}').contains(&ch1),
+            "expected Braille, got {ch1:?}"
+        );
+        // Must not look like the old staircase glyphs.
+        assert_ne!(buf[(x0, y)].symbol(), "•");
+        assert_ne!(buf[(x0, y)].symbol(), "╱");
     }
 
     #[test]

@@ -161,10 +161,11 @@ fn default_true() -> bool {
 
 impl IndicatorConfig {
     fn vp_level_defaults() -> (Option<LevelStyle>, Option<LevelStyle>, Option<LevelStyle>) {
+        // POC blue · VAH green · VAL red (product palette; TUI maps names → RGB).
         (
             Some(LevelStyle {
                 enabled: true,
-                color: Some("yellow".into()),
+                color: Some("blue".into()),
                 opacity: Some(1.0),
             }),
             Some(LevelStyle {
