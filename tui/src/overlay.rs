@@ -27,13 +27,35 @@ pub fn clamp_strength(strength: f64) -> f64 {
     strength.clamp(0.0, 1.0)
 }
 
+/// Default volume subplot intensity (sub-pane, not price overlay).
+pub const DEFAULT_VOLUME_STRENGTH: f64 = 0.85;
+
+/// Full-strength up volume bar (matches candle green family).
+pub const VOLUME_UP_COLOR: Color = Color::Rgb(52, 208, 88);
+/// Full-strength down volume bar (matches candle red family).
+pub const VOLUME_DOWN_COLOR: Color = Color::Rgb(234, 74, 90);
+
 /// Product default overlay strength for an indicator type (type style).
 pub fn default_strength_for_type(indicator_type: &str) -> f64 {
     match indicator_type {
         "ma" => DEFAULT_MA_STRENGTH,
         "session_vp" | "fixed_range_vp" | "anchored_vp" => DEFAULT_VP_STRENGTH,
+        "volume" => DEFAULT_VOLUME_STRENGTH,
         _ => DEFAULT_OVERLAY_STRENGTH,
     }
+}
+
+/// Volume subplot bar color at the given type-style strength.
+///
+/// Strength dims pure up/down hue toward black (same model as MA / VP levels).
+/// Volume is a sub-pane — strength is bar intensity, not price-overlay blend.
+pub fn volume_bar_color(up: bool, strength: f64) -> Color {
+    let full = if up {
+        VOLUME_UP_COLOR
+    } else {
+        VOLUME_DOWN_COLOR
+    };
+    dim_to_background(full, strength)
 }
 
 /// Linear blend of two RGB triples by strength (0 = under, 1 = over).
@@ -505,7 +527,22 @@ mod tests {
             default_strength_for_type("anchored_vp"),
             DEFAULT_VP_STRENGTH
         );
+        assert_eq!(default_strength_for_type("volume"), DEFAULT_VOLUME_STRENGTH);
         assert_eq!(default_strength_for_type("gex"), DEFAULT_OVERLAY_STRENGTH);
+    }
+
+    #[test]
+    fn volume_bar_color_scales_with_strength() {
+        let full_up = volume_bar_color(true, 1.0);
+        let dim_up = volume_bar_color(true, 0.35);
+        assert_eq!(full_up, VOLUME_UP_COLOR);
+        assert_eq!(
+            color_to_rgb(dim_up),
+            color_to_rgb(dim_to_background(VOLUME_UP_COLOR, 0.35))
+        );
+        assert_ne!(full_up, dim_up);
+        let full_dn = volume_bar_color(false, 1.0);
+        assert_eq!(full_dn, VOLUME_DOWN_COLOR);
     }
 
     #[test]

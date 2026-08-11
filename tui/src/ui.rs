@@ -23,8 +23,8 @@ use crate::app::{
 };
 use crate::ipc::{OhlcvBar, QuoteRow};
 use crate::overlay::{
-    paint_overlays, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine, OverlayPin,
-    MAX_VP_HIST_PANE_FRACTION,
+    paint_overlays, volume_bar_color, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
+    OverlayPin, MAX_VP_HIST_PANE_FRACTION,
 };
 use crate::timeframe::product_timeframe_to_interval;
 
@@ -150,7 +150,7 @@ fn draw_help_popup(frame: &mut Frame) {
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
         row("o / Esc", "Close indicator panel"),
         section("Type style popup (from Available · c)"),
-        row("← / → or +/-", "Nudge overlay strength (0–1)"),
+        row("← / → or +/-", "Nudge strength (0–1): MA/VP overlay intensity; Volume subplot bar intensity"),
         row("Enter", "Apply strength to all instances of that type on focused chart"),
         row("Esc", "Cancel without saving"),
         section("Fixed Range pin placement (← → move pin, not pan)"),
@@ -402,11 +402,7 @@ fn draw_available_list(frame: &mut Frame, area: Rect, app: &App) {
             }
         };
         let strength = app.focused_chart().overlay_strength(type_key);
-        let strength_note = if *type_key == "volume" {
-            String::new()
-        } else {
-            format!(" · str {strength:.2}")
-        };
+        let strength_note = format!(" · str {strength:.2}");
         let at_max = max.is_some_and(|m| count >= m);
         let row = format!("{mark}{label}{counts}{strength_note}");
         let style = if selected {
@@ -1879,14 +1875,16 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
         .map(|v| v.unwrap_or(0.0))
         .collect();
     let max_v = values.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+    // Type style strength → subplot bar intensity (Volume is not a price overlay).
+    let strength = chart.overlay_strength("volume");
+    // Slightly wider stems at high strength so intensity reads as more than just hue dim.
+    let body_w = (0.30 + 0.40 * strength.clamp(0.0, 1.0)).clamp(0.25, 0.75);
+    let half_w = body_w / 2.0;
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Volume ");
+        .title(format!(" Volume · str {strength:.2} "));
 
-    // Thin stems read better than full-width Block slabs in a short pane.
-    let body_w = 0.45_f64;
-    let half_w = body_w / 2.0;
     let canvas = Canvas::default()
         .block(block)
         .marker(symbols::Marker::Braille)
@@ -1896,12 +1894,7 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
             for (i, (bar, &vol)) in visible_bars.iter().zip(values.iter()).enumerate() {
                 let x = i as f64 + 0.5;
                 let up = bar.close >= bar.open;
-                // Soft directional tint — thinner stems so volume stays secondary.
-                let color = if up {
-                    Color::Rgb(0, 120, 60)
-                } else {
-                    Color::Rgb(140, 40, 40)
-                };
+                let color = volume_bar_color(up, strength);
                 let height = vol.max(max_v * 0.02);
                 ctx.draw(&Rectangle {
                     x: x - half_w,
