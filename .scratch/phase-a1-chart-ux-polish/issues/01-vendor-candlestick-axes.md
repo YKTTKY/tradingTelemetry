@@ -4,7 +4,7 @@
 
 **Blocked by:** none
 
-**Status:** ready-for-human
+**Status:** done
 
 - [x] Vendored (or forked-in-tree) candlestick widget builds with Ratatui 0.30.x
 - [x] All buffer writes respect `area.x` / `area.y` (dual + status bar safe)
@@ -21,5 +21,7 @@
 ## Comments
 
 - Implemented: vendored widget at `tui/vendor/tui-candlestick-chart` (path dep), `area` origin fix + tests, `ChartView` scale/window helpers, product TF map in `tui/src/timeframe.rs`, wired into price pane (`draw_candles`), ADR-0003.
+- Dense packing follow-up: one bar per column (equity weekends no longer open empty columns); confirmed continuous on 1m + 1D dual layout.
 - Overlay paint still uses a secondary Canvas on the candle area (Phase A features kept); issue 02 owns compose + strength.
 - Axis TZ: America/New_York offset at last bar (FixedOffset for the whole axis; DST mid-window is a known soft limit of the widget API).
+- **Closed:** human accepted visual density as-is for this ship; further chart UX in later A.1 issues.
