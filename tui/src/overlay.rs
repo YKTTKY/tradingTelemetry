@@ -11,11 +11,13 @@ use ratatui::{
 use tui_candlestick_chart::ChartView;
 
 /// Default MA overlay strength (continuous lines stay readable).
-pub const DEFAULT_MA_STRENGTH: f64 = 0.85;
-/// Default VP histogram strength (soft so candles stay readable).
-pub const DEFAULT_VP_STRENGTH: f64 = 0.35;
+pub const DEFAULT_MA_STRENGTH: f64 = 0.9;
+/// Default VP histogram strength (soft so candles stay readable — TV-like).
+pub const DEFAULT_VP_STRENGTH: f64 = 0.28;
 /// Fallback when type has no dedicated default.
 pub const DEFAULT_OVERLAY_STRENGTH: f64 = 0.75;
+/// Cap VP hist width as a fraction of the price pane (not only of the session span).
+pub const MAX_VP_HIST_PANE_FRACTION: f64 = 0.28;
 
 /// Clamp overlay strength into the terminal intensity range \[0, 1\].
 pub fn clamp_strength(strength: f64) -> f64 {
@@ -202,6 +204,25 @@ fn under_fg(buf: &Buffer, x: u16, y: u16) -> Color {
     buf[(x, y)].style().fg.unwrap_or(Color::Reset)
 }
 
+/// Candle body/wick glyphs from the vendored candlestick widget (`symbols.rs`).
+fn is_candle_glyph(sym: &str) -> bool {
+    matches!(
+        sym,
+        "┃" // BODY
+            | "│" // WICK
+            | "╽" // UP
+            | "╿" // DOWN
+            | "╻" // HALF_BODY_BOTTOM
+            | "╷" // HALF_WICK_BOTTOM
+            | "╹" // HALF_BODY_TOP
+            | "╵" // HALF_WICK_TOP
+    )
+}
+
+fn is_empty_glyph(sym: &str) -> bool {
+    sym.is_empty() || sym == " " || sym == "\u{00a0}" || sym == "·" || sym == "x"
+}
+
 fn paint_cell_fg(buf: &mut Buffer, x: u16, y: u16, over: Color, strength: f64, symbol: Option<&str>) {
     let under = under_fg(buf, x, y);
     let fg = blend_color(under, over, strength);
@@ -213,6 +234,8 @@ fn paint_cell_fg(buf: &mut Buffer, x: u16, y: u16, over: Color, strength: f64, s
     cell.set_style(Style::default().fg(fg));
 }
 
+/// Soft VP hist like TradingView: tint empty cells with ░; never replace candle glyphs.
+/// Only recolor candle cells lightly so price action stays readable under the profile.
 fn paint_hist_bar(
     buf: &mut Buffer,
     view: &ChartView,
@@ -220,10 +243,8 @@ fn paint_hist_bar(
     bar: &OverlayHistBar,
     strength: f64,
 ) {
-    // Soft hist: blend over under-cell color so candles stay readable.
-    // Only plant a soft block glyph on empty cells; never force-overwrite candle glyphs.
     let x0 = bar.x;
-    let x1 = bar.x + bar.width;
+    let x1 = bar.x + bar.width.max(0.5);
     let y_lo = bar.y;
     let y_hi = bar.y + bar.height;
     let Some(row_hi) = price_to_row_clamped(view, y_hi) else {
@@ -232,29 +253,44 @@ fn paint_hist_bar(
     let Some(row_lo) = price_to_row_clamped(view, y_lo) else {
         return;
     };
-    let (r0, r1) = if row_hi <= row_lo {
-        (row_hi, row_lo)
+    // Prefer a single row per bin mid-price so profiles don't solid-fill vertical slabs.
+    let mid = (y_lo + y_hi) * 0.5;
+    let row = price_to_row_clamped(view, mid).unwrap_or(row_lo);
+    let rows = if (row_hi as i32 - row_lo as i32).abs() <= 1 {
+        vec![row]
     } else {
-        (row_lo, row_hi)
+        // Tall bins: only the mid row (volume-by-price already one bin per level).
+        vec![row]
     };
+
     let col_start = x0.floor() as i64;
     let col_end = x1.ceil() as i64;
+    // Soften hist further vs levels/MA (TV opacity look).
+    let hist_strength = (strength * 0.85).clamp(0.0, 1.0);
     for col in col_start..col_end {
         let Some(cx) = local_x_to_col(view, col as f64 + 0.5) else {
             continue;
         };
-        for ry in r0..=r1 {
+        for &ry in &rows {
             if !cell_in_area(area, cx, ry) {
                 continue;
             }
             let under = under_fg(buf, cx, ry);
-            let fg = blend_color(under, bar.color, strength);
             let cell = &mut buf[(cx, ry)];
-            let sym = cell.symbol();
-            if sym.is_empty() || sym == " " || sym == "\u{00a0}" {
+            let sym = cell.symbol().to_string();
+            if is_candle_glyph(&sym) {
+                // Preserve candle glyph; light tint only.
+                let fg = blend_color(under, bar.color, hist_strength * 0.45);
+                cell.set_style(Style::default().fg(fg));
+            } else if is_empty_glyph(&sym) || sym == "░" || sym == "▒" {
+                let fg = blend_color(under, bar.color, hist_strength.max(0.2));
                 cell.set_symbol("░");
+                cell.set_style(Style::default().fg(fg));
+            } else {
+                // Existing overlay / level: soft blend, keep glyph.
+                let fg = blend_color(under, bar.color, hist_strength * 0.5);
+                cell.set_style(Style::default().fg(fg));
             }
-            cell.set_style(Style::default().fg(fg));
         }
     }
 }
@@ -271,6 +307,8 @@ fn paint_level(
     };
     let c0 = level.x0.min(level.x1).floor() as i64;
     let c1 = level.x0.max(level.x1).ceil() as i64;
+    // Slightly stronger than hist so POC/VAH/VAL read as lines, not a wash.
+    let level_strength = strength.clamp(0.35, 1.0);
     for col in c0..=c1 {
         let Some(cx) = local_x_to_col(view, col as f64 + 0.5) else {
             continue;
@@ -278,7 +316,37 @@ fn paint_level(
         if !cell_in_area(area, cx, row) {
             continue;
         }
-        paint_cell_fg(buf, cx, row, level.color, strength, Some("─"));
+        let under = under_fg(buf, cx, row);
+        let cell = &mut buf[(cx, row)];
+        let sym = cell.symbol().to_string();
+        let fg = blend_color(under, level.color, level_strength);
+        if is_candle_glyph(&sym) {
+            // Keep candle body; tint so the level still reads through.
+            cell.set_style(Style::default().fg(fg));
+        } else {
+            // Empty / hist: dashed level like TV.
+            cell.set_symbol("╌");
+            cell.set_style(Style::default().fg(fg));
+        }
+    }
+}
+
+/// Line-drawing glyph for a segment step (screen y grows downward).
+fn line_glyph(dx: i32, dy: i32) -> &'static str {
+    if dx == 0 && dy == 0 {
+        return "·";
+    }
+    if dy == 0 {
+        return "─";
+    }
+    if dx == 0 {
+        return "│";
+    }
+    // Screen coords: +y is down. Rising price (negative dy) while +dx → ╱
+    if (dx > 0 && dy < 0) || (dx < 0 && dy > 0) {
+        "╱"
+    } else {
+        "╲"
     }
 }
 
@@ -292,7 +360,7 @@ fn paint_line(
     for w in line.points.windows(2) {
         let (x1, p1) = w[0];
         let (x2, p2) = w[1];
-        // Skip large gaps (same policy as Phase A Canvas: adjacent columns only).
+        // Skip large gaps (missing MA samples / non-adjacent bars).
         if (x2 - x1).abs() > 1.5 + f64::EPSILON {
             continue;
         }
@@ -308,12 +376,31 @@ fn paint_line(
         let Some(r2) = price_to_row_clamped(view, p2) else {
             continue;
         };
-        for (cx, cy) in bresenham_u16(c1, r1, c2, r2) {
+        let cells = bresenham_u16(c1, r1, c2, r2);
+        if cells.is_empty() {
+            continue;
+        }
+        for i in 0..cells.len() {
+            let (cx, cy) = cells[i];
             if !cell_in_area(area, cx, cy) {
                 continue;
             }
-            // MA may win the cell glyph for continuity.
-            paint_cell_fg(buf, cx, cy, line.color, strength, Some("•"));
+            let (dx, dy) = if i + 1 < cells.len() {
+                (
+                    cells[i + 1].0 as i32 - cx as i32,
+                    cells[i + 1].1 as i32 - cy as i32,
+                )
+            } else if i > 0 {
+                (
+                    cx as i32 - cells[i - 1].0 as i32,
+                    cy as i32 - cells[i - 1].1 as i32,
+                )
+            } else {
+                (c2 as i32 - c1 as i32, r2 as i32 - r1 as i32)
+            };
+            let glyph = line_glyph(dx, dy);
+            // MA may win the cell so the stroke stays continuous (spec).
+            paint_cell_fg(buf, cx, cy, line.color, strength, Some(glyph));
         }
     }
 }
@@ -468,13 +555,66 @@ mod tests {
         paint_overlays(&mut buf, &view, &layers, &strengths);
 
         let cell = &buf[(seed_x, seed_y)];
-        // MA paints last among hist/level/line and may win the glyph.
-        assert_eq!(cell.symbol(), "•");
+        // MA paints last among hist/level/line and may win with a continuous stroke glyph.
+        assert!(
+            matches!(cell.symbol(), "─" | "│" | "╱" | "╲" | "·"),
+            "expected line glyph, got {:?}",
+            cell.symbol()
+        );
         // Yellow named → RGB approx; strength 1.0 should recolor fully.
         let fg = color_to_rgb(cell.style().fg.unwrap_or(Color::Reset));
         assert!(
             fg.0 > 150 && fg.1 > 150,
             "expected strong yellow-ish, got {fg:?}"
+        );
+    }
+
+    #[test]
+    fn ma_horizontal_uses_continuous_dash_not_dot() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let mut layers = OverlayLayers::default();
+        layers.lines.push(OverlayLine {
+            points: vec![(15.5, 150.0), (16.5, 150.0), (17.5, 150.0)],
+            color: Color::Rgb(0, 255, 255),
+            type_key: "ma".into(),
+        });
+        let mut strengths = HashMap::new();
+        strengths.insert("ma".into(), 1.0);
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+        let y = view.price_to_row(150.0).unwrap();
+        let x0 = area.x + 15;
+        assert_eq!(buf[(x0, y)].symbol(), "─");
+        assert_eq!(buf[(x0 + 1, y)].symbol(), "─");
+    }
+
+    #[test]
+    fn soft_hist_preserves_candle_glyph() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let seed_x = area.x + 15;
+        let seed_y = view.price_to_row(150.0).unwrap();
+        buf[(seed_x, seed_y)]
+            .set_symbol("┃")
+            .set_style(Style::default().fg(Color::Rgb(52, 208, 88)));
+        let mut layers = OverlayLayers::default();
+        layers.hist.push(OverlayHistBar {
+            x: 15.0,
+            y: 145.0,
+            width: 3.0,
+            height: 10.0,
+            color: Color::Rgb(0, 100, 200),
+            type_key: "session_vp".into(),
+        });
+        let mut strengths = HashMap::new();
+        strengths.insert("session_vp".into(), 0.5);
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+        assert_eq!(
+            buf[(seed_x, seed_y)].symbol(),
+            "┃",
+            "hist must not replace candle glyphs"
         );
     }
 

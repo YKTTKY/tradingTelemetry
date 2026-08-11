@@ -24,6 +24,7 @@ use crate::app::{
 use crate::ipc::{OhlcvBar, QuoteRow};
 use crate::overlay::{
     paint_overlays, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine, OverlayPin,
+    MAX_VP_HIST_PANE_FRACTION,
 };
 use crate::timeframe::product_timeframe_to_interval;
 
@@ -425,8 +426,15 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     } else {
                         "pins✓"
                     };
+                    let data = match chart.indicator_series.get(&ind.id) {
+                        Some(s) if !s.profiles.is_empty() => " · profile",
+                        Some(_) if ind.enabled => " · empty profile",
+                        None if ind.enabled => " · …",
+                        _ => "",
+                    };
                     format!(
-                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins} {}  (Space/Enter on/off · r re-pin)",
+                        "{mark}[{on}] Fixed Range VP rows={rows} w={bw}% {place} {ext} {pins}{} {}  (r re-pin)",
+                        data,
                         vp_levels(ind)
                     )
                 }
@@ -439,8 +447,15 @@ fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {
                     } else {
                         "pin✓"
                     };
+                    let data = match chart.indicator_series.get(&ind.id) {
+                        Some(s) if !s.profiles.is_empty() => " · profile",
+                        Some(_) if ind.enabled => " · empty profile",
+                        None if ind.enabled => " · …",
+                        _ => "",
+                    };
                     format!(
-                        "{mark}[{on}] Anchored VP rows={rows} w={bw}% {place} {pin} {}  (Space/Enter on/off · r re-pin · 9 cash)",
+                        "{mark}[{on}] Anchored VP rows={rows} w={bw}% {place} {pin}{} {}  (r re-pin · 9 cash)",
+                        data,
                         vp_levels(ind)
                     )
                 }
@@ -677,8 +692,12 @@ fn draw_price_and_volume(
     }
 }
 
-// Distinct but calm MA colors (read as thin lines over green/red candles).
-const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::LightMagenta];
+// MA colors as solid RGB (named colors blend poorly with candle green/red).
+const MA_COLORS: [Color; 3] = [
+    Color::Rgb(0, 200, 255),   // cyan — short MA
+    Color::Rgb(255, 210, 40),  // gold — mid MA
+    Color::Rgb(220, 120, 255), // magenta — long MA
+];
 
 /// America/New_York fixed offset at `ts_ms` (handles EST/EDT).
 fn ny_offset_at_ms(ts_ms: i64) -> chrono::FixedOffset {
@@ -922,17 +941,17 @@ fn draw_candles(
     };
     push_vp(
         &mut layers,
-        build_session_vp_draw(svp, &visible, n_bars),
+        build_session_vp_draw(svp, &visible, n_bars, n_cols),
         "session_vp",
     );
     push_vp(
         &mut layers,
-        build_fixed_range_vp_draw(&frvps, &visible, n_bars),
+        build_fixed_range_vp_draw(&frvps, &visible, n_bars, n_cols),
         "fixed_range_vp",
     );
     push_vp(
         &mut layers,
-        build_anchored_vp_draw(&avps, &visible, n_bars),
+        build_anchored_vp_draw(&avps, &visible, n_bars, n_cols),
         "anchored_vp",
     );
 
@@ -1101,10 +1120,28 @@ fn hist_color_for_opacity(name: Option<&str>, opacity: Option<f64>) -> Option<Co
     }
 }
 
+/// Distinct soft defaults so Session / FRVP / AVP don't look identical (TV-like).
+fn default_vp_hist_color(type_key: &str) -> Color {
+    match type_key {
+        "session_vp" => Color::Rgb(70, 110, 160),   // steel blue
+        "fixed_range_vp" => Color::Rgb(140, 90, 170), // purple
+        "anchored_vp" => Color::Rgb(50, 140, 150),    // teal
+        _ => Color::DarkGray,
+    }
+}
+
+/// Cap hist box width: min(span * box_width_pct, pane_width * MAX_VP_HIST_PANE_FRACTION).
+fn capped_vp_box_width(span: f64, box_width_pct: f64, pane_width: f64) -> f64 {
+    let from_span = span * box_width_pct;
+    let from_pane = pane_width.max(1.0) * MAX_VP_HIST_PANE_FRACTION;
+    from_span.min(from_pane).max(1.0)
+}
+
 fn build_session_vp_draw(
     svp: Option<(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)>,
     visible: &[OhlcvBar],
     n: f64,
+    pane_width: f64,
 ) -> VpOverlayDraw {
     let empty = VpOverlayDraw {
         hist_rects: Vec::new(),
@@ -1123,7 +1160,15 @@ fn build_session_vp_draw(
     let hist_color = hist_color_for_opacity(
         hist_style.and_then(|h| h.color.as_deref()),
         hist_style.and_then(|h| h.opacity),
-    );
+    )
+    .map(|c| {
+        // Prefer type-distinct soft RGB when config still uses the generic steelblue default.
+        if hist_style.and_then(|h| h.color.as_deref()) == Some("steelblue") {
+            default_vp_hist_color("session_vp")
+        } else {
+            c
+        }
+    });
     let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
     let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
     let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
@@ -1173,7 +1218,7 @@ fn build_session_vp_draw(
             (x_end.min(n - 0.5).max(0.0), x_start.min(n).max(0.5))
         };
         let span = (x_hi - x_lo).max(1.0);
-        let box_w = span * box_width_pct;
+        let box_w = capped_vp_box_width(span, box_width_pct, pane_width);
         let hist_x0 = if placement_right { x_hi - box_w } else { x_lo };
 
         if let Some(hcolor) = hist_color {
@@ -1202,7 +1247,7 @@ fn build_session_vp_draw(
                 };
                 let y = bin.price_low;
                 let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
-                hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+                hist_rects.push((x, y, bar_w.max(0.5), h, hcolor));
             }
         }
 
@@ -1227,6 +1272,7 @@ fn build_fixed_range_vp_draw(
     frvps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
     visible: &[OhlcvBar],
     n: f64,
+    pane_width: f64,
 ) -> VpOverlayDraw {
     let empty = VpOverlayDraw {
         hist_rects: Vec::new(),
@@ -1272,7 +1318,14 @@ fn build_fixed_range_vp_draw(
         let hist_color = hist_color_for_opacity(
             hist_style.and_then(|h| h.color.as_deref()),
             hist_style.and_then(|h| h.opacity),
-        );
+        )
+        .map(|c| {
+            if hist_style.and_then(|h| h.color.as_deref()) == Some("steelblue") {
+                default_vp_hist_color("fixed_range_vp")
+            } else {
+                c
+            }
+        });
         let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
         let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
         let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
@@ -1314,7 +1367,7 @@ fn build_fixed_range_vp_draw(
             };
             let levels_hi = x_levels_end.min(n).max(hist_hi);
             let span = (hist_hi - hist_lo).max(1.0);
-            let box_w = span * box_width_pct;
+            let box_w = capped_vp_box_width(span, box_width_pct, pane_width);
             let hist_x0 = if placement_right {
                 hist_hi - box_w
             } else {
@@ -1346,7 +1399,7 @@ fn build_fixed_range_vp_draw(
                     };
                     let y = bin.price_low;
                     let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
-                    hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+                    hist_rects.push((x, y, bar_w.max(0.5), h, hcolor));
                 }
             }
 
@@ -1375,6 +1428,7 @@ fn build_anchored_vp_draw(
     avps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
     visible: &[OhlcvBar],
     n: f64,
+    pane_width: f64,
 ) -> VpOverlayDraw {
     // Anchored VP is always "extend to now": reuse Fixed Range-style draw with
     // range_start=anchor and range_end/levels_end from the engine profile.
@@ -1423,7 +1477,14 @@ fn build_anchored_vp_draw(
         let hist_color = hist_color_for_opacity(
             hist_style.and_then(|h| h.color.as_deref()),
             hist_style.and_then(|h| h.opacity),
-        );
+        )
+        .map(|c| {
+            if hist_style.and_then(|h| h.color.as_deref()) == Some("steelblue") {
+                default_vp_hist_color("anchored_vp")
+            } else {
+                c
+            }
+        });
         let poc_on = cfg.poc.as_ref().map(|s| s.enabled).unwrap_or(true);
         let vah_on = cfg.vah.as_ref().map(|s| s.enabled).unwrap_or(true);
         let val_on = cfg.val.as_ref().map(|s| s.enabled).unwrap_or(true);
@@ -1464,7 +1525,7 @@ fn build_anchored_vp_draw(
             };
             let levels_hi = x_levels_end.min(n).max(hist_hi);
             let span = (hist_hi - hist_lo).max(1.0);
-            let box_w = span * box_width_pct;
+            let box_w = capped_vp_box_width(span, box_width_pct, pane_width);
             let hist_x0 = if placement_right {
                 hist_hi - box_w
             } else {
@@ -1496,7 +1557,7 @@ fn build_anchored_vp_draw(
                     };
                     let y = bin.price_low;
                     let h = (bin.price_high - bin.price_low).max(f64::EPSILON);
-                    hist_rects.push((x, y, bar_w.max(0.02), h, hcolor));
+                    hist_rects.push((x, y, bar_w.max(0.5), h, hcolor));
                 }
             }
 
