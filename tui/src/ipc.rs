@@ -64,6 +64,12 @@ impl EngineEndpoint {
             .expect("watchlist remove path joins base")
     }
 
+    pub fn watchlist_rename_url(&self) -> Url {
+        self.base
+            .join("/v1/watchlist/rename")
+            .expect("watchlist rename path joins base")
+    }
+
     pub fn indicators_url(&self) -> Url {
         self.base
             .join("/v1/indicators")
@@ -575,6 +581,11 @@ pub struct WatchlistSymbolRequest {
     pub symbol: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WatchlistRenameRequest {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WatchlistMutationResponse {
     pub workspace: WorkspaceSnapshot,
@@ -894,6 +905,27 @@ pub async fn post_watchlist_remove(
     Ok(response)
 }
 
+pub async fn post_watchlist_rename(
+    endpoint: &EngineEndpoint,
+    name: &str,
+) -> Result<WatchlistMutationResponse, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = WatchlistRenameRequest {
+        name: name.to_string(),
+    };
+    let response: WatchlistMutationResponse = client
+        .post(endpoint.watchlist_rename_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
 pub async fn run_ipc_loop(endpoint: EngineEndpoint, tx: mpsc::UnboundedSender<IpcEvent>) {
     loop {
@@ -1040,6 +1072,10 @@ mod tests {
         assert_eq!(
             ep.watchlist_add_url().as_str(),
             "http://127.0.0.1:8765/v1/watchlist/add"
+        );
+        assert_eq!(
+            ep.watchlist_rename_url().as_str(),
+            "http://127.0.0.1:8765/v1/watchlist/rename"
         );
     }
 }

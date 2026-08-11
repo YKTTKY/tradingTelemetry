@@ -342,6 +342,13 @@ class WorkspaceState:
         wl = self.active_watchlist()
         wl.symbols = [s for s in wl.symbols if s != sym]
 
+    def rename_active(self, name: str) -> None:
+        """Set display name of the active watchlist. Empty rejected; duplicates allowed."""
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("name is required")
+        self.active_watchlist().name = cleaned
+
     def to_storage(self) -> dict[str, Any]:
         """Full state for disk (includes inactive layout memory)."""
         return {
@@ -528,5 +535,10 @@ class WorkspaceStore:
 
     def remove_symbol(self, symbol: str) -> dict[str, Any]:
         self.state.remove_symbol(symbol)
+        self.save()
+        return self.state.to_public()
+
+    def rename_active(self, name: str) -> dict[str, Any]:
+        self.state.rename_active(name)
         self.save()
         return self.state.to_public()

@@ -45,6 +45,7 @@ Domain instruments stay canonical (`SPY`, not `SPY:test`). LSE symbol/resolution
 | `POST /v1/watchlist/active` | Switch active watchlist (`watchlist_id`); persists |
 | `POST /v1/watchlist/add` | Add `symbol` to the active watchlist; persists; returns workspace + quotes |
 | `POST /v1/watchlist/remove` | Remove `symbol` from the active watchlist; persists |
+| `POST /v1/watchlist/rename` | Rename active watchlist display name (`name`); empty rejected; duplicate names allowed; id stable; persists; returns workspace + quotes |
 | `WS /v1/ws` | Live events: `feed_status`, `heartbeat`, conflated `bar_update` + `quote_update` + `indicator_update` |
 
 **Workspace file:** default `~/.local/share/trading-telemetry/workspace.json` (override with `--workspace` or `MARKET_ENGINE_WORKSPACE`). No Redis/Postgres.

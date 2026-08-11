@@ -18,7 +18,8 @@ use crossterm::terminal::{
 };
 use ipc::{
     post_chart_interest, post_indicators, post_type_styles, post_watchlist_active,
-    post_watchlist_add, post_watchlist_remove, post_workspace_layout, run_ipc_loop,
+    post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
+    run_ipc_loop,
     EngineEndpoint, IpcEvent,
 };
 use ratatui::backend::CrosstermBackend;
@@ -88,6 +89,9 @@ async fn run_loop(
                     PendingWatchlistOp::Add { symbol } => post_watchlist_add(&ep, &symbol).await,
                     PendingWatchlistOp::Remove { symbol } => {
                         post_watchlist_remove(&ep, &symbol).await
+                    }
+                    PendingWatchlistOp::Rename { name } => {
+                        post_watchlist_rename(&ep, &name).await
                     }
                 };
                 match result {
@@ -220,6 +224,15 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(c) => app.prompt_push_char(c),
             _ => {}
         },
+        InputMode::WatchlistRenamePrompt { .. } => match code {
+            KeyCode::Esc => app.cancel_prompt(),
+            KeyCode::Enter => {
+                let _ = app.apply_watchlist_rename_prompt();
+            }
+            KeyCode::Backspace => app.prompt_pop_char(),
+            KeyCode::Char(c) => app.prompt_push_char(c),
+            _ => {}
+        },
         InputMode::IndicatorPanel => match code {
             KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
             KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -327,7 +340,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
                     app.quit();
                 }
             }
-            KeyCode::Enter => app.enter_workspace(),
+            // Welcome: Enter opens workspace. Workspace: Enter/Space load selected symbol.
+            KeyCode::Enter if app.screen == Screen::Welcome => app.enter_workspace(),
+            KeyCode::Enter | KeyCode::Char(' ') if app.screen == Screen::Workspace => {
+                let _ = app.load_selected_watchlist_symbol();
+            }
             KeyCode::Char(']') if app.screen == Screen::Workspace => app.cycle_timeframe(1),
             KeyCode::Char('[') if app.screen == Screen::Workspace => app.cycle_timeframe(-1),
             KeyCode::Char('i') | KeyCode::Char('I') if app.screen == Screen::Workspace => {
@@ -350,6 +367,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Char('a') | KeyCode::Char('A') if app.screen == Screen::Workspace => {
                 app.begin_watchlist_add_prompt();
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if app.screen == Screen::Workspace => {
+                app.begin_watchlist_rename_prompt();
             }
             KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('d') | KeyCode::Char('D')
                 if app.screen == Screen::Workspace =>

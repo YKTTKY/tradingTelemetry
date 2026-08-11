@@ -259,3 +259,75 @@ def test_vix_included_when_vendor_resolves(tmp_path: Path):
     assert quotes["VIX"]["status"] == "ok"
     assert quotes["VIX"]["last"] == 21.0
     assert quotes["VIX"]["previous_close"] == 20.5
+
+
+def test_rename_active_watchlist_persists_and_keeps_id(tmp_path: Path):
+    """POST /v1/watchlist/rename updates active list display name; id stays stable."""
+    store = tmp_path / "workspace.json"
+    client, _ = _client(workspace_path=store)
+
+    snap = client.get("/v1/snapshot").json()["workspace"]
+    active_id = snap["active_watchlist_id"]
+    core = next(wl for wl in snap["watchlists"] if wl["id"] == active_id)
+    assert core["name"] == "Core"
+    symbols_before = list(core["symbols"])
+
+    renamed = client.post("/v1/watchlist/rename", json={"name": "  Day desk  "})
+    assert renamed.status_code == 200
+    body = renamed.json()
+    active = next(
+        wl for wl in body["workspace"]["watchlists"] if wl["id"] == active_id
+    )
+    assert active["id"] == active_id
+    assert active["name"] == "Day desk"
+    assert active["symbols"] == symbols_before
+    assert body["workspace"]["active_watchlist_id"] == active_id
+    # Quotes still returned for membership.
+    assert "quotes" in body
+
+    # Persist across engine restart.
+    assert store.is_file()
+    raw = store.read_text(encoding="utf-8")
+    assert "Day desk" in raw
+    assert '"id": "core"' in raw or '"id":"core"' in raw
+
+    client2, _ = _client(workspace_path=store)
+    again = client2.get("/v1/snapshot").json()["workspace"]
+    assert again["active_watchlist_id"] == active_id
+    restored = next(wl for wl in again["watchlists"] if wl["id"] == active_id)
+    assert restored["name"] == "Day desk"
+    assert restored["symbols"] == symbols_before
+
+
+def test_rename_rejects_empty_name(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    client, _ = _client(workspace_path=store)
+
+    for payload in ({"name": ""}, {"name": "   "}, {}):
+        response = client.post("/v1/watchlist/rename", json=payload)
+        assert response.status_code == 422, payload
+
+    snap = client.get("/v1/snapshot").json()["workspace"]
+    core = next(wl for wl in snap["watchlists"] if wl["name"] == "Core")
+    assert core["id"] == "core"
+
+
+def test_rename_allows_duplicate_display_names(tmp_path: Path):
+    """Ids stay unique; display names may collide."""
+    store = tmp_path / "workspace.json"
+    client, _ = _client(workspace_path=store)
+
+    snap = client.get("/v1/snapshot").json()["workspace"]
+    core_id = next(wl["id"] for wl in snap["watchlists"] if wl["name"] == "Core")
+    focus = next(wl for wl in snap["watchlists"] if wl["name"] == "Focus")
+
+    client.post("/v1/watchlist/active", json={"watchlist_id": focus["id"]})
+    renamed = client.post("/v1/watchlist/rename", json={"name": "Core"})
+    assert renamed.status_code == 200
+    lists = renamed.json()["workspace"]["watchlists"]
+    names = [wl["name"] for wl in lists]
+    assert names.count("Core") == 2
+    ids = {wl["id"] for wl in lists}
+    assert core_id in ids
+    assert focus["id"] in ids
+    assert len(ids) == len(lists)

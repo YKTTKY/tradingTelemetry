@@ -198,12 +198,14 @@ pub struct AvpPlaceState {
     pub is_new: bool,
 }
 
-/// Modal input for instrument selection and watchlist add.
+/// Modal input for instrument selection and watchlist add/rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     InstrumentPrompt { buffer: String },
     WatchlistAddPrompt { buffer: String },
+    /// Rename the active watchlist sheet (display name).
+    WatchlistRenamePrompt { buffer: String },
     /// Indicator panel for the focused chart (add / toggle / configure).
     IndicatorPanel,
     /// Two-pin Fixed Range VP placement on the focused chart.
@@ -218,6 +220,7 @@ pub enum PendingWatchlistOp {
     SetActive { watchlist_id: String },
     Add { symbol: String },
     Remove { symbol: String },
+    Rename { name: String },
 }
 
 /// Pending full-replace indicator apply for one chart.
@@ -635,6 +638,57 @@ impl App {
         self.pending_watchlist = Some(PendingWatchlistOp::Remove { symbol });
     }
 
+    /// Enter/Space on a watchlist row: set focused chart instrument (keep TF + indicators).
+    /// Returns true when chart interest must reload.
+    pub fn load_selected_watchlist_symbol(&mut self) -> bool {
+        if self.screen != Screen::Workspace {
+            return false;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return false;
+        }
+        if !self.watchlist_visible {
+            return false;
+        }
+        let symbols = self.active_symbols();
+        if symbols.is_empty() {
+            return false;
+        }
+        let idx = self.watchlist_selected.min(symbols.len() - 1);
+        let symbol = symbols[idx].clone();
+        self.set_instrument(&symbol)
+    }
+
+    /// Open rename prompt for the active watchlist (display name). Prefills current name.
+    pub fn begin_watchlist_rename_prompt(&mut self) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        let current = self
+            .active_watchlist()
+            .map(|wl| wl.name.clone())
+            .unwrap_or_default();
+        self.input_mode = InputMode::WatchlistRenamePrompt { buffer: current };
+    }
+
+    /// Apply rename prompt. Empty (after trim) is rejected; arms engine rename when non-empty.
+    pub fn apply_watchlist_rename_prompt(&mut self) -> bool {
+        let InputMode::WatchlistRenamePrompt { buffer } = &self.input_mode else {
+            return false;
+        };
+        let name = buffer.trim().to_string();
+        if name.is_empty() {
+            // Stay in prompt so the user can correct; empty is never sent.
+            return false;
+        }
+        self.input_mode = InputMode::Normal;
+        self.pending_watchlist = Some(PendingWatchlistOp::Rename { name });
+        true
+    }
+
     pub fn watchlist_select_delta(&mut self, delta: i32) {
         if self.screen != Screen::Workspace || !self.watchlist_visible {
             return;
@@ -671,10 +725,24 @@ impl App {
         workspace: WorkspaceSnapshot,
         quotes: Vec<QuoteRow>,
     ) {
-        self.apply_workspace(workspace);
-        // Replace quote map for symbols we still care about; keep others for dual-list cache.
+        // Watchlist mutations return a full workspace snapshot, but only membership /
+        // active sheet / names should change here. Rebuilding charts via apply_workspace
+        // would drop live series (Idle) without re-arming chart interest.
+        if !workspace.watchlists.is_empty() {
+            self.watchlists = workspace.watchlists;
+            self.active_watchlist_id = if !workspace.active_watchlist_id.is_empty()
+                && self
+                    .watchlists
+                    .iter()
+                    .any(|wl| wl.id == workspace.active_watchlist_id)
+            {
+                workspace.active_watchlist_id
+            } else {
+                self.watchlists[0].id.clone()
+            };
+            self.clamp_watchlist_selection();
+        }
         self.apply_quotes(quotes);
-        self.clamp_watchlist_selection();
     }
 
     fn clamp_watchlist_selection(&mut self) {
@@ -1883,6 +1951,14 @@ impl App {
                     }
                 }
             }
+            InputMode::WatchlistRenamePrompt { buffer } => {
+                // Display names: printable ASCII, including spaces; preserve case.
+                if c.is_ascii_graphic() || c == ' ' {
+                    if buffer.len() < 40 {
+                        buffer.push(c);
+                    }
+                }
+            }
             InputMode::Normal
             | InputMode::IndicatorPanel
             | InputMode::FrvpPlacing
@@ -1893,7 +1969,8 @@ impl App {
     pub fn prompt_pop_char(&mut self) {
         match &mut self.input_mode {
             InputMode::InstrumentPrompt { buffer }
-            | InputMode::WatchlistAddPrompt { buffer } => {
+            | InputMode::WatchlistAddPrompt { buffer }
+            | InputMode::WatchlistRenamePrompt { buffer } => {
                 buffer.pop();
             }
             InputMode::Normal
@@ -2773,6 +2850,249 @@ mod tests {
         assert!(app.set_instrument("ES"));
         assert_eq!(app.charts[0].instrument, "QQQ");
         assert_eq!(app.charts[1].instrument, "ES");
+    }
+
+    fn core_watchlist_workspace() -> WorkspaceSnapshot {
+        WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1h".into(),
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
+            watchlists: vec![
+                WatchlistSnapshot {
+                    id: "core".into(),
+                    name: "Core".into(),
+                    symbols: vec!["ES".into(), "NQ".into(), "SPY".into()],
+                },
+                WatchlistSnapshot {
+                    id: "focus".into(),
+                    name: "Focus".into(),
+                    symbols: vec!["QQQ".into()],
+                },
+            ],
+            active_watchlist_id: "core".into(),
+        }
+    }
+
+    #[test]
+    fn load_selected_watchlist_symbol_sets_focused_instrument_keeps_tf_and_indicators() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(core_watchlist_workspace());
+        app.chart_load_started();
+        // Seed indicators on focused chart — must survive symbol switch.
+        app.input_mode = InputMode::IndicatorPanel;
+        app.indicator_add_default_ma_stack();
+        app.input_mode = InputMode::Normal;
+        let indicator_ids: Vec<String> = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert!(!indicator_ids.is_empty());
+        assert_eq!(app.focused_chart().timeframe, "1h");
+        assert_eq!(app.focused_chart().instrument, "SPY");
+
+        app.watchlist_selected = 0; // ES
+        assert!(app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "ES");
+        assert_eq!(app.focused_chart().timeframe, "1h");
+        let after: Vec<String> = app
+            .focused_chart()
+            .indicators
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(after, indicator_ids);
+        assert!(app.needs_chart_load);
+    }
+
+    #[test]
+    fn load_selected_watchlist_symbol_only_changes_focused_dual_chart() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(dual_workspace());
+        // Attach a multi-list with symbols for selection.
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "dual-vertical".into(),
+            charts: vec![
+                WorkspaceChartSnapshot {
+                    id: "top".into(),
+                    instrument: "QQQ".into(),
+                    timeframe: "1D".into(),
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
+                WorkspaceChartSnapshot {
+                    id: "bottom".into(),
+                    instrument: "SPY".into(),
+                    timeframe: "1D".into(),
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
+            ],
+            watchlists: vec![WatchlistSnapshot {
+                id: "core".into(),
+                name: "Core".into(),
+                symbols: vec!["ES".into(), "NQ".into()],
+            }],
+            active_watchlist_id: "core".into(),
+        });
+        app.chart_load_started();
+        app.focus_next(); // bottom
+        app.watchlist_selected = 0; // ES
+        assert!(app.load_selected_watchlist_symbol());
+        assert_eq!(app.charts[0].instrument, "QQQ");
+        assert_eq!(app.charts[1].instrument, "ES");
+    }
+
+    #[test]
+    fn load_selected_watchlist_symbol_inactive_outside_normal_workspace_sidebar() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(core_watchlist_workspace());
+        app.chart_load_started();
+        app.watchlist_selected = 0;
+
+        app.input_mode = InputMode::IndicatorPanel;
+        assert!(!app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "SPY");
+
+        app.input_mode = InputMode::Normal;
+        app.watchlist_visible = false;
+        assert!(!app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "SPY");
+
+        app.watchlist_visible = true;
+        app.input_mode = InputMode::FrvpPlacing;
+        assert!(!app.load_selected_watchlist_symbol());
+
+        app.input_mode = InputMode::WatchlistAddPrompt {
+            buffer: String::new(),
+        };
+        assert!(!app.load_selected_watchlist_symbol());
+    }
+
+    #[test]
+    fn rename_prompt_arms_pending_rename_and_rejects_empty() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(core_watchlist_workspace());
+
+        app.begin_watchlist_rename_prompt();
+        assert!(matches!(
+            app.input_mode,
+            InputMode::WatchlistRenamePrompt { ref buffer } if buffer == "Core"
+        ));
+
+        // Clear to empty → reject, stay in prompt.
+        if let InputMode::WatchlistRenamePrompt { buffer } = &mut app.input_mode {
+            buffer.clear();
+        }
+        assert!(!app.apply_watchlist_rename_prompt());
+        assert!(matches!(
+            app.input_mode,
+            InputMode::WatchlistRenamePrompt { .. }
+        ));
+        assert!(app.pending_watchlist.is_none());
+
+        // Type a new name with spaces (preserve case).
+        if let InputMode::WatchlistRenamePrompt { buffer } = &mut app.input_mode {
+            buffer.clear();
+        }
+        for c in "Day desk".chars() {
+            app.prompt_push_char(c);
+        }
+        assert!(app.apply_watchlist_rename_prompt());
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.pending_watchlist,
+            Some(PendingWatchlistOp::Rename {
+                name: "Day desk".into()
+            })
+        );
+    }
+
+    #[test]
+    fn rename_prompt_inactive_when_indicator_panel_open() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(core_watchlist_workspace());
+        app.input_mode = InputMode::IndicatorPanel;
+        app.begin_watchlist_rename_prompt();
+        assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+        assert!(app.pending_watchlist.is_none());
+    }
+
+    #[test]
+    fn apply_watchlist_state_updates_names_without_wiping_chart_series() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(core_watchlist_workspace());
+        app.chart_load_started();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1h".into(),
+            status: "ok".into(),
+            bars: vec![OhlcvBar {
+                ts: 1,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+            chart_id: Some("primary".into()),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        assert!(matches!(
+            app.focused_chart().series,
+            ChartSeriesState::Available { .. }
+        ));
+
+        app.apply_watchlist_state(
+            WorkspaceSnapshot {
+                layout_mode: "single".into(),
+                charts: vec![WorkspaceChartSnapshot {
+                    id: "primary".into(),
+                    instrument: "SPY".into(),
+                    timeframe: "1h".into(),
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                }],
+                watchlists: vec![
+                    WatchlistSnapshot {
+                        id: "core".into(),
+                        name: "Day desk".into(),
+                        symbols: vec!["ES".into(), "NQ".into(), "SPY".into()],
+                    },
+                    WatchlistSnapshot {
+                        id: "focus".into(),
+                        name: "Focus".into(),
+                        symbols: vec![],
+                    },
+                ],
+                active_watchlist_id: "core".into(),
+            },
+            vec![],
+        );
+        assert_eq!(
+            app.active_watchlist().map(|w| w.name.as_str()),
+            Some("Day desk")
+        );
+        assert!(matches!(
+            app.focused_chart().series,
+            ChartSeriesState::Available { .. }
+        ));
+        assert_eq!(app.focused_chart().instrument, "SPY");
+        assert_eq!(app.focused_chart().timeframe, "1h");
+        assert!(!app.needs_chart_load);
     }
 
     #[test]

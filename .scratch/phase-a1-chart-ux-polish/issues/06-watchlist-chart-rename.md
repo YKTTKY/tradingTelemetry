@@ -4,16 +4,16 @@
 
 **Blocked by:** none (can parallel 01–05; coordinate key routing with 04)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Enter/Space load symbol on focused chart only
-- [ ] Timeframe + indicators preserved on symbol change
-- [ ] Dual: only focused chart changes
-- [ ] Inactive during indicator panel / prompt / pin mode
-- [ ] `r` rename active list in Normal; persisted across restart
-- [ ] Empty name rejected; ids stable
-- [ ] IPC contract tests for rename
-- [ ] Help text updated
+- [x] Enter/Space load symbol on focused chart only
+- [x] Timeframe + indicators preserved on symbol change
+- [x] Dual: only focused chart changes
+- [x] Inactive during indicator panel / prompt / pin mode
+- [x] `r` rename active list in Normal; persisted across restart
+- [x] Empty name rejected; ids stable
+- [x] IPC contract tests for rename
+- [x] Help text updated
 
 ## Notes
 

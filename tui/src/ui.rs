@@ -117,6 +117,8 @@ fn draw_help_popup(frame: &mut Frame) {
         row("w", "Show / hide sidebar"),
         row("n / p", "Next / previous watchlist sheet"),
         row("↑ / ↓", "Move selection in active list"),
+        row("Enter / Space", "Load selected symbol on focused chart (keep TF + indicators)"),
+        row("r", "Rename active watchlist sheet (Normal mode)"),
         row("a", "Add symbol to active list"),
         row("x / d", "Remove selected symbol"),
         section("Indicator panel"),
@@ -151,7 +153,7 @@ fn draw_help_popup(frame: &mut Frame) {
         row("Enter", "Lock anchor (profile builds to now)"),
         row("Esc", "Cancel placement (drops new AVP)"),
         section("Text prompts"),
-        row("Enter", "Apply instrument or watchlist add"),
+        row("Enter", "Apply instrument, watchlist add, or rename"),
         row("Esc", "Cancel prompt"),
         Line::from(Span::styled(
             "  Close help with Esc, ?, h, or Enter",
@@ -192,7 +194,9 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let panel_open = matches!(app.input_mode, InputMode::IndicatorPanel);
     let prompt_h = match &app.input_mode {
-        InputMode::InstrumentPrompt { .. } | InputMode::WatchlistAddPrompt { .. } => 3,
+        InputMode::InstrumentPrompt { .. }
+        | InputMode::WatchlistAddPrompt { .. }
+        | InputMode::WatchlistRenamePrompt { .. } => 3,
         InputMode::IndicatorPanel => 10,
         InputMode::FrvpPlacing | InputMode::AvpPlacing => 3,
         InputMode::Normal => 0,
@@ -240,6 +244,14 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Watchlist add (Enter apply · Esc cancel) "),
+            );
+            frame.render_widget(prompt, chunks[2]);
+        }
+        InputMode::WatchlistRenamePrompt { buffer } => {
+            let prompt = Paragraph::new(format!("Rename watchlist: {buffer}_")).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Rename watchlist (Enter save · Esc cancel · empty rejected) "),
             );
             frame.render_widget(prompt, chunks[2]);
         }
@@ -321,7 +333,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
     } else {
         Paragraph::new(format!(
-            "{} · {} · {}  ·  ? help  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w list  ·  n/p sheet  ·  a add  ·  x rem  ·  q  [{}]",
+            "{} · {} · {}  ·  ? help  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w list  ·  Enter/Sp chart  ·  r rename  ·  n/p sheet  ·  a add  ·  x rem  ·  q  [{}]",
             app.layout.as_str(),
             focused.instrument,
             focused.timeframe,

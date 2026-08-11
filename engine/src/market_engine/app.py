@@ -45,6 +45,12 @@ class WatchlistSymbolBody(BaseModel):
     symbol: str = Field(min_length=1)
 
 
+class WatchlistRenameBody(BaseModel):
+    """Display name for the active watchlist sheet."""
+
+    name: str = Field(min_length=1)
+
+
 class IndicatorsBody(BaseModel):
     chart_id: str | None = None
     indicators: list[dict[str, Any]] = Field(default_factory=list)
@@ -310,6 +316,15 @@ def create_app(
     def remove_watchlist_symbol(body: WatchlistSymbolBody) -> dict[str, Any]:
         try:
             workspace.remove_symbol(body.symbol)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return watchlist_payload()
+
+    @app.post("/v1/watchlist/rename")
+    def rename_active_watchlist(body: WatchlistRenameBody) -> dict[str, Any]:
+        """Rename the active watchlist display name; id and membership unchanged."""
+        try:
+            workspace.rename_active(body.name)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return watchlist_payload()
