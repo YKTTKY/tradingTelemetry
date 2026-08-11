@@ -300,11 +300,14 @@ fn paint_level(
     view: &ChartView,
     area: Rect,
     level: &OverlayLevel,
-    _strength: f64,
+    strength: f64,
 ) {
     let Some(row) = price_to_row_clamped(view, level.price) else {
         return;
     };
+    // Same opacity model as MA: dim pure level hue toward black (not under-fg).
+    // Strength 0 skips paint; low strength keeps POC blue / VAH green / VAL red readable.
+    let fg = dim_to_background(level.color, strength);
     let c0 = level.x0.min(level.x1).floor() as i64;
     let c1 = level.x0.max(level.x1).ceil() as i64;
     for col in c0..=c1 {
@@ -323,7 +326,7 @@ fn paint_level(
             continue;
         }
         cell.set_symbol("─");
-        cell.set_style(Style::default().fg(level.color));
+        cell.set_style(Style::default().fg(fg));
     }
 }
 
@@ -726,8 +729,42 @@ mod tests {
         assert_eq!(buf[(empty_x, seed_y)].symbol(), "─");
         assert_eq!(
             buf[(empty_x, seed_y)].style().fg,
-            Some(Color::Rgb(80, 160, 255))
+            Some(Color::Rgb(80, 160, 255)),
+            "full strength keeps pure POC color"
         );
+    }
+
+    #[test]
+    fn vp_level_strength_dims_color_not_ignored() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let y = view.price_to_row(150.0).unwrap();
+        let x = area.x + 15;
+        buf[(x, y)].set_symbol(" ");
+
+        let level_color = Color::Rgb(80, 160, 255);
+        let mut layers = OverlayLayers::default();
+        layers.levels.push(OverlayLevel {
+            x0: 15.0,
+            x1: 16.0,
+            price: 150.0,
+            color: level_color,
+            type_key: "session_vp".into(),
+        });
+        let mut strengths = HashMap::new();
+        strengths.insert("session_vp".into(), 0.4);
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+
+        assert_eq!(buf[(x, y)].symbol(), "─");
+        let fg = buf[(x, y)].style().fg.expect("level fg");
+        assert_eq!(
+            color_to_rgb(fg),
+            color_to_rgb(dim_to_background(level_color, 0.4)),
+            "POC/VAH/VAL must honor type overlay strength"
+        );
+        // Distinct from full-strength pure color.
+        assert_ne!(fg, level_color);
     }
 
     #[test]
