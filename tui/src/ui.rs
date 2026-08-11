@@ -1,5 +1,7 @@
 //! Ratatui views: Welcome, workspace feed status, single/dual charts, watchlist.
 
+use chrono::{Offset, TimeZone, Utc};
+use chrono_tz::America::New_York;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -7,9 +9,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         canvas::{Canvas, Line as CanvasLine, Rectangle},
-        Block, Borders, Clear, Paragraph, Wrap,
+        Block, Borders, Clear, Paragraph, StatefulWidget, Wrap,
     },
     Frame,
+};
+use tui_candlestick_chart::{
+    Candle, CandleStickChart, CandleStickChartState, ChartView, Interval,
 };
 
 use crate::app::{
@@ -17,6 +22,7 @@ use crate::app::{
     UNAVAILABLE_COPY,
 };
 use crate::ipc::{OhlcvBar, QuoteRow};
+use crate::timeframe::product_timeframe_to_interval;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
@@ -671,6 +677,39 @@ fn draw_price_and_volume(
 // Distinct but calm MA colors (read as thin lines over green/red candles).
 const MA_COLORS: [Color; 3] = [Color::Cyan, Color::Yellow, Color::LightMagenta];
 
+/// America/New_York fixed offset at `ts_ms` (handles EST/EDT).
+fn ny_offset_at_ms(ts_ms: i64) -> chrono::FixedOffset {
+    let utc = Utc
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .unwrap_or_else(Utc::now);
+    New_York.offset_from_utc_datetime(&utc.naive_utc()).fix()
+}
+
+/// Engine bars use unix **seconds**; the candlestick widget uses **milliseconds**.
+fn bars_to_widget_candles(bars: &[OhlcvBar]) -> Vec<Candle> {
+    bars.iter()
+        .filter_map(|b| Candle::new(b.ts.saturating_mul(1000), b.open, b.high, b.low, b.close))
+        .collect()
+}
+
+/// Bars whose open time falls inside the widget's visible window.
+fn bars_in_view<'a>(bars: &'a [OhlcvBar], view: &ChartView) -> Vec<&'a OhlcvBar> {
+    bars.iter()
+        .filter(|b| {
+            let t = b.ts.saturating_mul(1000);
+            t >= view.view_start_ts && t <= view.view_end_ts
+        })
+        .collect()
+}
+
+/// Canvas X for a bar open (seconds) in the price pane coordinate space [0, price_width].
+fn view_ts_to_x(view: &ChartView, ts_sec: i64) -> f64 {
+    let step = (view.interval as i64 * 1000).max(1) as f64;
+    let ts_ms = ts_sec.saturating_mul(1000) as f64;
+    (ts_ms - view.view_start_ts as f64) / step + 0.5
+}
+
 fn draw_candles(
     frame: &mut Frame,
     area: Rect,
@@ -679,66 +718,33 @@ fn draw_candles(
     chart: &Chart,
     bars: &[OhlcvBar],
 ) {
-    // One candle column ≈ one terminal cell. Cap density so wicks stay legible.
-    let inner_w = area.width.saturating_sub(2).max(8) as usize;
-    // Prefer fewer bars than full width so each candle has room for a body + gap.
-    let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
-    // Keep the live FRVP pin cursor in view while scrubbing history.
-    let place_cursor = app.frvp_place.as_ref().and_then(|p| {
-        if p.chart_id == chart.id {
-            Some(p.cursor_bar.min(bars.len().saturating_sub(1)))
-        } else {
-            None
-        }
-    });
-    let start = if bars.len() <= max_bars {
-        0
-    } else if let Some(cur) = place_cursor {
-        let half = max_bars / 2;
-        let max_start = bars.len() - max_bars;
-        cur.saturating_sub(half).min(max_start)
-    } else {
-        bars.len() - max_bars
+    let Some(interval) = product_timeframe_to_interval(&chart.timeframe) else {
+        let body = Paragraph::new(format!(
+            "Unsupported timeframe for chart axes: {}",
+            chart.timeframe
+        ))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title(title.to_string()));
+        frame.render_widget(body, area);
+        return;
     };
-    let visible = &bars[start..start + max_bars.min(bars.len() - start)];
-    let n = visible.len() as f64;
-
-    // Scale primarily from candle range so MAs don't crush price action.
-    let mut min_p = visible[0].low;
-    let mut max_p = visible[0].high;
-    for b in visible {
-        min_p = min_p.min(b.low);
-        max_p = max_p.max(b.high);
+    let widget_candles = bars_to_widget_candles(bars);
+    if widget_candles.is_empty() {
+        let body = Paragraph::new(UNAVAILABLE_COPY)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title(title.to_string()));
+        frame.render_widget(body, area);
+        return;
     }
-    let candle_span = (max_p - min_p).max(f64::EPSILON);
+
     let ma_lines = chart.enabled_ma_lines();
-    // Only expand the scale a little for MAs that sit near price (ignore wild outliers).
-    for (_, series) in &ma_lines {
-        for val in series.values.iter().skip(start).take(visible.len()) {
-            if let Some(v) = *val {
-                if v >= min_p - candle_span && v <= max_p + candle_span {
-                    min_p = min_p.min(v);
-                    max_p = max_p.max(v);
-                }
-            }
-        }
-    }
-    if (max_p - min_p).abs() < f64::EPSILON {
-        min_p -= 1.0;
-        max_p += 1.0;
-    }
-    let pad = ((max_p - min_p) * 0.06).max(0.01);
-    min_p -= pad;
-    max_p += pad;
-    let y_span = max_p - min_p;
-
-    let last = bars.last().expect("non-empty");
-    let ma_hint = ma_legend(&ma_lines);
     let svp = chart.enabled_session_vp();
     let frvps = chart.enabled_fixed_range_vps();
     let avps = chart.enabled_anchored_vps();
     let gex = chart.enabled_gex();
     let garch = chart.enabled_garch();
+    let last = bars.last().expect("non-empty");
+    let ma_hint = ma_legend(&ma_lines);
     let vp_hint = {
         let mut tags: Vec<&str> = Vec::new();
         if svp.is_some() {
@@ -756,7 +762,6 @@ fn draw_candles(
             format!("  {}", tags.join("+"))
         }
     };
-    // Only annotate successful optional series — never invent GEX/GARCH when unavailable.
     let optional_hint = {
         let mut parts: Vec<String> = Vec::new();
         if let Some((_, series)) = gex {
@@ -783,17 +788,12 @@ fn draw_candles(
         }
     };
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}{}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
         last.open,
         last.high,
         last.low,
         last.close,
         bars.len(),
-        if visible.len() < bars.len() {
-            format!(" show={}", visible.len())
-        } else {
-            String::new()
-        },
         ma_hint,
         vp_hint,
         optional_hint,
@@ -806,78 +806,115 @@ fn draw_candles(
             subtitle,
             Style::default().fg(Color::DarkGray),
         )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 8 || inner.height < 5 {
+        return;
+    }
 
-    // Narrow bodies leave gaps; Braille gives sub-cell resolution for wicks + MA.
-    let body_w = 0.35_f64;
-    let half_w = body_w / 2.0;
-    // Minimum body height ≈ ~1 braille row in price units.
-    let min_body = y_span * 0.012;
+    // Keep pin placement cursor in view (widget pan cursor = window end timestamp, ms).
+    let mut candle_state = CandleStickChartState::default();
+    let place_bar_ts = app
+        .frvp_place
+        .as_ref()
+        .filter(|p| p.chart_id == chart.id)
+        .map(|p| p.cursor_bar.min(bars.len().saturating_sub(1)))
+        .or_else(|| {
+            app.avp_place
+                .as_ref()
+                .filter(|p| p.chart_id == chart.id)
+                .map(|p| p.cursor_bar.min(bars.len().saturating_sub(1)))
+        })
+        .and_then(|idx| bars.get(idx).map(|b| b.ts.saturating_mul(1000)));
+    if let Some(ts_ms) = place_bar_ts {
+        // Center-ish: set window end so the pin sits near the middle when history allows.
+        let width = inner.width.saturating_sub(12).max(4) as i64; // rough y-axis allowance
+        let half = (width / 2) * (interval as i64) * 1000;
+        let end = (ts_ms + half).min(bars.last().unwrap().ts.saturating_mul(1000));
+        candle_state.set_cursor_timestamp(Some(end));
+    }
+
+    let tz = ny_offset_at_ms(last.ts.saturating_mul(1000));
+    let widget = CandleStickChart::new(interval)
+        .candles(widget_candles)
+        .display_timezone(tz)
+        .bullish_color(Color::Rgb(52, 208, 88))
+        .bearish_color(Color::Rgb(234, 74, 90));
+
+    // Paint candles + price/time axes (origin-safe for dual layout).
+    widget.render(inner, frame.buffer_mut(), &mut candle_state);
+
+    let Some(view) = candle_state.last_view.clone() else {
+        return;
+    };
+    let candle_area = view.candle_area();
+    if candle_area.width == 0 || candle_area.height == 0 {
+        return;
+    }
+
+    // Overlays share the widget's price/time scale (refined further in issue 02).
+    let visible_refs = bars_in_view(bars, &view);
+    if visible_refs.is_empty() {
+        return;
+    }
+    let visible: Vec<OhlcvBar> = visible_refs.iter().map(|b| (*b).clone()).collect();
+    let n_bars = visible.len() as f64;
+    let n_cols = view.price_width() as f64;
+    let x_offset = view_ts_to_x(&view, visible[0].ts) - 0.5;
+    let min_p = view.y_min;
+    let max_p = view.y_max;
+    let y_span = (max_p - min_p).max(f64::EPSILON);
+
+    // Map full-series index → global start for pin helpers.
+    let start = bars
+        .iter()
+        .position(|b| b.ts == visible[0].ts)
+        .unwrap_or(0);
 
     let mut ma_segments: Vec<(Color, Vec<(f64, f64)>)> = Vec::new();
     for (mi, (_cfg, series)) in ma_lines.iter().enumerate() {
         let color = MA_COLORS[mi % MA_COLORS.len()];
         let mut pts: Vec<(f64, f64)> = Vec::new();
-        for (i, val) in series.values.iter().skip(start).take(visible.len()).enumerate() {
-            if let Some(v) = val {
-                pts.push((i as f64 + 0.5, *v));
+        for (i, val) in series.values.iter().enumerate() {
+            let Some(v) = val else { continue };
+            let Some(bar) = bars.get(i) else { continue };
+            let x = view_ts_to_x(&view, bar.ts);
+            if x < 0.0 || x > n_cols {
+                continue;
             }
+            pts.push((x, *v));
         }
         ma_segments.push((color, pts));
     }
 
-    // Precompute Session + Fixed Range + Anchored VP drawable primitives in chart x/y space.
-    let mut vp_draw = build_session_vp_draw(svp, visible, n);
-    let fr_draw = build_fixed_range_vp_draw(&frvps, visible, n);
+    let mut vp_draw = build_session_vp_draw(svp, &visible, n_bars);
+    let fr_draw = build_fixed_range_vp_draw(&frvps, &visible, n_bars);
     vp_draw.hist_rects.extend(fr_draw.hist_rects);
     vp_draw.levels.extend(fr_draw.levels);
-    let av_draw = build_anchored_vp_draw(&avps, visible, n);
+    let av_draw = build_anchored_vp_draw(&avps, &visible, n_bars);
     vp_draw.hist_rects.extend(av_draw.hist_rects);
     vp_draw.levels.extend(av_draw.levels);
+    // Shift index-space VP geometry into widget column space (right-aligned live tip).
+    for rect in &mut vp_draw.hist_rects {
+        rect.0 += x_offset;
+    }
+    for level in &mut vp_draw.levels {
+        level.0 += x_offset;
+        level.1 += x_offset;
+    }
 
-    // Pin markers: placement cursor + locked anchors on enabled FRVPs / AVPs.
-    let pin_labels = collect_frvp_pin_labels(
-        app,
-        chart,
-        bars,
-        start,
-        visible,
-        max_p,
-        y_span,
-    );
+    let pin_labels = collect_frvp_pin_labels(app, chart, bars, start, &visible, max_p, y_span);
+    let pin_labels: Vec<(f64, f64, String, Color)> = pin_labels
+        .into_iter()
+        .map(|(x, y, g, c)| (x + x_offset, y, g, c))
+        .collect();
 
+    // Overlay pass: Canvas only paints drawn cells (does not wipe candle glyphs).
     let canvas = Canvas::default()
-        .block(block)
-        // Braille: 2×4 subpixels per cell — far thinner than Marker::Block slabs.
         .marker(symbols::Marker::Braille)
-        .x_bounds([0.0, n])
+        .x_bounds([0.0, n_cols])
         .y_bounds([min_p, max_p])
         .paint(move |ctx| {
-            // Candles first (underlays).
-            for (i, bar) in visible.iter().enumerate() {
-                let x = i as f64 + 0.5;
-                let up = bar.close >= bar.open;
-                let color = if up { Color::Green } else { Color::Red };
-
-                ctx.draw(&CanvasLine {
-                    x1: x,
-                    y1: bar.low,
-                    x2: x,
-                    y2: bar.high,
-                    color,
-                });
-
-                let top = bar.open.max(bar.close);
-                let bottom = bar.open.min(bar.close);
-                let height = (top - bottom).max(min_body);
-                ctx.draw(&Rectangle {
-                    x: x - half_w,
-                    y: bottom,
-                    width: body_w,
-                    height,
-                    color,
-                });
-            }
-            // VP histogram + levels (under MA so trend lines stay sharp).
             for rect in &vp_draw.hist_rects {
                 ctx.draw(&Rectangle {
                     x: rect.0,
@@ -896,12 +933,11 @@ fn draw_candles(
                     color: *color,
                 });
             }
-            // MA as connected segments (thin braille strokes over candles).
             for (color, pts) in &ma_segments {
                 for w in pts.windows(2) {
                     let (x1, y1) = w[0];
                     let (x2, y2) = w[1];
-                    if (x2 - x1).abs() <= 1.0 + f64::EPSILON {
+                    if (x2 - x1).abs() <= 1.5 + f64::EPSILON {
                         ctx.draw(&CanvasLine {
                             x1,
                             y1,
@@ -912,9 +948,7 @@ fn draw_candles(
                     }
                 }
             }
-            // FRVP pin markers (drawn last so they sit on top of candles).
             for (x, y, glyph, color) in &pin_labels {
-                // Small vertical stem so the marker reads above the wick.
                 ctx.draw(&CanvasLine {
                     x1: *x,
                     y1: *y - y_span * 0.01,
@@ -935,7 +969,7 @@ fn draw_candles(
             }
         });
 
-    frame.render_widget(canvas, area);
+    frame.render_widget(canvas, candle_area);
 }
 
 /// Labels painted above candles for FRVP anchors / live placement cursor.

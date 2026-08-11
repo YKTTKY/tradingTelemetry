@@ -1,0 +1,9 @@
+tui-candlestick-chart is based on:
+
+1. https://github.com/codingskynet/tui-candlestick-chart
+   Copyright (c) 2023 Taewoo An
+   MIT License (see LICENSE)
+
+2. https://github.com/Julien-R44/cli-candlestick-chart
+   Copyright (c) 2021 Julien-R44 <julien@ripouteau.com>
+   MIT License

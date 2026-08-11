@@ -2,6 +2,7 @@
 
 mod app;
 mod ipc;
+mod timeframe;
 mod ui;
 
 use std::io::{self, stdout};

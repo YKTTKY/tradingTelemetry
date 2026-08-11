@@ -1,0 +1,15 @@
+[package]
+name = "tui-candlestick-chart"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Vendored Ratatui candlestick widget (based on codingskynet/tui-candlestick-chart / cli-candlestick-chart)"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+itertools = { version = "0.14", default-features = false, features = ["use_alloc"] }
+ordered-float = { version = "4.0", default-features = false }
+ratatui = { version = "0.30.2", default-features = false }
+tracing = { version = "0.1", default-features = false }
+unicode-segmentation = "1.10.1"
