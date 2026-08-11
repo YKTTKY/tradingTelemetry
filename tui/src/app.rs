@@ -4,9 +4,11 @@ use std::collections::HashMap;
 
 use crate::ipc::{
     BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IpcEvent,
-    IndicatorConfig, IndicatorSeriesData, IndicatorUpdateEvent, IndicatorsApplyResponse, OhlcvBar,
-    QuoteRow, QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
+    IndicatorConfig, IndicatorSeriesData, IndicatorTypeStyle, IndicatorUpdateEvent,
+    IndicatorsApplyResponse, OhlcvBar, QuoteRow, QuoteUpdateEvent, WatchlistSnapshot,
+    WorkspaceSnapshot,
 };
+use crate::overlay::{clamp_strength, default_strength_for_type};
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
 pub const UNAVAILABLE_COPY: &str = "Data Currently not Available";
@@ -225,6 +227,13 @@ pub struct PendingIndicatorsApply {
     pub indicators: Vec<IndicatorConfig>,
 }
 
+/// Pending type-style (overlay strength) persist for one chart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingTypeStylesApply {
+    pub chart_id: String,
+    pub type_styles: HashMap<String, IndicatorTypeStyle>,
+}
+
 pub const MAX_MA_LINES: usize = 3;
 pub const MAX_SESSION_VP: usize = 1;
 pub const MAX_FIXED_RANGE_VP: usize = 4;
@@ -271,6 +280,8 @@ pub struct Chart {
     pub indicators: Vec<IndicatorConfig>,
     /// Computed series keyed by indicator id (aligned to bars by index).
     pub indicator_series: HashMap<String, IndicatorSeriesData>,
+    /// Per-indicator-type presentation (overlay strength). Shared by all instances.
+    pub type_styles: HashMap<String, IndicatorTypeStyle>,
 }
 
 impl Chart {
@@ -282,7 +293,45 @@ impl Chart {
             series: ChartSeriesState::Idle,
             indicators: Vec::new(),
             indicator_series: HashMap::new(),
+            type_styles: HashMap::new(),
         }
+    }
+
+    /// Overlay strength for a type: stored type style, else product default.
+    pub fn overlay_strength(&self, indicator_type: &str) -> f64 {
+        self.type_styles
+            .get(indicator_type)
+            .map(|s| clamp_strength(s.overlay_strength))
+            .unwrap_or_else(|| default_strength_for_type(indicator_type))
+    }
+
+    /// Set overlay strength for an indicator type on this chart (clamped).
+    pub fn set_overlay_strength(&mut self, indicator_type: impl Into<String>, strength: f64) {
+        let key = indicator_type.into();
+        self.type_styles
+            .insert(key, IndicatorTypeStyle::with_strength(clamp_strength(strength)));
+    }
+
+    /// Strength map suitable for the overlay paint pass (explicit + defaults for known paint types).
+    pub fn overlay_strength_map(&self) -> HashMap<String, f64> {
+        let mut map = HashMap::new();
+        for key in [
+            "ma",
+            "session_vp",
+            "fixed_range_vp",
+            "anchored_vp",
+        ] {
+            map.insert(key.to_string(), self.overlay_strength(key));
+        }
+        for (k, v) in &self.type_styles {
+            map.insert(k.clone(), clamp_strength(v.overlay_strength));
+        }
+        map
+    }
+
+    /// Snapshot of stored type styles for engine persist (only explicit entries).
+    pub fn type_styles_for_persist(&self) -> HashMap<String, IndicatorTypeStyle> {
+        self.type_styles.clone()
     }
 
     pub fn default_single() -> Self {
@@ -409,6 +458,8 @@ pub struct App {
     pub pending_watchlist: Option<PendingWatchlistOp>,
     /// When Some, main loop POSTs indicator apply for that chart.
     pub pending_indicators: Option<PendingIndicatorsApply>,
+    /// When Some, main loop POSTs type styles for that chart.
+    pub pending_type_styles: Option<PendingTypeStylesApply>,
     /// Selected row in the indicator panel list.
     pub indicator_selected: usize,
     pub input_mode: InputMode,
@@ -444,6 +495,7 @@ impl Default for App {
             watchlist_selected: 0,
             pending_watchlist: None,
             pending_indicators: None,
+            pending_type_styles: None,
             indicator_selected: 0,
             input_mode: InputMode::Normal,
             frvp_place: None,
@@ -695,6 +747,7 @@ impl App {
                 .map(|c| {
                     let mut chart = Chart::new(c.id, c.instrument, c.timeframe);
                     chart.indicators = c.indicators;
+                    chart.type_styles = c.type_styles;
                     chart
                 })
                 .collect();
@@ -787,6 +840,27 @@ impl App {
         }
         let cur = self.indicator_selected.min(n - 1) as i32;
         self.indicator_selected = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    /// Set overlay strength on a chart and arm engine persist (ticket 05 UI will call this).
+    pub fn set_chart_overlay_strength(
+        &mut self,
+        chart_id: &str,
+        indicator_type: &str,
+        strength: f64,
+    ) {
+        let Some(chart) = self.charts.iter_mut().find(|c| c.id == chart_id) else {
+            return;
+        };
+        chart.set_overlay_strength(indicator_type, strength);
+        self.pending_type_styles = Some(PendingTypeStylesApply {
+            chart_id: chart.id.clone(),
+            type_styles: chart.type_styles_for_persist(),
+        });
+    }
+
+    pub fn type_styles_request_started(&mut self) {
+        self.pending_type_styles = None;
     }
 
     fn arm_indicators_apply(&mut self) {
@@ -2078,6 +2152,64 @@ fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
 mod tests {
     use super::*;
     use crate::ipc::WorkspaceChartSnapshot;
+    use crate::overlay::{DEFAULT_MA_STRENGTH, DEFAULT_VP_STRENGTH};
+
+    #[test]
+    fn chart_overlay_strength_defaults_by_type() {
+        let chart = Chart::default_single();
+        assert_eq!(chart.overlay_strength("ma"), DEFAULT_MA_STRENGTH);
+        assert_eq!(chart.overlay_strength("session_vp"), DEFAULT_VP_STRENGTH);
+        assert_eq!(chart.overlay_strength("fixed_range_vp"), DEFAULT_VP_STRENGTH);
+    }
+
+    #[test]
+    fn chart_set_overlay_strength_clamps_and_persists_per_type() {
+        let mut chart = Chart::default_single();
+        chart.set_overlay_strength("ma", 0.4);
+        chart.set_overlay_strength("session_vp", 2.0);
+        assert_eq!(chart.overlay_strength("ma"), 0.4);
+        assert_eq!(chart.overlay_strength("session_vp"), 1.0);
+        // Independent per type.
+        assert_eq!(chart.overlay_strength("anchored_vp"), DEFAULT_VP_STRENGTH);
+        let map = chart.overlay_strength_map();
+        assert_eq!(map.get("ma"), Some(&0.4));
+        assert_eq!(map.get("session_vp"), Some(&1.0));
+    }
+
+    #[test]
+    fn set_chart_overlay_strength_arms_engine_persist() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.set_chart_overlay_strength("primary", "ma", 0.33);
+        assert_eq!(app.charts[0].overlay_strength("ma"), 0.33);
+        let pending = app.pending_type_styles.expect("armed");
+        assert_eq!(pending.chart_id, "primary");
+        assert_eq!(
+            pending.type_styles.get("ma").map(|s| s.overlay_strength),
+            Some(0.33)
+        );
+    }
+
+    #[test]
+    fn apply_workspace_restores_type_styles() {
+        let mut styles = HashMap::new();
+        styles.insert("ma".into(), IndicatorTypeStyle::with_strength(0.55));
+        let mut app = App::default();
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+                indicators: vec![],
+                type_styles: styles,
+            }],
+            watchlists: vec![],
+            active_watchlist_id: String::new(),
+        });
+        assert_eq!(app.charts[0].overlay_strength("ma"), 0.55);
+        assert_eq!(app.charts[0].overlay_strength("session_vp"), DEFAULT_VP_STRENGTH);
+    }
 
     #[test]
     fn welcome_enters_workspace_with_default_spy_1d() {
@@ -2520,12 +2652,14 @@ mod tests {
                         instrument: "ES".into(),
                         timeframe: "1D".into(),
                                             indicators: vec![],
+                                            type_styles: HashMap::new(),
                     },
                     WorkspaceChartSnapshot {
                         id: "bottom".into(),
                         instrument: "QQQ".into(),
                         timeframe: "1h".into(),
                                             indicators: vec![],
+                                            type_styles: HashMap::new(),
                     },
                 ],
                 watchlists: vec![
@@ -2701,6 +2835,7 @@ mod tests {
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
                                     indicators: vec![],
+                                    type_styles: HashMap::new(),
                     }],
             watchlists: vec![
                 WatchlistSnapshot {
@@ -2762,6 +2897,7 @@ mod tests {
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
                                     indicators: vec![],
+                                    type_styles: HashMap::new(),
                     }],
             watchlists: vec![WatchlistSnapshot {
                 id: "core".into(),
@@ -3001,12 +3137,14 @@ mod tests {
                     instrument: "QQQ".into(),
                     timeframe: "1D".into(),
                                         indicators: vec![],
+                                        type_styles: HashMap::new(),
                     },
                 WorkspaceChartSnapshot {
                     id: "bottom".into(),
                     instrument: "SPY".into(),
                     timeframe: "1D".into(),
                                         indicators: vec![],
+                                        type_styles: HashMap::new(),
                     },
             ],
             watchlists: vec![],

@@ -8,13 +8,13 @@ use ratatui::{
     symbols,
     text::{Line, Span},
     widgets::{
-        canvas::{Canvas, Line as CanvasLine, Rectangle},
+        canvas::{Canvas, Rectangle},
         Block, Borders, Clear, Paragraph, StatefulWidget, Wrap,
     },
     Frame,
 };
 use tui_candlestick_chart::{
-    Candle, CandleStickChart, CandleStickChartState, ChartView, Interval,
+    Candle, CandleStickChart, CandleStickChartState, ChartView,
 };
 
 use crate::app::{
@@ -22,6 +22,9 @@ use crate::app::{
     UNAVAILABLE_COPY,
 };
 use crate::ipc::{OhlcvBar, QuoteRow};
+use crate::overlay::{
+    paint_overlays, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine, OverlayPin,
+};
 use crate::timeframe::product_timeframe_to_interval;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -708,8 +711,7 @@ fn bars_in_view<'a>(bars: &'a [OhlcvBar], view: &ChartView) -> Vec<&'a OhlcvBar>
         .collect()
 }
 
-/// Canvas X for a bar open (seconds) in the price pane coordinate space [0, price_width].
-/// Uses dense column mapping from the widget view (not calendar time).
+/// Local candle-area X for a bar open (seconds) via ChartView dense columns.
 fn view_ts_to_x(view: &ChartView, ts_sec: i64) -> Option<f64> {
     view.timestamp_to_local_x(ts_sec.saturating_mul(1000))
 }
@@ -853,7 +855,7 @@ fn draw_candles(
         return;
     }
 
-    // Overlays share the widget's dense bar columns (refined further in issue 02).
+    // Overlays share the widget's dense bar columns + price scale (cell compose).
     let visible_refs = bars_in_view(bars, &view);
     if visible_refs.is_empty() {
         return;
@@ -863,9 +865,8 @@ fn draw_candles(
     let n_cols = view.price_width() as f64;
     // Index-space VP/pins use 0..n_bars; shift into right-aligned dense columns.
     let x_offset = view.column_offset as f64;
-    let min_p = view.y_min;
     let max_p = view.y_max;
-    let y_span = (max_p - min_p).max(f64::EPSILON);
+    let y_span = (view.y_max - view.y_min).max(f64::EPSILON);
 
     // Map full-series index → global start for pin helpers.
     let start = bars
@@ -873,7 +874,8 @@ fn draw_candles(
         .position(|b| b.ts == visible[0].ts)
         .unwrap_or(0);
 
-    let mut ma_segments: Vec<(Color, Vec<(f64, f64)>)> = Vec::new();
+    let mut layers = OverlayLayers::default();
+
     for (mi, (_cfg, series)) in ma_lines.iter().enumerate() {
         let color = MA_COLORS[mi % MA_COLORS.len()];
         let mut pts: Vec<(f64, f64)> = Vec::new();
@@ -888,91 +890,66 @@ fn draw_candles(
             }
             pts.push((x, *v));
         }
-        ma_segments.push((color, pts));
+        if !pts.is_empty() {
+            layers.lines.push(OverlayLine {
+                points: pts,
+                color,
+                type_key: "ma".into(),
+            });
+        }
     }
 
-    let mut vp_draw = build_session_vp_draw(svp, &visible, n_bars);
-    let fr_draw = build_fixed_range_vp_draw(&frvps, &visible, n_bars);
-    vp_draw.hist_rects.extend(fr_draw.hist_rects);
-    vp_draw.levels.extend(fr_draw.levels);
-    let av_draw = build_anchored_vp_draw(&avps, &visible, n_bars);
-    vp_draw.hist_rects.extend(av_draw.hist_rects);
-    vp_draw.levels.extend(av_draw.levels);
-    for rect in &mut vp_draw.hist_rects {
-        rect.0 += x_offset;
-    }
-    for level in &mut vp_draw.levels {
-        level.0 += x_offset;
-        level.1 += x_offset;
-    }
+    let push_vp = |layers: &mut OverlayLayers, draw: VpOverlayDraw, type_key: &str| {
+        for rect in draw.hist_rects {
+            layers.hist.push(OverlayHistBar {
+                x: rect.0 + x_offset,
+                y: rect.1,
+                width: rect.2,
+                height: rect.3,
+                color: rect.4,
+                type_key: type_key.into(),
+            });
+        }
+        for level in draw.levels {
+            layers.levels.push(OverlayLevel {
+                x0: level.0 + x_offset,
+                x1: level.1 + x_offset,
+                price: level.2,
+                color: level.3,
+                type_key: type_key.into(),
+            });
+        }
+    };
+    push_vp(
+        &mut layers,
+        build_session_vp_draw(svp, &visible, n_bars),
+        "session_vp",
+    );
+    push_vp(
+        &mut layers,
+        build_fixed_range_vp_draw(&frvps, &visible, n_bars),
+        "fixed_range_vp",
+    );
+    push_vp(
+        &mut layers,
+        build_anchored_vp_draw(&avps, &visible, n_bars),
+        "anchored_vp",
+    );
 
     let pin_labels = collect_frvp_pin_labels(app, chart, bars, start, &visible, max_p, y_span);
-    let pin_labels: Vec<(f64, f64, String, Color)> = pin_labels
-        .into_iter()
-        .map(|(x, y, g, c)| (x + x_offset, y, g, c))
-        .collect();
-
-    // Overlay pass: Canvas only paints drawn cells (does not wipe candle glyphs).
-    let canvas = Canvas::default()
-        .marker(symbols::Marker::Braille)
-        .x_bounds([0.0, n_cols])
-        .y_bounds([min_p, max_p])
-        .paint(move |ctx| {
-            for rect in &vp_draw.hist_rects {
-                ctx.draw(&Rectangle {
-                    x: rect.0,
-                    y: rect.1,
-                    width: rect.2,
-                    height: rect.3,
-                    color: rect.4,
-                });
-            }
-            for (x0, x1, y, color) in &vp_draw.levels {
-                ctx.draw(&CanvasLine {
-                    x1: *x0,
-                    y1: *y,
-                    x2: *x1,
-                    y2: *y,
-                    color: *color,
-                });
-            }
-            for (color, pts) in &ma_segments {
-                for w in pts.windows(2) {
-                    let (x1, y1) = w[0];
-                    let (x2, y2) = w[1];
-                    if (x2 - x1).abs() <= 1.5 + f64::EPSILON {
-                        ctx.draw(&CanvasLine {
-                            x1,
-                            y1,
-                            x2,
-                            y2,
-                            color: *color,
-                        });
-                    }
-                }
-            }
-            for (x, y, glyph, color) in &pin_labels {
-                ctx.draw(&CanvasLine {
-                    x1: *x,
-                    y1: *y - y_span * 0.01,
-                    x2: *x,
-                    y2: *y,
-                    color: *color,
-                });
-                ctx.print(
-                    *x,
-                    *y,
-                    Span::styled(
-                        glyph.clone(),
-                        Style::default()
-                            .fg(*color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                );
-            }
+    for (x, y, glyph, color) in pin_labels {
+        layers.pins.push(OverlayPin {
+            x: x + x_offset,
+            price: y,
+            glyph,
+            color,
         });
+    }
 
-    frame.render_widget(canvas, candle_area);
+    // Cell-based compose on the same buffer as candles (no Braille Canvas world).
+    // Paint order inside paint_overlays: hist → levels → MA → pins.
+    let strengths = chart.overlay_strength_map();
+    paint_overlays(frame.buffer_mut(), &view, &layers, &strengths);
 }
 
 /// Labels painted above candles for FRVP anchors / live placement cursor.

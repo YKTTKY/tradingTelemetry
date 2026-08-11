@@ -34,6 +34,12 @@ impl EngineEndpoint {
             .expect("chart interest path joins base")
     }
 
+    pub fn chart_type_styles_url(&self) -> Url {
+        self.base
+            .join("/v1/chart/type-styles")
+            .expect("chart type-styles path joins base")
+    }
+
     pub fn workspace_url(&self) -> Url {
         self.base
             .join("/v1/workspace")
@@ -464,6 +470,26 @@ pub struct IndicatorUpdateEvent {
     pub series: std::collections::HashMap<String, IndicatorSeriesData>,
 }
 
+/// Per-chart presentation settings shared by all instances of an indicator type.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct IndicatorTypeStyle {
+    /// Terminal overlay intensity / blend weight in \[0, 1\] (no true alpha).
+    #[serde(default = "default_overlay_strength_field")]
+    pub overlay_strength: f64,
+}
+
+fn default_overlay_strength_field() -> f64 {
+    0.75
+}
+
+impl IndicatorTypeStyle {
+    pub fn with_strength(overlay_strength: f64) -> Self {
+        Self {
+            overlay_strength: overlay_strength.clamp(0.0, 1.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct WorkspaceChartSnapshot {
     pub id: String,
@@ -471,6 +497,9 @@ pub struct WorkspaceChartSnapshot {
     pub timeframe: String,
     #[serde(default)]
     pub indicators: Vec<IndicatorConfig>,
+    /// Type style map keyed by indicator type (`ma`, `session_vp`, …).
+    #[serde(default)]
+    pub type_styles: std::collections::HashMap<String, IndicatorTypeStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -526,6 +555,13 @@ pub struct ChartInterestRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkspaceRequest {
     pub layout_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TypeStylesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chart_id: Option<String>,
+    pub type_styles: std::collections::HashMap<String, IndicatorTypeStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -761,6 +797,30 @@ pub async fn post_workspace_layout(
     };
     let response: WorkspaceSnapshot = client
         .post(endpoint.workspace_url())
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response)
+}
+
+/// Persist per-chart indicator type styles (overlay strength) via workspace store.
+pub async fn post_type_styles(
+    endpoint: &EngineEndpoint,
+    chart_id: &str,
+    type_styles: std::collections::HashMap<String, IndicatorTypeStyle>,
+) -> Result<WorkspaceSnapshot, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let body = TypeStylesRequest {
+        chart_id: Some(chart_id.to_string()),
+        type_styles,
+    };
+    let response: WorkspaceSnapshot = client
+        .post(endpoint.chart_type_styles_url())
         .json(&body)
         .send()
         .await?

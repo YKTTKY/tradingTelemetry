@@ -50,6 +50,13 @@ class IndicatorsBody(BaseModel):
     indicators: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class TypeStylesBody(BaseModel):
+    """Per-chart indicator type styles (overlay strength, …)."""
+
+    chart_id: str | None = None
+    type_styles: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -270,6 +277,18 @@ def create_app(
         indicators.set_configs(chart_id, configs)
         workspace.set_indicators(chart_id, configs)
         return indicator_apply_response(chart_id)
+
+    @app.post("/v1/chart/type-styles")
+    def set_type_styles(body: TypeStylesBody) -> dict[str, Any]:
+        """Replace type styles for one chart slot (persisted with workspace)."""
+        try:
+            chart_id = workspace.state.resolve_chart_id(body.chart_id)
+            # Allow writing primary memory while dual is active (and vice versa)
+            # only for the active layout's chart_ids — match indicators apply.
+            workspace.state.validate_chart_id_for_layout(chart_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return workspace.set_type_styles(chart_id, body.type_styles)
 
     @app.post("/v1/watchlist/active")
     def set_active_watchlist(body: WatchlistActiveBody) -> dict[str, Any]:

@@ -2,6 +2,7 @@
 
 mod app;
 mod ipc;
+mod overlay;
 mod timeframe;
 mod ui;
 
@@ -16,8 +17,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ipc::{
-    post_chart_interest, post_indicators, post_watchlist_active, post_watchlist_add,
-    post_watchlist_remove, post_workspace_layout, run_ipc_loop, EngineEndpoint, IpcEvent,
+    post_chart_interest, post_indicators, post_type_styles, post_watchlist_active,
+    post_watchlist_add, post_watchlist_remove, post_workspace_layout, run_ipc_loop,
+    EngineEndpoint, IpcEvent,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -118,6 +120,23 @@ async fn run_loop(
                             message: err.to_string(),
                         });
                     }
+                }
+            });
+        }
+
+        if let Some(pending) = app.pending_type_styles.clone() {
+            app.type_styles_request_started();
+            let ep = endpoint.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // Local chart already holds styles; engine persists for restore.
+                // Do not apply full workspace (would wipe bar series + re-interest).
+                if let Err(err) =
+                    post_type_styles(&ep, &pending.chart_id, pending.type_styles).await
+                {
+                    let _ = tx.send(IpcEvent::IndicatorsFailed {
+                        message: format!("type styles: {err}"),
+                    });
                 }
             });
         }

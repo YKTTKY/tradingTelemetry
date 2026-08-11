@@ -101,6 +101,35 @@ def default_watchlists(*, include_vix: bool = False) -> list[Watchlist]:
     ]
 
 
+def _clamp_strength(value: Any) -> float:
+    try:
+        s = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if s != s:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, s))
+
+
+def parse_type_styles(raw: Any) -> dict[str, dict[str, float]]:
+    """Parse type style map: { indicator_type: { overlay_strength: float } }."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for key, val in raw.items():
+        tkey = str(key).strip()
+        if not tkey or not isinstance(val, dict):
+            continue
+        strength = _clamp_strength(val.get("overlay_strength", 0.75))
+        out[tkey] = {"overlay_strength": strength}
+    return out
+
+
+def type_styles_public(styles: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Public shape; empty map omitted by callers when desired."""
+    return {k: {"overlay_strength": float(v["overlay_strength"])} for k, v in styles.items()}
+
+
 @dataclass
 class WorkspaceState:
     """In-memory workspace with independent single vs dual chart memories."""
@@ -112,30 +141,52 @@ class WorkspaceState:
     primary_indicators: list[IndicatorConfig] = field(default_factory=list)
     dual_top_indicators: list[IndicatorConfig] = field(default_factory=list)
     dual_bottom_indicators: list[IndicatorConfig] = field(default_factory=list)
+    primary_type_styles: dict[str, dict[str, float]] = field(default_factory=dict)
+    dual_top_type_styles: dict[str, dict[str, float]] = field(default_factory=dict)
+    dual_bottom_type_styles: dict[str, dict[str, float]] = field(default_factory=dict)
     watchlists: list[Watchlist] = field(default_factory=lambda: default_watchlists())
     active_watchlist_id: str = WATCHLIST_CORE_ID
+
+    def _chart_public(
+        self,
+        chart_id: str,
+        selection: ChartSelection,
+        indicators: list[IndicatorConfig],
+        type_styles: dict[str, dict[str, float]],
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "id": chart_id,
+            **selection.to_dict(),
+            "indicators": [c.to_public() for c in indicators],
+        }
+        if type_styles:
+            body["type_styles"] = type_styles_public(type_styles)
+        return body
 
     def active_charts(self) -> list[dict[str, Any]]:
         """Charts visible for the current layout (for snapshot / TUI restore)."""
         if self.layout_mode == LAYOUT_DUAL:
             return [
-                {
-                    "id": CHART_TOP,
-                    **self.dual_top.to_dict(),
-                    "indicators": [c.to_public() for c in self.dual_top_indicators],
-                },
-                {
-                    "id": CHART_BOTTOM,
-                    **self.dual_bottom.to_dict(),
-                    "indicators": [c.to_public() for c in self.dual_bottom_indicators],
-                },
+                self._chart_public(
+                    CHART_TOP,
+                    self.dual_top,
+                    self.dual_top_indicators,
+                    self.dual_top_type_styles,
+                ),
+                self._chart_public(
+                    CHART_BOTTOM,
+                    self.dual_bottom,
+                    self.dual_bottom_indicators,
+                    self.dual_bottom_type_styles,
+                ),
             ]
         return [
-            {
-                "id": CHART_PRIMARY,
-                **self.primary.to_dict(),
-                "indicators": [c.to_public() for c in self.primary_indicators],
-            }
+            self._chart_public(
+                CHART_PRIMARY,
+                self.primary,
+                self.primary_indicators,
+                self.primary_type_styles,
+            )
         ]
 
     def to_public(self) -> dict[str, Any]:
@@ -220,6 +271,28 @@ class WorkspaceState:
         else:
             raise ValueError(f"unknown chart_id: {chart_id}")
 
+    def type_styles_for(self, chart_id: str) -> dict[str, dict[str, float]]:
+        if chart_id == CHART_PRIMARY:
+            return dict(self.primary_type_styles)
+        if chart_id == CHART_TOP:
+            return dict(self.dual_top_type_styles)
+        if chart_id == CHART_BOTTOM:
+            return dict(self.dual_bottom_type_styles)
+        raise ValueError(f"unknown chart_id: {chart_id}")
+
+    def set_type_styles(
+        self, chart_id: str, styles: dict[str, dict[str, float]]
+    ) -> None:
+        cleaned = parse_type_styles(styles)
+        if chart_id == CHART_PRIMARY:
+            self.primary_type_styles = cleaned
+        elif chart_id == CHART_TOP:
+            self.dual_top_type_styles = cleaned
+        elif chart_id == CHART_BOTTOM:
+            self.dual_bottom_type_styles = cleaned
+        else:
+            raise ValueError(f"unknown chart_id: {chart_id}")
+
     def all_chart_indicator_slots(self) -> list[tuple[str, list[IndicatorConfig]]]:
         """Every persisted chart slot (including inactive layout memory)."""
         return [
@@ -281,6 +354,11 @@ class WorkspaceState:
             "dual_bottom_indicators": [
                 c.to_storage() for c in self.dual_bottom_indicators
             ],
+            "primary_type_styles": type_styles_public(self.primary_type_styles),
+            "dual_top_type_styles": type_styles_public(self.dual_top_type_styles),
+            "dual_bottom_type_styles": type_styles_public(
+                self.dual_bottom_type_styles
+            ),
             "watchlists": [wl.to_storage() for wl in self.watchlists],
             "active_watchlist_id": self.active_watchlist_id,
         }
@@ -324,6 +402,11 @@ class WorkspaceState:
             ),
             dual_bottom_indicators=indicators_from_storage(
                 data.get("dual_bottom_indicators")
+            ),
+            primary_type_styles=parse_type_styles(data.get("primary_type_styles")),
+            dual_top_type_styles=parse_type_styles(data.get("dual_top_type_styles")),
+            dual_bottom_type_styles=parse_type_styles(
+                data.get("dual_bottom_type_styles")
             ),
             watchlists=watchlists,
             active_watchlist_id=active,
@@ -423,6 +506,13 @@ class WorkspaceStore:
         self, chart_id: str, configs: list[IndicatorConfig]
     ) -> dict[str, Any]:
         self.state.set_indicators(chart_id, configs)
+        self.save()
+        return self.state.to_public()
+
+    def set_type_styles(
+        self, chart_id: str, styles: dict[str, dict[str, float]]
+    ) -> dict[str, Any]:
+        self.state.set_type_styles(chart_id, styles)
         self.save()
         return self.state.to_public()
 

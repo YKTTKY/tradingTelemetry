@@ -249,3 +249,70 @@ def test_invalid_layout_mode_is_rejected(tmp_path: Path):
         json={"layout_mode": "grid-3x3"},
     )
     assert response.status_code == 422
+
+
+def test_type_styles_persist_per_chart_and_restore(tmp_path: Path):
+    """Overlay strength type styles are per chart slot and survive engine restart."""
+    store = tmp_path / "workspace.json"
+    client1, _ = _client(workspace_path=store)
+
+    body = client1.post(
+        "/v1/chart/type-styles",
+        json={
+            "chart_id": "primary",
+            "type_styles": {
+                "ma": {"overlay_strength": 0.4},
+                "session_vp": {"overlay_strength": 0.2},
+            },
+        },
+    ).json()
+    assert body["charts"] == [
+        {
+            "id": "primary",
+            "instrument": "SPY",
+            "timeframe": "1D",
+            "indicators": [],
+            "type_styles": {
+                "ma": {"overlay_strength": 0.4},
+                "session_vp": {"overlay_strength": 0.2},
+            },
+        },
+    ]
+
+    # Dual layout has independent slots; primary memory keeps styles when off-layout.
+    client1.post("/v1/workspace", json={"layout_mode": "dual-vertical"})
+    client1.post(
+        "/v1/chart/type-styles",
+        json={
+            "chart_id": "top",
+            "type_styles": {"ma": {"overlay_strength": 0.9}},
+        },
+    )
+    dual = client1.get("/v1/snapshot").json()["workspace"]
+    assert dual["charts"][0]["type_styles"] == {"ma": {"overlay_strength": 0.9}}
+    # Bottom has no custom styles → field omitted or empty.
+    assert dual["charts"][1].get("type_styles", {}) == {}
+
+    # Clamp out-of-range strength.
+    clamped = client1.post(
+        "/v1/chart/type-styles",
+        json={
+            "chart_id": "bottom",
+            "type_styles": {"ma": {"overlay_strength": 3.5}},
+        },
+    ).json()
+    assert clamped["charts"][1]["type_styles"]["ma"]["overlay_strength"] == 1.0
+
+    # Restart restores dual + styles.
+    client2, _ = _client(workspace_path=store)
+    snap = client2.get("/v1/snapshot").json()["workspace"]
+    assert snap["layout_mode"] == "dual-vertical"
+    assert snap["charts"][0]["type_styles"]["ma"]["overlay_strength"] == 0.9
+    assert snap["charts"][1]["type_styles"]["ma"]["overlay_strength"] == 1.0
+
+    # Single layout still holds primary styles from first mutation.
+    single = client2.post("/v1/workspace", json={"layout_mode": "single"}).json()
+    assert single["charts"][0]["type_styles"] == {
+        "ma": {"overlay_strength": 0.4},
+        "session_vp": {"overlay_strength": 0.2},
+    }
