@@ -1,7 +1,7 @@
 //! Overlay compose + type overlay strength for the price pane.
 //!
 //! Paint order (after candles/axes): VP hist → levels → MA → pins.
-//! Continuous overlays may win candle cells; strength softens recoloring.
+//! Overlays never replace candle body/wick glyphs (candles stay readable).
 
 use ratatui::{
     buffer::Buffer,
@@ -141,8 +141,8 @@ pub fn resolve_strength(type_key: &str, styles: &std::collections::HashMap<Strin
 
 /// Paint overlays into `buf` on the same cell grid as the candlestick widget.
 ///
-/// Order: VP hist → levels → MA lines → pins. Continuous lines may overwrite
-/// candle cells; strength blends the overlay color with the cell under it.
+/// Order: VP hist → levels → MA lines → pins. Candle glyphs are never replaced
+/// (MA/VP skip those cells so green/red stays intact).
 pub fn paint_overlays(
     buf: &mut Buffer,
     view: &ChartView,
@@ -416,12 +416,16 @@ fn paint_lines_braille(
             if !cell_in_area(area, abs_x, abs_y) {
                 continue;
             }
+            let existing = buf[(abs_x, abs_y)].symbol().to_string();
+            // Never block candle bodies/wicks — MA is drawn around them only.
+            if is_candle_glyph(&existing) {
+                continue;
+            }
             let over = colors[idx].unwrap_or(Color::Cyan);
             let s = cell_strength[idx];
             let under = under_fg(buf, abs_x, abs_y);
             let fg = blend_color(under, over, s);
             let cell = &mut buf[(abs_x, abs_y)];
-            // MA may win the glyph for continuous stroke (Braille curve).
             let ch = braille_char(mask);
             let mut sbuf = [0u8; 4];
             let sym = ch.encode_utf8(&mut sbuf);
@@ -517,26 +521,20 @@ mod tests {
     }
 
     #[test]
-    fn paint_order_ma_wins_over_hist_on_shared_cell() {
+    fn ma_skips_candle_cells_but_paints_empty_neighbors() {
         let view = sample_view();
         let area = view.candle_area();
         let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
-        // Seed a "candle" under-cell in the price pane.
         let seed_x = area.x + 15;
         let seed_y = view.price_to_row(150.0).unwrap();
+        let candle = Color::Rgb(52, 208, 88);
         buf[(seed_x, seed_y)]
             .set_symbol("┃")
-            .set_style(Style::default().fg(Color::Rgb(52, 208, 88)));
+            .set_style(Style::default().fg(candle));
+        // Empty neighbor for the MA stroke to land on.
+        buf[(seed_x + 1, seed_y)].set_symbol(" ");
 
         let mut layers = OverlayLayers::default();
-        layers.hist.push(OverlayHistBar {
-            x: 15.0,
-            y: 140.0,
-            width: 2.0,
-            height: 20.0,
-            color: Color::Cyan,
-            type_key: "session_vp".into(),
-        });
         layers.lines.push(OverlayLine {
             points: vec![(15.5, 150.0), (16.5, 150.0)],
             color: Color::Yellow,
@@ -545,22 +543,20 @@ mod tests {
 
         let mut strengths = HashMap::new();
         strengths.insert("ma".into(), 1.0);
-        strengths.insert("session_vp".into(), 1.0);
         paint_overlays(&mut buf, &view, &layers, &strengths);
 
-        let cell = &buf[(seed_x, seed_y)];
-        // MA paints last as Braille stroke and may win the glyph.
-        let ch = cell.symbol().chars().next().unwrap_or(' ');
+        // Candle cell unchanged (MA must not block it).
+        assert_eq!(buf[(seed_x, seed_y)].symbol(), "┃");
+        assert_eq!(buf[(seed_x, seed_y)].style().fg, Some(candle));
+        // Neighbor gets Braille MA.
+        let ch = buf[(seed_x + 1, seed_y)]
+            .symbol()
+            .chars()
+            .next()
+            .unwrap_or(' ');
         assert!(
             ('\u{2800}'..='\u{28FF}').contains(&ch),
-            "expected Braille MA glyph, got {:?}",
-            cell.symbol()
-        );
-        // Yellow named → RGB approx; strength 1.0 should recolor fully.
-        let fg = color_to_rgb(cell.style().fg.unwrap_or(Color::Reset));
-        assert!(
-            fg.0 > 150 && fg.1 > 150,
-            "expected strong yellow-ish, got {fg:?}"
+            "expected Braille on empty cell, got {ch:?}"
         );
     }
 
@@ -671,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn low_strength_softens_ma_recolor_of_candle() {
+    fn ma_never_recolors_candle_even_at_full_strength() {
         let view = sample_view();
         let area = view.candle_area();
         let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
@@ -689,13 +685,15 @@ mod tests {
             type_key: "ma".into(),
         });
         let mut strengths = HashMap::new();
-        strengths.insert("ma".into(), 0.25);
+        strengths.insert("ma".into(), 1.0);
         paint_overlays(&mut buf, &view, &layers, &strengths);
 
-        let fg = color_to_rgb(buf[(seed_x, seed_y)].style().fg.unwrap());
-        // Blend of green candle + red overlay at 0.25 → still mostly green, some red.
-        assert!(fg.1 > fg.0, "low strength should keep green dominant: {fg:?}");
-        assert!(fg.0 > 40, "some red should bleed in: {fg:?}");
+        assert_eq!(buf[(seed_x, seed_y)].symbol(), "┃");
+        assert_eq!(
+            buf[(seed_x, seed_y)].style().fg,
+            Some(candle),
+            "MA must not recolor or replace candle glyphs"
+        );
     }
 
     #[test]
