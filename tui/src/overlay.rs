@@ -259,22 +259,19 @@ fn paint_hist_bar(
             if !cell_in_area(area, cx, ry) {
                 continue;
             }
-            let under = under_fg(buf, cx, ry);
-            let cell = &mut buf[(cx, ry)];
-            let sym = cell.symbol().to_string();
+            let sym = buf[(cx, ry)].symbol().to_string();
+            // Never recolor candle green/red — hist only fills empty / soft cells.
             if is_candle_glyph(&sym) {
-                // Preserve candle glyph; light tint only.
-                let fg = blend_color(under, bar.color, hist_strength * 0.45);
-                cell.set_style(Style::default().fg(fg));
-            } else if is_empty_glyph(&sym) || sym == "░" || sym == "▒" {
+                continue;
+            }
+            if is_empty_glyph(&sym) || sym == "░" || sym == "▒" {
+                let under = under_fg(buf, cx, ry);
                 let fg = blend_color(under, bar.color, hist_strength.max(0.2));
+                let cell = &mut buf[(cx, ry)];
                 cell.set_symbol("░");
                 cell.set_style(Style::default().fg(fg));
-            } else {
-                // Existing overlay / level: soft blend, keep glyph.
-                let fg = blend_color(under, bar.color, hist_strength * 0.5);
-                cell.set_style(Style::default().fg(fg));
             }
+            // Leave other overlays (MA Braille, prior levels) alone.
         }
     }
 }
@@ -284,15 +281,13 @@ fn paint_level(
     view: &ChartView,
     area: Rect,
     level: &OverlayLevel,
-    strength: f64,
+    _strength: f64,
 ) {
     let Some(row) = price_to_row_clamped(view, level.price) else {
         return;
     };
     let c0 = level.x0.min(level.x1).floor() as i64;
     let c1 = level.x0.max(level.x1).ceil() as i64;
-    // Levels are strategy lines — keep them vivid (don't wash into candle green/red).
-    let level_strength = strength.max(0.8);
     for col in c0..=c1 {
         let Some(cx) = local_x_to_col(view, col as f64 + 0.5) else {
             continue;
@@ -300,18 +295,16 @@ fn paint_level(
         if !cell_in_area(area, cx, row) {
             continue;
         }
-        let under = under_fg(buf, cx, row);
         let cell = &mut buf[(cx, row)];
         let sym = cell.symbol().to_string();
-        let fg = blend_color(under, level.color, level_strength);
+        // Never recolor candle bodies/wicks when POC/VAH/VAL cross them —
+        // green stays green, red stays red. Level only paints empty/hist cells
+        // so the line reads as a dashed stroke through price action.
         if is_candle_glyph(&sym) {
-            // Keep candle body; strong tint so VAH/POC/VAL still read.
-            cell.set_style(Style::default().fg(fg));
-        } else {
-            // Empty / hist: solid-ish dash in the level color.
-            cell.set_symbol("─");
-            cell.set_style(Style::default().fg(level.color));
+            continue;
         }
+        cell.set_symbol("─");
+        cell.set_style(Style::default().fg(level.color));
     }
 }
 
@@ -603,15 +596,16 @@ mod tests {
     }
 
     #[test]
-    fn soft_hist_preserves_candle_glyph() {
+    fn soft_hist_preserves_candle_glyph_and_color() {
         let view = sample_view();
         let area = view.candle_area();
         let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
         let seed_x = area.x + 15;
         let seed_y = view.price_to_row(150.0).unwrap();
+        let candle = Color::Rgb(52, 208, 88);
         buf[(seed_x, seed_y)]
             .set_symbol("┃")
-            .set_style(Style::default().fg(Color::Rgb(52, 208, 88)));
+            .set_style(Style::default().fg(candle));
         let mut layers = OverlayLayers::default();
         layers.hist.push(OverlayHistBar {
             x: 15.0,
@@ -628,6 +622,51 @@ mod tests {
             buf[(seed_x, seed_y)].symbol(),
             "┃",
             "hist must not replace candle glyphs"
+        );
+        assert_eq!(
+            buf[(seed_x, seed_y)].style().fg,
+            Some(candle),
+            "hist must not recolor candle green/red"
+        );
+    }
+
+    #[test]
+    fn vp_level_does_not_recolor_candle_on_cross() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let seed_x = area.x + 15;
+        let seed_y = view.price_to_row(150.0).unwrap();
+        let bearish = Color::Rgb(234, 74, 90);
+        buf[(seed_x, seed_y)]
+            .set_symbol("┃")
+            .set_style(Style::default().fg(bearish));
+        // Empty neighbor so the level still paints somewhere.
+        let empty_x = seed_x + 1;
+        buf[(empty_x, seed_y)].set_symbol(" ");
+
+        let mut layers = OverlayLayers::default();
+        layers.levels.push(OverlayLevel {
+            x0: 15.0,
+            x1: 17.0,
+            price: 150.0,
+            color: Color::Rgb(80, 160, 255), // POC blue
+            type_key: "session_vp".into(),
+        });
+        let mut strengths = HashMap::new();
+        strengths.insert("session_vp".into(), 1.0);
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+
+        assert_eq!(buf[(seed_x, seed_y)].symbol(), "┃");
+        assert_eq!(
+            buf[(seed_x, seed_y)].style().fg,
+            Some(bearish),
+            "POC/VAH/VAL must not turn red candles blue/green"
+        );
+        assert_eq!(buf[(empty_x, seed_y)].symbol(), "─");
+        assert_eq!(
+            buf[(empty_x, seed_y)].style().fg,
+            Some(Color::Rgb(80, 160, 255))
         );
     }
 
