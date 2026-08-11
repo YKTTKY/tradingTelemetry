@@ -79,6 +79,25 @@ pub fn blend_color(under: Color, over: Color, strength: f64) -> Color {
     rgb_to_color(blend_rgb(color_to_rgb(under), color_to_rgb(over), strength))
 }
 
+/// Chart-background black used when dimming continuous overlays (MA).
+///
+/// MA strength must **not** blend with `under_fg`: empty cells use `Color::Reset`,
+/// which `color_to_rgb` maps to mid-gray — low strength then turns cyan/gold/magenta
+/// into muddy olive/brown. Dim pure hue toward black instead so opacity keeps hue.
+pub const OVERLAY_DIM_BG: (u8, u8, u8) = (0, 0, 0);
+
+/// Dim `over` toward chart black by strength (1 = full hue, 0 = invisible).
+///
+/// Prefer this for MA strokes on empty cells; keep `blend_color` for soft VP hist
+/// that intentionally tints existing content.
+pub fn dim_to_background(over: Color, strength: f64) -> Color {
+    rgb_to_color(blend_rgb(
+        OVERLAY_DIM_BG,
+        color_to_rgb(over),
+        clamp_strength(strength),
+    ))
+}
+
 // --- Geometry primitives for cell paint ------------------------------------
 
 /// Horizontal histogram bar rect in ChartView local coordinates (column/price).
@@ -423,8 +442,9 @@ fn paint_lines_braille(
             }
             let over = colors[idx].unwrap_or(Color::Cyan);
             let s = cell_strength[idx];
-            let under = under_fg(buf, abs_x, abs_y);
-            let fg = blend_color(under, over, s);
+            // Dim pure MA hue toward black (not under-fg) so low strength stays
+            // cyan/gold/magenta instead of muddy gray blends.
+            let fg = dim_to_background(over, s);
             let cell = &mut buf[(abs_x, abs_y)];
             let ch = braille_char(mask);
             let mut sbuf = [0u8; 4];
@@ -492,6 +512,50 @@ mod tests {
         assert_eq!(blend_rgb(black, white, 0.0), black);
         assert_eq!(blend_rgb(black, white, 1.0), white);
         assert_eq!(blend_rgb(black, white, 0.5), (128, 128, 128));
+    }
+
+    #[test]
+    fn dim_to_background_preserves_hue_at_low_strength() {
+        // Cyan MA at 0.35 must stay cyan-ish, not muddy gray (old under_fg path).
+        let cyan = Color::Rgb(0, 200, 255);
+        let dim = dim_to_background(cyan, 0.35);
+        let (r, g, b) = color_to_rgb(dim);
+        assert_eq!(r, 0);
+        assert!((g as i32 - 70).abs() <= 1, "g={g}");
+        assert!((b as i32 - 89).abs() <= 1, "b={b}");
+        // Blue channel still dominates green (hue preserved vs olive mud).
+        assert!(b > g);
+        assert_eq!(dim_to_background(cyan, 1.0), cyan);
+        assert_eq!(color_to_rgb(dim_to_background(cyan, 0.0)), OVERLAY_DIM_BG);
+    }
+
+    #[test]
+    fn ma_low_strength_uses_dim_hue_not_under_blend() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        // Seed gray under (what Reset-like content used to pollute into).
+        let y = view.price_to_row(150.0).unwrap();
+        let x0 = area.x + 15;
+        buf[(x0, y)]
+            .set_symbol(" ")
+            .set_style(Style::default().fg(Color::Rgb(160, 160, 160)));
+
+        let mut layers = OverlayLayers::default();
+        layers.lines.push(OverlayLine {
+            points: vec![(15.5, 150.0), (16.5, 150.0)],
+            color: Color::Rgb(0, 200, 255),
+            type_key: "ma".into(),
+        });
+        let mut strengths = HashMap::new();
+        strengths.insert("ma".into(), 0.35);
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+
+        let fg = buf[(x0, y)].style().fg.expect("ma fg");
+        let (r, g, b) = color_to_rgb(fg);
+        // Must match dim_to_background, not blend with gray under.
+        assert_eq!((r, g, b), color_to_rgb(dim_to_background(Color::Rgb(0, 200, 255), 0.35)));
+        assert!(b > g && r == 0, "expected dim cyan, got ({r},{g},{b})");
     }
 
     #[test]

@@ -503,12 +503,55 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
                     },
                 )
             };
-            let label = match ind.indicator_type.as_str() {
-                "ma" => format!(
+            let unavailable = chart
+                .indicator_series
+                .get(&ind.id)
+                .and_then(|s| s.status.as_deref())
+                == Some("unavailable");
+            let base_style = if selected {
+                Style::default()
+                    .fg(if unavailable {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    })
+                    .add_modifier(Modifier::BOLD)
+            } else if unavailable && ind.enabled {
+                Style::default().fg(Color::Yellow)
+            } else if ind.enabled {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            // MA rows: show stable paint color name, tinted to match the chart stroke.
+            if ind.indicator_type == "ma" {
+                let (ma_color, ma_name) = ma_slot_for_indicator(chart, &ind.id)
+                    .unwrap_or_else(|| ma_slot(0));
+                let head = format!(
                     "{mark}[{on}] MA {} {}",
                     ind.ma_type.as_deref().unwrap_or("sma").to_uppercase(),
                     ind.length.unwrap_or(1)
-                ),
+                );
+                let color_style = if ind.enabled {
+                    if selected {
+                        Style::default()
+                            .fg(ma_color)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(ma_color)
+                    }
+                } else {
+                    base_style
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(head, base_style),
+                    Span::styled(format!(" ({ma_name})"), color_style),
+                ]));
+                continue;
+            }
+
+            let label = match ind.indicator_type.as_str() {
                 "volume" => format!("{mark}[{on}] Volume"),
                 "session_vp" => {
                     let rows = ind.rows.unwrap_or(500);
@@ -580,27 +623,7 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
                 ),
                 other => format!("{mark}[{on}] {other}"),
             };
-            let unavailable = chart
-                .indicator_series
-                .get(&ind.id)
-                .and_then(|s| s.status.as_deref())
-                == Some("unavailable");
-            let style = if selected {
-                Style::default()
-                    .fg(if unavailable {
-                        Color::Yellow
-                    } else {
-                        Color::Cyan
-                    })
-                    .add_modifier(Modifier::BOLD)
-            } else if unavailable && ind.enabled {
-                Style::default().fg(Color::Yellow)
-            } else if ind.enabled {
-                Style::default()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            lines.push(Line::from(Span::styled(label, style)));
+            lines.push(Line::from(Span::styled(label, base_style)));
         }
     }
     let border = if active {
@@ -872,11 +895,30 @@ fn draw_price_and_volume(
 }
 
 // MA colors as solid RGB (named colors blend poorly with candle green/red).
+// Slot order is stable across the chart's MA instances (not only enabled ones).
 const MA_COLORS: [Color; 3] = [
-    Color::Rgb(0, 200, 255),   // cyan — short MA
-    Color::Rgb(255, 210, 40),  // gold — mid MA
-    Color::Rgb(220, 120, 255), // magenta — long MA
+    Color::Rgb(0, 200, 255),   // cyan — first MA
+    Color::Rgb(255, 210, 40),  // gold — second MA
+    Color::Rgb(220, 120, 255), // magenta — third MA
 ];
+
+const MA_COLOR_NAMES: [&str; 3] = ["cyan", "gold", "magenta"];
+
+/// Color + display name for the n-th MA instance on a chart (0-based).
+fn ma_slot(index: usize) -> (Color, &'static str) {
+    let i = index % MA_COLORS.len();
+    (MA_COLORS[i], MA_COLOR_NAMES[i])
+}
+
+/// Stable MA slot among **all** MA configs on the chart (enabled or not).
+fn ma_slot_for_indicator(chart: &Chart, indicator_id: &str) -> Option<(Color, &'static str)> {
+    chart
+        .indicators
+        .iter()
+        .filter(|i| i.indicator_type == "ma")
+        .position(|i| i.id == indicator_id)
+        .map(ma_slot)
+}
 
 /// America/New_York fixed offset at `ts_ms` (handles EST/EDT).
 fn ny_offset_at_ms(ts_ms: i64) -> chrono::FixedOffset {
@@ -948,7 +990,7 @@ fn draw_candles(
     let gex = chart.enabled_gex();
     let garch = chart.enabled_garch();
     let last = bars.last().expect("non-empty");
-    let ma_hint = ma_legend(&ma_lines);
+    let ma_hint = ma_legend(chart, &ma_lines);
     let vp_hint = {
         let mut tags: Vec<&str> = Vec::new();
         if svp.is_some() {
@@ -1085,8 +1127,17 @@ fn draw_candles(
 
     let mut layers = OverlayLayers::default();
 
-    for (mi, (_cfg, series)) in ma_lines.iter().enumerate() {
-        let color = MA_COLORS[mi % MA_COLORS.len()];
+    // Color by stable index among all MA instances (matches Current panel labels).
+    for cfg in chart.indicators.iter().filter(|i| i.indicator_type == "ma") {
+        if !cfg.enabled {
+            continue;
+        }
+        let Some(series) = chart.indicator_series.get(&cfg.id) else {
+            continue;
+        };
+        let color = ma_slot_for_indicator(chart, &cfg.id)
+            .map(|(c, _)| c)
+            .unwrap_or(MA_COLORS[0]);
         let mut pts: Vec<(f64, f64)> = Vec::new();
         for (i, val) in series.values.iter().enumerate() {
             let Some(v) = val else { continue };
@@ -1786,20 +1837,20 @@ fn build_anchored_vp_draw(
     }
 }
 
-fn ma_legend(ma_lines: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)]) -> String {
+fn ma_legend(
+    chart: &Chart,
+    ma_lines: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+) -> String {
     if ma_lines.is_empty() {
         return String::new();
     }
     let parts: Vec<String> = ma_lines
         .iter()
-        .enumerate()
-        .map(|(i, (cfg, _))| {
+        .map(|(cfg, _)| {
             let len = cfg.length.unwrap_or(0);
-            let tag = match i % 3 {
-                0 => "c", // cyan
-                1 => "y", // yellow
-                _ => "m", // magenta
-            };
+            let tag = ma_slot_for_indicator(chart, &cfg.id)
+                .map(|(_, name)| name.chars().next().unwrap_or('?'))
+                .unwrap_or('?');
             format!("{tag}{len}")
         })
         .collect();
