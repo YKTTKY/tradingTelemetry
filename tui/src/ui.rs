@@ -693,21 +693,25 @@ fn bars_to_widget_candles(bars: &[OhlcvBar]) -> Vec<Candle> {
         .collect()
 }
 
-/// Bars whose open time falls inside the widget's visible window.
+/// Bars whose open time falls inside the widget's dense visible window.
 fn bars_in_view<'a>(bars: &'a [OhlcvBar], view: &ChartView) -> Vec<&'a OhlcvBar> {
+    if view.column_timestamps.is_empty() {
+        return Vec::new();
+    }
+    let first = *view.column_timestamps.first().unwrap();
+    let last = *view.column_timestamps.last().unwrap();
     bars.iter()
         .filter(|b| {
             let t = b.ts.saturating_mul(1000);
-            t >= view.view_start_ts && t <= view.view_end_ts
+            t >= first && t <= last
         })
         .collect()
 }
 
 /// Canvas X for a bar open (seconds) in the price pane coordinate space [0, price_width].
-fn view_ts_to_x(view: &ChartView, ts_sec: i64) -> f64 {
-    let step = (view.interval as i64 * 1000).max(1) as f64;
-    let ts_ms = ts_sec.saturating_mul(1000) as f64;
-    (ts_ms - view.view_start_ts as f64) / step + 0.5
+/// Uses dense column mapping from the widget view (not calendar time).
+fn view_ts_to_x(view: &ChartView, ts_sec: i64) -> Option<f64> {
+    view.timestamp_to_local_x(ts_sec.saturating_mul(1000))
 }
 
 fn draw_candles(
@@ -827,11 +831,8 @@ fn draw_candles(
         })
         .and_then(|idx| bars.get(idx).map(|b| b.ts.saturating_mul(1000)));
     if let Some(ts_ms) = place_bar_ts {
-        // Center-ish: set window end so the pin sits near the middle when history allows.
-        let width = inner.width.saturating_sub(12).max(4) as i64; // rough y-axis allowance
-        let half = (width / 2) * (interval as i64) * 1000;
-        let end = (ts_ms + half).min(bars.last().unwrap().ts.saturating_mul(1000));
-        candle_state.set_cursor_timestamp(Some(end));
+        // Dense window ends at the pin bar (widget takes up to price_width bars ending there).
+        candle_state.set_cursor_timestamp(Some(ts_ms));
     }
 
     let tz = ny_offset_at_ms(last.ts.saturating_mul(1000));
@@ -852,7 +853,7 @@ fn draw_candles(
         return;
     }
 
-    // Overlays share the widget's price/time scale (refined further in issue 02).
+    // Overlays share the widget's dense bar columns (refined further in issue 02).
     let visible_refs = bars_in_view(bars, &view);
     if visible_refs.is_empty() {
         return;
@@ -860,7 +861,8 @@ fn draw_candles(
     let visible: Vec<OhlcvBar> = visible_refs.iter().map(|b| (*b).clone()).collect();
     let n_bars = visible.len() as f64;
     let n_cols = view.price_width() as f64;
-    let x_offset = view_ts_to_x(&view, visible[0].ts) - 0.5;
+    // Index-space VP/pins use 0..n_bars; shift into right-aligned dense columns.
+    let x_offset = view.column_offset as f64;
     let min_p = view.y_min;
     let max_p = view.y_max;
     let y_span = (max_p - min_p).max(f64::EPSILON);
@@ -878,7 +880,9 @@ fn draw_candles(
         for (i, val) in series.values.iter().enumerate() {
             let Some(v) = val else { continue };
             let Some(bar) = bars.get(i) else { continue };
-            let x = view_ts_to_x(&view, bar.ts);
+            let Some(x) = view_ts_to_x(&view, bar.ts) else {
+                continue;
+            };
             if x < 0.0 || x > n_cols {
                 continue;
             }
@@ -894,7 +898,6 @@ fn draw_candles(
     let av_draw = build_anchored_vp_draw(&avps, &visible, n_bars);
     vp_draw.hist_rects.extend(av_draw.hist_rects);
     vp_draw.levels.extend(av_draw.levels);
-    // Shift index-space VP geometry into widget column space (right-aligned live tip).
     for rect in &mut vp_draw.hist_rects {
         rect.0 += x_offset;
     }

@@ -198,6 +198,114 @@ impl XAxis {
 
         result.into_iter().map(String::from_iter).collect()
     }
+
+    /// Dense layout: one real bar per column (right-aligned with `column_offset` empty cells).
+    ///
+    /// Labels sit under painted columns using actual bar open times — not a continuous
+    /// calendar range (so weekend gaps do not open empty tick columns).
+    pub fn render_dense(
+        width: u16,
+        column_offset: u16,
+        column_timestamps: &[i64],
+        interval: Interval,
+        is_realtime: bool,
+        time_offset: FixedOffset,
+    ) -> Vec<String> {
+        let width = width as usize;
+        let mut result = vec![
+            "─".repeat(width).chars().collect_vec(),
+            " ".repeat(width).chars().collect_vec(),
+        ];
+        if column_timestamps.is_empty() || width == 0 {
+            return result.into_iter().map(String::from_iter).collect();
+        }
+
+        let offset = column_offset as usize;
+        let n = column_timestamps.len();
+        // Map painted bar index → absolute column.
+        let col_of = |i: usize| -> usize { offset + i };
+
+        // Last (rightmost) label — always shown.
+        {
+            let last_i = n - 1;
+            let last_ts = column_timestamps[last_i];
+            let prev_ts = if last_i > 0 {
+                column_timestamps[last_i - 1]
+            } else {
+                // Compare against "now" style when only one bar (matches calendar path).
+                last_ts
+            };
+            let prev_dt = if last_i > 0 {
+                DateTime::from_timestamp_millis(prev_ts).unwrap()
+            } else {
+                Utc::now()
+            };
+            let last_dt = DateTime::from_timestamp_millis(last_ts).unwrap();
+            let rendered = shorted_now_string(
+                prev_dt,
+                last_dt,
+                interval.render_precision(),
+                time_offset,
+            );
+            let rendered = if is_realtime {
+                format!("*{rendered}")
+            } else {
+                rendered
+            };
+            let col = col_of(last_i) as isize;
+            let written = overwrite_chars(
+                &mut result[1],
+                col - (rendered.len() / 2) as isize,
+                rendered,
+                true,
+            );
+            if written {
+                let c = col_of(last_i);
+                if c < width {
+                    result[0][c] = '┴';
+                }
+            }
+        }
+
+        // Intermediate ticks every render_gap *bars* from the right (stable under pan).
+        let gap_bars = interval.render_gap().max(1);
+        if n >= 2 {
+            for i in 0..n - 1 {
+                let from_right = n - 1 - i;
+                if from_right % gap_bars != 0 {
+                    continue;
+                }
+                let prev = DateTime::from_timestamp_millis(column_timestamps[i.saturating_sub(1)])
+                    .unwrap();
+                // When i==0, prev==current; diff may be empty — skip.
+                let prev = if i > 0 {
+                    DateTime::from_timestamp_millis(column_timestamps[i - 1]).unwrap()
+                } else {
+                    prev
+                };
+                let now = DateTime::from_timestamp_millis(column_timestamps[i]).unwrap();
+                let rendered = diff_datetime_string(prev, now, time_offset);
+                if rendered.is_empty() {
+                    continue;
+                }
+                let col = col_of(i) as isize;
+                let written = overwrite_chars(
+                    &mut result[1],
+                    col - (rendered.len() / 2) as isize,
+                    format!(" {rendered} "),
+                    false,
+                );
+                if written {
+                    let c = col_of(i);
+                    if c < width {
+                        result[0][c] = '┴';
+                    }
+                }
+            }
+        }
+
+        result.into_iter().map(String::from_iter).collect()
+    }
 }
 
 fn shorted_now_string<Tz: TimeZone>(

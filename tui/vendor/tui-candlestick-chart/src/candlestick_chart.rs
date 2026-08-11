@@ -1,5 +1,4 @@
 use chrono::{FixedOffset, Offset, Utc};
-use itertools::Itertools;
 use ratatui::{
     prelude::{Buffer, Rect},
     style::{Color, Style, Styled},
@@ -80,52 +79,10 @@ impl CandleStickChart {
 
     /// Compute the visible window + price scale for `area` without painting.
     ///
-    /// Mirrors the layout used by [`StatefulWidget::render`] so overlays can share
-    /// coordinates. Returns `None` when there is no data or the area is too small.
+    /// Dense layout: one real bar per column (weekends/session gaps do not open empty columns).
     pub fn compute_view(&self, area: Rect, state: &CandleStickChartState) -> Option<ChartView> {
-        if self.candles.is_empty() {
-            return None;
-        }
-
-        let global_min = self.candles.iter().map(|c| c.low).min().unwrap();
-        let global_max = self.candles.iter().map(|c| c.high).max().unwrap();
-
-        let y_axis_width: u16 =
-            YAxis::estimated_width(self.numeric.clone(), global_min, global_max);
-        if area.width <= y_axis_width || area.height <= X_AXIS_HEIGHT {
-            return None;
-        }
-
-        let chart_width = area.width - y_axis_width;
-        let chart_width_usize = chart_width as usize;
-
-        let first_timestamp = self.candles.first().unwrap().timestamp;
-        let last_timestamp = self.candles.last().unwrap().timestamp;
-
-        let chart_end_timestamp = state.cursor_timestamp.unwrap_or(last_timestamp);
-        let chart_start_timestamp =
-            chart_end_timestamp - self.interval as i64 * 1000 * (chart_width_usize as i64 - 1);
-
-        // Price scale from real candles inside the visible window only.
-        let (y_min, y_max) = visible_price_range(
-            &self.candles,
-            first_timestamp,
-            last_timestamp,
-            chart_start_timestamp,
-            chart_end_timestamp,
-        )?;
-
-        Some(ChartView {
-            area,
-            y_axis_width,
-            x_axis_height: X_AXIS_HEIGHT,
-            y_min: *y_min,
-            y_max: *y_max,
-            view_start_ts: chart_start_timestamp,
-            view_end_ts: chart_end_timestamp,
-            interval: self.interval,
-            is_live_tip: state.cursor_timestamp.is_none(),
-        })
+        let layout = DenseLayout::compute(&self.candles, self.numeric.clone(), area, state)?;
+        Some(layout.view(area, self.interval, state.cursor_timestamp.is_none()))
     }
 }
 
@@ -141,28 +98,97 @@ impl Styled for CandleStickChart {
     }
 }
 
-fn visible_price_range(
-    candles: &[Candle],
-    first_timestamp: i64,
-    last_timestamp: i64,
-    chart_start_timestamp: i64,
-    chart_end_timestamp: i64,
-) -> Option<(crate::Float, crate::Float)> {
-    let mut min_p: Option<crate::Float> = None;
-    let mut max_p: Option<crate::Float> = None;
-    for c in candles {
-        if c.timestamp < chart_start_timestamp || c.timestamp > chart_end_timestamp {
-            continue;
+/// Dense (index-based) window into `candles` for the current area + cursor.
+struct DenseLayout<'a> {
+    y_axis_width: u16,
+    chart_width: u16,
+    /// Slice of real candles painted left→right (already windowed).
+    visible: &'a [Candle],
+    /// Empty columns on the left when fewer bars than width (right-align to live tip).
+    column_offset: u16,
+    y_min: crate::Float,
+    y_max: crate::Float,
+    /// Inclusive bar indices into the full series that can still be panned to.
+    series_first_ts: i64,
+    series_last_ts: i64,
+    /// True when the left edge of the pane still has older bars available.
+    need_previous: bool,
+}
+
+impl<'a> DenseLayout<'a> {
+    fn compute(
+        candles: &'a [Candle],
+        numeric: Numeric,
+        area: Rect,
+        state: &CandleStickChartState,
+    ) -> Option<Self> {
+        if candles.is_empty() {
+            return None;
         }
-        if c.timestamp < first_timestamp || c.timestamp > last_timestamp {
-            continue;
+
+        let global_min = candles.iter().map(|c| c.low).min().unwrap();
+        let global_max = candles.iter().map(|c| c.high).max().unwrap();
+        let y_axis_width = YAxis::estimated_width(numeric, global_min, global_max);
+        if area.width <= y_axis_width || area.height <= X_AXIS_HEIGHT {
+            return None;
         }
-        min_p = Some(min_p.map_or(c.low, |m| m.min(c.low)));
-        max_p = Some(max_p.map_or(c.high, |m| m.max(c.high)));
+
+        let chart_width = area.width - y_axis_width;
+        let width = chart_width as usize;
+        if width == 0 {
+            return None;
+        }
+
+        let series_first_ts = candles.first().unwrap().timestamp;
+        let series_last_ts = candles.last().unwrap().timestamp;
+
+        // Window end = cursor bar (nearest at-or-before cursor) or live tip (last bar).
+        let end_idx = match state.cursor_timestamp {
+            Some(cursor_ts) => candles
+                .iter()
+                .rposition(|c| c.timestamp <= cursor_ts)
+                .unwrap_or(0),
+            None => candles.len() - 1,
+        };
+        let count = (end_idx + 1).min(width);
+        let start_idx = end_idx + 1 - count;
+        let visible = &candles[start_idx..=end_idx];
+
+        let y_min = visible.iter().map(|c| c.low).min().unwrap();
+        let y_max = visible.iter().map(|c| c.high).max().unwrap();
+
+        // Right-align when the series is shorter than the pane (empty left gutter).
+        let column_offset = (width - visible.len()) as u16;
+        let need_previous = start_idx > 0;
+
+        Some(Self {
+            y_axis_width,
+            chart_width,
+            visible,
+            column_offset,
+            y_min,
+            y_max,
+            series_first_ts,
+            series_last_ts,
+            need_previous,
+        })
     }
-    match (min_p, max_p) {
-        (Some(min), Some(max)) => Some((min, max)),
-        _ => None,
+
+    fn view(&self, area: Rect, interval: Interval, is_live_tip: bool) -> ChartView {
+        let column_timestamps: Vec<i64> = self.visible.iter().map(|c| c.timestamp).collect();
+        ChartView {
+            area,
+            y_axis_width: self.y_axis_width,
+            x_axis_height: X_AXIS_HEIGHT,
+            y_min: *self.y_min,
+            y_max: *self.y_max,
+            view_start_ts: *column_timestamps.first().unwrap_or(&0),
+            view_end_ts: *column_timestamps.last().unwrap_or(&0),
+            interval,
+            is_live_tip,
+            column_timestamps,
+            column_offset: self.column_offset,
+        }
     }
 }
 
@@ -172,158 +198,72 @@ impl StatefulWidget for CandleStickChart {
     /// render like:
     /// |---|-----------------------|
     /// | y |                       |
-    /// |   |                       |
-    /// | a |                       |
-    /// | x |                       |
-    /// | i |                       |
-    /// | s |       chart data      |
-    /// |   |                       |
-    /// | a |                       |
-    /// | r |                       |
-    /// | e |                       |
-    /// | a |                       |
+    /// | a |       chart data      |
+    /// | x |   (dense: 1 bar/col)  |
     /// |---|-----------------------|
     ///     |      x axis area      |
-    ///     |-----------------------|
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        if self.candles.is_empty() {
+        let Some(layout) = DenseLayout::compute(&self.candles, self.numeric.clone(), area, state)
+        else {
             state.last_view = None;
             return;
-        }
+        };
 
-        let global_min = self.candles.iter().map(|c| c.low).min().unwrap();
-        let global_max = self.candles.iter().map(|c| c.high).max().unwrap();
-
-        let y_axis_width: u16 =
-            YAxis::estimated_width(self.numeric.clone(), global_min, global_max);
-        if area.width <= y_axis_width || area.height <= X_AXIS_HEIGHT {
-            state.last_view = None;
-            return;
-        }
-
-        let chart_width = area.width - y_axis_width;
-        let chart_width_usize = chart_width as usize;
-
-        // with first/last dummies
-        let first_timestamp = self.candles.first().unwrap().timestamp;
-        let last_timestamp = self.candles.last().unwrap().timestamp;
-
-        let mut candles = Vec::new();
-        for i in (1..=(chart_width as i64 - 1)).rev() {
-            candles.push(
-                Candle::new(
-                    first_timestamp - i * self.interval as i64 * 1000,
-                    0.,
-                    0.,
-                    0.,
-                    0.,
-                )
-                .unwrap(),
-            );
-        }
-        candles.extend(self.candles.clone());
-        for i in 1..=(chart_width as i64 - 1) {
-            candles.push(
-                Candle::new(
-                    last_timestamp + i * self.interval as i64 * 1000,
-                    0.,
-                    0.,
-                    0.,
-                    0.,
-                )
-                .unwrap(),
-            );
-        }
-
-        let chart_end_timestamp = state.cursor_timestamp.unwrap_or(last_timestamp);
-        let chart_start_timestamp =
-            chart_end_timestamp - self.interval as i64 * 1000 * (chart_width_usize as i64 - 1);
-        let rendered_candles = candles
-            .iter()
-            .filter(|c| c.timestamp >= chart_start_timestamp && c.timestamp <= chart_end_timestamp)
-            .collect_vec();
-
-        if rendered_candles.is_empty() {
-            state.last_view = None;
-            return;
-        }
-
+        // Pan bounds: first/last *bar* timestamps (not calendar dummies).
         state.set_info(CandleStikcChartInfo::new(
-            candles[chart_width_usize - 1].timestamp,
-            candles.last().unwrap().timestamp,
+            layout.series_first_ts,
+            layout.series_last_ts,
             self.interval,
-            last_timestamp,
-            rendered_candles.first().unwrap().timestamp < first_timestamp,
+            layout.series_last_ts,
+            layout.need_previous,
         ));
 
-        let y_min = rendered_candles
-            .iter()
-            .filter(|c| c.timestamp >= first_timestamp && c.timestamp <= last_timestamp)
-            .map(|c| c.low)
-            .min()
-            .unwrap();
-        let y_max = rendered_candles
-            .iter()
-            .filter(|c| c.timestamp >= first_timestamp && c.timestamp <= last_timestamp)
-            .map(|c| c.high)
-            .max()
-            .unwrap();
-
         let price_height = area.height - X_AXIS_HEIGHT;
-        let y_axis = YAxis::new(self.numeric.clone(), price_height, y_min, y_max);
+        let y_axis = YAxis::new(
+            self.numeric.clone(),
+            price_height,
+            layout.y_min,
+            layout.y_max,
+        );
         let rendered_y_axis = y_axis.render();
-        // All buffer writes must use area origin so dual layout / status chrome work.
         for (y, string) in rendered_y_axis.iter().enumerate() {
             buf.set_string(area.x, area.y + y as u16, string, self.style);
         }
 
-        let timestamp_min = rendered_candles.first().unwrap().timestamp;
-        let timestamp_max = rendered_candles.last().unwrap().timestamp;
-
-        let x_axis = XAxis::new(
-            chart_width,
-            timestamp_min,
-            timestamp_max,
+        let column_timestamps: Vec<i64> = layout.visible.iter().map(|c| c.timestamp).collect();
+        let rendered_x_axis = XAxis::render_dense(
+            layout.chart_width,
+            layout.column_offset,
+            &column_timestamps,
             self.interval,
             state.cursor_timestamp.is_none(),
+            self.display_timezone,
         );
-        let rendered_x_axis = x_axis.render(self.display_timezone);
         buf.set_string(
-            area.x + y_axis_width - 2,
+            area.x + layout.y_axis_width - 2,
             area.y + area.height - X_AXIS_HEIGHT,
             "└──",
             self.style,
         );
         for (y, string) in rendered_x_axis.iter().enumerate() {
             buf.set_string(
-                area.x + y_axis_width,
+                area.x + layout.y_axis_width,
                 area.y + area.height - X_AXIS_HEIGHT + y as u16,
                 string,
                 self.style,
             );
         }
 
-        let mut offset = 0;
-        let mut prev_timestamp =
-            rendered_candles.first().unwrap().timestamp - self.interval as i64 * 1000;
-        for (x, candle) in rendered_candles.iter().enumerate() {
-            if candle.timestamp < first_timestamp || candle.timestamp > last_timestamp {
-                prev_timestamp = candle.timestamp;
-                continue;
-            }
-            let gap = (candle.timestamp - prev_timestamp) / (self.interval as i64 * 1000);
-            if gap > 1 {
-                offset += gap as u16 - 1;
-            }
+        // Dense paint: one real candle per column, right-aligned.
+        for (i, candle) in layout.visible.iter().enumerate() {
             let (candle_type, rendered) = candle.render(&y_axis);
-
             let color = match candle_type {
                 CandleType::Bearish => self.bearish_color,
                 CandleType::Bullish => self.bullish_color,
             };
-
+            let col = layout.column_offset + i as u16;
             for (y, char) in rendered.iter().enumerate() {
-                let cell_x = area.x + x as u16 + y_axis_width + offset;
+                let cell_x = area.x + layout.y_axis_width + col;
                 let cell_y = area.y + y as u16;
                 if cell_x < area.x + area.width && cell_y < area.y + price_height {
                     buf[(cell_x, cell_y)]
@@ -331,20 +271,9 @@ impl StatefulWidget for CandleStickChart {
                         .set_style(Style::default().fg(color));
                 }
             }
-            prev_timestamp = candle.timestamp;
         }
 
-        state.last_view = Some(ChartView {
-            area,
-            y_axis_width,
-            x_axis_height: X_AXIS_HEIGHT,
-            y_min: *y_min,
-            y_max: *y_max,
-            view_start_ts: chart_start_timestamp,
-            view_end_ts: chart_end_timestamp,
-            interval: self.interval,
-            is_live_tip: state.cursor_timestamp.is_none(),
-        });
+        state.last_view = Some(layout.view(area, self.interval, state.cursor_timestamp.is_none()));
     }
 }
 
@@ -403,6 +332,7 @@ mod tests {
 
     #[test]
     fn simple_candle() {
+        // Single bar is right-aligned into the price pane.
         let widget = CandleStickChart::new(Interval::OneMinute)
             .candles(vec![Candle::new(0, 0.9, 3.0, 0.0, 2.1).unwrap()]);
         let buffer = render(widget, 14, 8);
@@ -489,21 +419,24 @@ mod tests {
         );
     }
 
+    /// Sparse calendar timestamps (gap) still paint **adjacent** columns — dense packing.
     #[test]
-    fn simple_omitted_candles_with_x_label() {
+    fn gapped_timestamps_paint_dense_not_calendar() {
         let widget = CandleStickChart::new(Interval::OneMinute).candles(vec![
             Candle::new(0, 0.9, 3.0, 0.0, 2.1).unwrap(),
+            // 4 minutes later — calendar packing would leave empty columns; dense does not.
             Candle::new(240000, 2.0, 5.2, 0.9, 3.9).unwrap(),
         ]);
         let buffer = render(widget, 19, 8);
+        // Two candles in the last two columns (right-aligned), no gap columns between them.
         assert_eq!(
             buffer,
             Buffer::with_lines(vec![
-                "     5.200 ├ x xxx│",
-                "           │ x xxx│",
-                "           │ x│xxx┃",
-                "           │ x┃xxx│",
-                "     1.040 ├ x│xxx╵",
+                "     5.200 ├ xxxx │",
+                "           │ xxxx │",
+                "           │ xxxx│┃",
+                "           │ xxxx┃│",
+                "     1.040 ├ xxxx│╵",
                 "xxxxxxxxxxx└──────┴",
                 "xxxxxxxxxxxxx*00:04",
                 "xxxxxxxxxxxxxxxxxxx",
@@ -557,8 +490,6 @@ mod tests {
         );
     }
 
-    /// Dual layout / status chrome: widget must not paint at absolute (0,0) when
-    /// the layout `area` is offset.
     #[test]
     fn render_respects_area_origin() {
         let widget = CandleStickChart::new(Interval::OneMinute)
@@ -568,12 +499,10 @@ mod tests {
         let mut state = CandleStickChartState::default();
         let buffer = render_at(widget, full, area, &mut state);
 
-        // Outside the chart rect stays filler.
         assert_eq!(buffer[(0, 0)].symbol(), "·");
         assert_eq!(buffer[(4, 3)].symbol(), "·");
         assert_eq!(buffer[(5, 2)].symbol(), "·");
 
-        // Inside area has content (y-axis / candle glyphs).
         let mut painted = 0usize;
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
@@ -587,11 +516,66 @@ mod tests {
             "expected candle+axis paint inside offset area, painted={painted}"
         );
 
-        // last_view records the same absolute area for overlay helpers.
         let view = state.last_view.expect("view after render");
         assert_eq!(view.area, area);
         assert_eq!(view.candle_area().x, area.x + view.y_axis_width);
         assert_eq!(view.candle_area().y, area.y);
+        assert_eq!(view.painted_bars(), 1);
+    }
+
+    #[test]
+    fn dense_window_takes_last_n_bars() {
+        // 10 one-minute bars; narrow pane → only the latest columns.
+        let candles: Vec<_> = (0..10)
+            .map(|i| {
+                Candle::new(
+                    i * 60_000,
+                    1.0 + i as f64,
+                    2.0 + i as f64,
+                    0.5 + i as f64,
+                    1.5 + i as f64,
+                )
+                .unwrap()
+            })
+            .collect();
+        let widget = CandleStickChart::new(Interval::OneMinute).candles(candles);
+        // y-axis ~12 wide → chart_width = 19-12 = 7 for width 19? estimated_width depends on prices.
+        let area = Rect::new(0, 0, 40, 12);
+        let mut state = CandleStickChartState::default();
+        let view = widget
+            .compute_view(area, &state)
+            .expect("view");
+        // Live tip: last painted bar is the series tip.
+        assert_eq!(view.view_end_ts, 9 * 60_000);
+        assert!(view.painted_bars() > 0);
+        assert!(view.painted_bars() <= view.price_width() as usize);
+        // Columns are contiguous bar indices (no calendar holes).
+        for w in view.column_timestamps.windows(2) {
+            assert_eq!(w[1] - w[0], 60_000);
+        }
+
+        let _ = render_at(
+            CandleStickChart::new(Interval::OneMinute).candles(
+                (0..10)
+                    .map(|i| {
+                        Candle::new(
+                            i * 60_000,
+                            1.0 + i as f64,
+                            2.0 + i as f64,
+                            0.5 + i as f64,
+                            1.5 + i as f64,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            ),
+            Rect::new(0, 0, 40, 12),
+            area,
+            &mut state,
+        );
+        let last = state.last_view.unwrap();
+        assert_eq!(last.view_end_ts, view.view_end_ts);
+        assert_eq!(last.painted_bars(), view.painted_bars());
     }
 
     #[test]
@@ -603,9 +587,7 @@ mod tests {
         let widget = CandleStickChart::new(Interval::OneMinute).candles(candles.clone());
         let area = Rect::new(2, 1, 24, 10);
         let mut state = CandleStickChartState::default();
-        let computed = widget
-            .compute_view(area, &state)
-            .expect("compute_view");
+        let computed = widget.compute_view(area, &state).expect("compute_view");
         let widget2 = CandleStickChart::new(Interval::OneMinute).candles(candles);
         let full = Rect::new(0, 0, 40, 20);
         let _ = render_at(widget2, full, area, &mut state);
@@ -614,7 +596,7 @@ mod tests {
         assert_eq!(computed.y_axis_width, last.y_axis_width);
         assert_eq!(computed.view_start_ts, last.view_start_ts);
         assert_eq!(computed.view_end_ts, last.view_end_ts);
-        assert!((computed.y_min - last.y_min).abs() < 1e-9);
-        assert!((computed.y_max - last.y_max).abs() < 1e-9);
+        assert_eq!(computed.column_timestamps, last.column_timestamps);
+        assert_eq!(computed.column_offset, last.column_offset);
     }
 }

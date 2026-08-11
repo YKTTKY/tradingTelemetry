@@ -8,6 +8,9 @@ use crate::x_axis::Interval;
 ///
 /// Coordinates are absolute terminal cells so dual layout and chrome can place overlays
 /// on the same price/time grid as the candle widget.
+///
+/// Layout is **dense**: one real bar per column (no empty weekend/session columns).
+/// `column_timestamps` lists the open time (ms) of each painted candle column left→right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChartView {
     /// Full widget area (including axes).
@@ -19,14 +22,20 @@ pub struct ChartView {
     /// Visible price range (min/max of real candles in the window).
     pub y_min: f64,
     pub y_max: f64,
-    /// Inclusive window end timestamp (ms, candle open time).
+    /// Inclusive window end timestamp (ms) — last painted bar.
     pub view_end_ts: i64,
-    /// Inclusive window start timestamp (ms).
+    /// Inclusive window start timestamp (ms) — first painted bar.
     pub view_start_ts: i64,
-    /// Candle interval for this view.
+    /// Candle interval (product/metadata; placement is index-dense, not calendar).
     pub interval: Interval,
     /// True when the cursor is at the live tip (right edge follows latest bar).
     pub is_live_tip: bool,
+    /// Open timestamps (ms) for each candle column, left → right.
+    /// Length equals the number of painted candles (≤ price_width). Right-aligned in the pane
+    /// when fewer bars than columns (`column_offset` empty cells on the left).
+    pub column_timestamps: Vec<i64>,
+    /// Columns of left padding before the first painted candle (right-aligned live tip).
+    pub column_offset: u16,
 }
 
 impl ChartView {
@@ -51,16 +60,12 @@ impl ChartView {
     }
 
     /// Map a price to an absolute terminal row (top of candle area = high).
-    ///
-    /// Returns `None` if the price region has zero height or the price is outside
-    /// the scaled range by more than a tiny epsilon (still clamps into range when inside span).
     pub fn price_to_row(&self, price: f64) -> Option<u16> {
         let h = self.price_height();
         if h == 0 {
             return None;
         }
         let span = (self.y_max - self.y_min).max(f64::EPSILON);
-        // Row 0 is max price (top); row h-1 is min price (bottom of candle area).
         let frac = (self.y_max - price) / span;
         let row = (frac * (h as f64 - 1.0).max(0.0))
             .round()
@@ -78,33 +83,49 @@ impl ChartView {
         (price - self.y_min) / span * h
     }
 
-    /// Map a candle open timestamp (ms) to an absolute terminal column in the candle area.
+    /// Map a candle open timestamp (ms) to an absolute terminal column.
     ///
-    /// Uses linear time → column mapping (`view_start` + `interval`). Matches continuous
-    /// series; if the renderer inserts extra gap columns for missing bars, prefer
-    /// aligning overlays via the same gap-aware path as paint (see widget render).
+    /// Matches the **nearest** dense column by open time (equities skip non-trading sessions).
     pub fn timestamp_to_col(&self, ts_ms: i64) -> Option<u16> {
-        let w = self.price_width();
-        if w == 0 {
+        if self.column_timestamps.is_empty() {
             return None;
         }
-        let step = self.interval as i64 * 1000;
-        if step <= 0 {
-            return None;
+        let mut best_i = 0usize;
+        let mut best_d = (self.column_timestamps[0] - ts_ms).abs();
+        for (i, &t) in self.column_timestamps.iter().enumerate().skip(1) {
+            let d = (t - ts_ms).abs();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
         }
-        if ts_ms < self.view_start_ts || ts_ms > self.view_end_ts {
-            return None;
+        // Reject timestamps far outside the painted window (more than one interval past ends).
+        let step = (self.interval as i64 * 1000).max(1);
+        if best_d > step {
+            let first = *self.column_timestamps.first().unwrap();
+            let last = *self.column_timestamps.last().unwrap();
+            if ts_ms < first - step || ts_ms > last + step {
+                return None;
+            }
         }
-        let idx = (ts_ms - self.view_start_ts) / step;
-        if idx < 0 || idx >= w as i64 {
-            return None;
-        }
-        Some(self.area.x + self.y_axis_width + idx as u16)
+        Some(self.area.x + self.y_axis_width + self.column_offset + best_i as u16)
     }
 
-    /// Number of candle columns (one bar per cell) in the price pane.
+    /// Local canvas X (0-based within candle area) for a bar open timestamp (ms).
+    pub fn timestamp_to_local_x(&self, ts_ms: i64) -> Option<f64> {
+        let col = self.timestamp_to_col(ts_ms)?;
+        let left = self.area.x + self.y_axis_width;
+        Some((col - left) as f64 + 0.5)
+    }
+
+    /// Number of candle columns (full price pane width in cells).
     pub fn candle_columns(&self) -> u16 {
         self.price_width()
+    }
+
+    /// Number of painted bars in this view.
+    pub fn painted_bars(&self) -> usize {
+        self.column_timestamps.len()
     }
 }
 
@@ -116,6 +137,7 @@ mod tests {
     use crate::Interval;
 
     fn sample_view() -> ChartView {
+        // 3 dense bars right-aligned into 18 columns → offset 15
         ChartView {
             area: Rect::new(10, 5, 30, 13),
             y_axis_width: 12,
@@ -123,9 +145,11 @@ mod tests {
             y_min: 100.0,
             y_max: 200.0,
             view_start_ts: 1_000_000,
-            view_end_ts: 1_000_000 + 60_000 * 17, // 18 columns of 1m
+            view_end_ts: 1_000_000 + 60_000 * 2,
             interval: Interval::OneMinute,
             is_live_tip: true,
+            column_timestamps: vec![1_000_000, 1_060_000, 1_120_000],
+            column_offset: 15,
         }
     }
 
@@ -143,14 +167,15 @@ mod tests {
     fn price_to_row_maps_high_to_top() {
         let v = sample_view();
         assert_eq!(v.price_to_row(200.0), Some(5));
-        assert_eq!(v.price_to_row(100.0), Some(14)); // y=5 + 9
+        assert_eq!(v.price_to_row(100.0), Some(14));
     }
 
     #[test]
-    fn timestamp_to_col_maps_window() {
+    fn timestamp_to_col_uses_dense_columns() {
         let v = sample_view();
-        assert_eq!(v.timestamp_to_col(1_000_000), Some(22));
-        assert_eq!(v.timestamp_to_col(1_000_000 + 60_000), Some(23));
-        assert_eq!(v.timestamp_to_col(999_999), None);
+        // first bar at local col 15 → absolute x = 22 + 15
+        assert_eq!(v.timestamp_to_col(1_000_000), Some(22 + 15));
+        assert_eq!(v.timestamp_to_col(1_060_000), Some(22 + 16));
+        assert_eq!(v.timestamp_to_local_x(1_000_000), Some(15.5));
     }
 }

@@ -8,6 +8,7 @@ Vendored into Trading Telemetry from
 
 - All buffer writes offset by `area.x` / `area.y` so dual layout and chrome work.
 - Public `ChartView` / scale helpers for overlay compose on the same price/time scale.
+- **Dense packing:** one real bar per column (equity weekends/session gaps do not open empty columns). X-axis labels use actual bar open times.
 - Kept on Ratatui 0.30.x to match the host TUI.
 
 See `docs/adr/0003-vendor-candlestick-widget.md` in the monorepo root for why we vendor.
