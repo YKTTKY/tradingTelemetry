@@ -110,6 +110,7 @@ fn draw_help_popup(frame: &mut Frame) {
         section("Chart & layout"),
         row("l", "Toggle single ↔ dual-vertical"),
         row("Tab", "Focus next chart (dual)"),
+        row("← / →", "Pan focused chart through loaded history"),
         row("[ / ]", "Previous / next timeframe"),
         row("i", "Change instrument (focused chart)"),
         row("o", "Open / close indicator panel"),
@@ -824,8 +825,15 @@ fn draw_candles(
             format!("  {}", parts.join(" "))
         }
     };
+    let pan_hint = if chart.pan_at_oldest {
+        "  · oldest loaded"
+    } else if chart.pan_cursor_ts.is_some() {
+        "  · panned"
+    } else {
+        ""
+    };
     let subtitle = format!(
-        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}",
+        " O={:.2} H={:.2} L={:.2} C={:.2}  bars={}{}{}{}{}",
         last.open,
         last.high,
         last.low,
@@ -834,6 +842,7 @@ fn draw_candles(
         ma_hint,
         vp_hint,
         optional_hint,
+        pan_hint,
     );
 
     let block = Block::default()
@@ -849,8 +858,11 @@ fn draw_candles(
         return;
     }
 
-    // Keep pin placement cursor in view (widget pan cursor = window end timestamp, ms).
+    // Per-chart pan state (None = live tip). Pin placement may override the window.
     let mut candle_state = CandleStickChartState::default();
+    if let Some(ts_sec) = chart.pan_cursor_ts {
+        candle_state.set_cursor_timestamp(Some(ts_sec.saturating_mul(1000)));
+    }
     let place_bar_ts = app
         .frvp_place
         .as_ref()
@@ -1632,14 +1644,15 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
     let Some(vol_series) = chart.volume_series() else {
         return;
     };
+    let Some(end_idx) = Chart::pan_window_end_index(bars, chart.pan_cursor_ts) else {
+        return;
+    };
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
     let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
-    let start = if bars.len() <= max_bars {
-        0
-    } else {
-        bars.len() - max_bars
-    };
-    let visible_bars = &bars[start..];
+    // Align volume window end with chart pan (live tip when unpanned).
+    let end = end_idx + 1;
+    let start = end.saturating_sub(max_bars);
+    let visible_bars = &bars[start..end];
     let n = visible_bars.len() as f64;
     let values: Vec<f64> = vol_series
         .values

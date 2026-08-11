@@ -43,7 +43,8 @@ class StubLseClient:
         default_factory=dict
     )
     fail_with: Exception | None = None
-    candles_calls: list[tuple[str, str, str]] = field(default_factory=list)
+    # (symbol, lse_timeframe, order, limit)
+    candles_calls: list[tuple[str, str, str, int]] = field(default_factory=list)
     subscribed: list[str] = field(default_factory=list)
     unsubscribed: list[str] = field(default_factory=list)
     connect_calls: list[list[str] | None] = field(default_factory=list)
@@ -60,7 +61,7 @@ class StubLseClient:
         order: str = "asc",
         dataset: str | None = None,
     ) -> list[dict[str, Any]]:
-        self.candles_calls.append((symbol, timeframe, order))
+        self.candles_calls.append((symbol, timeframe, order, int(limit)))
         if self.fail_with is not None:
             raise self.fail_with
         rows = list(self.candles_by_key.get((symbol, timeframe), []))
@@ -270,7 +271,7 @@ def test_lse_fetch_history_maps_es_to_es_f_not_equity_ticker():
     assert result.instrument == "ES"
     assert result.bars[-1].close == 5540.0
     assert result.bars[-1].close != 72.67
-    assert stub.candles_calls == [("ES.F", "1d", "desc")]
+    assert stub.candles_calls == [("ES.F", "1d", "desc", 500)]
 
 
 def test_lse_fetch_history_maps_nq_to_nq_f():
@@ -303,7 +304,7 @@ def test_lse_fetch_history_maps_nq_to_nq_f():
     assert result.available is True
     assert result.instrument == "NQ"
     assert result.bars[-1].close == 19150.0
-    assert stub.candles_calls == [("NQ.F", "1d", "desc")]
+    assert stub.candles_calls == [("NQ.F", "1d", "desc", 500)]
 
 
 def test_lse_subscribe_uses_wire_symbol_es_f_for_domain_es():
@@ -343,7 +344,8 @@ def test_lse_fetch_history_maps_domain_tf_and_returns_bars():
     # Canonical instrument — never a :test suffix
     assert ":" not in result.instrument
     # Must request newest page (desc); returned series stays ascending for charts.
-    assert stub.candles_calls == [("SPY", "1d", "desc")]
+    # 1D default A2 cap is 500.
+    assert stub.candles_calls == [("SPY", "1d", "desc", 500)]
     assert result.bars[0].ts < result.bars[-1].ts
 
 
@@ -388,6 +390,44 @@ def test_lse_fetch_history_uses_newest_page_not_oldest():
     # Ancient page must not be included when limit trims to newest.
     assert all(b.close != 100.5 for b in result.bars)
     assert stub.candles_calls[-1][2] == "desc"
+    assert stub.candles_calls[-1][3] == 2
+
+
+def test_lse_history_limit_deeper_for_1m_than_1d():
+    """A2: short TFs request more newest bars so pan can scrub multi-session."""
+    from market_engine.vendor import (
+        HISTORY_LIMIT_BY_TIMEFRAME,
+        LseVendor,
+        history_limit_for,
+    )
+
+    assert history_limit_for("1m") == 3900
+    assert history_limit_for("1D") == 500
+    assert HISTORY_LIMIT_BY_TIMEFRAME["1m"] > HISTORY_LIMIT_BY_TIMEFRAME["1D"]
+
+    stub = StubLseClient(
+        candles_by_key={
+            ("SPY", "1m"): [
+                {
+                    "timestamp": "2024-07-01T14:00:00Z",
+                    "open": 540.0,
+                    "high": 540.5,
+                    "low": 539.5,
+                    "close": 540.2,
+                    "volume": 1000.0,
+                }
+            ],
+            ("SPY", "1d"): _STUB_SPY_1D,
+        }
+    )
+    vendor = LseVendor(client=stub)
+
+    vendor.fetch_history("SPY", "1m")
+    vendor.fetch_history("SPY", "1D")
+
+    by_tf = {tf: lim for (_sym, tf, _ord, lim) in stub.candles_calls}
+    assert by_tf["1m"] == 3900
+    assert by_tf["1d"] == 500
 
 
 def test_lse_fetch_history_unavailable_when_empty_rows():

@@ -125,6 +125,7 @@ Instrument ids are **canonical** (`SPY`, `QQQ`, …) — never a `:test` suffix.
 - Single and dual chart memories are independent; toggling layout restores each mode’s last instruments/timeframes.
 - Multiple chart slots may hold concurrent interest (dual layout). `chart_id` defaults to `primary` (single) or `top` (dual) when omitted.
 - Supported product timeframes: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1D`, `1W`. Outside that set (or unknown pairs) → `status: unavailable` with empty `bars` (no invented series).
+- **History depth (A2):** on chart interest the LSE adapter requests the **newest N** bars per timeframe (pan is local over this buffer; async older-edge fetch is later). Caps: `1m` **3900** (≈10 US equity RTH sessions), `3m` 2000, `5m` 1500, `15m` 1000, `30m` 750, `1h`/`4h`/`1D` 500, `1W` 260. See `market_engine.vendor.HISTORY_LIMIT_BY_TIMEFRAME`. Fake vendor returns full seeded/fixture series (no trim).
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/v1/workspace \

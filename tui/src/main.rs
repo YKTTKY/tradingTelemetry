@@ -382,6 +382,13 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Down if app.screen == Screen::Workspace => {
                 app.watchlist_select_delta(1);
             }
+            // Chart pan over loaded history (A2). Pin modes own ← → above.
+            KeyCode::Left if app.screen == Screen::Workspace => {
+                app.pan_focused_chart(-1);
+            }
+            KeyCode::Right if app.screen == Screen::Workspace => {
+                app.pan_focused_chart(1);
+            }
             KeyCode::Tab if app.screen == Screen::Workspace => {
                 app.focus_next();
             }

@@ -285,6 +285,15 @@ pub struct Chart {
     pub indicator_series: HashMap<String, IndicatorSeriesData>,
     /// Per-indicator-type presentation (overlay strength). Shared by all instances.
     pub type_styles: HashMap<String, IndicatorTypeStyle>,
+    /// Chart pan: window end as bar open time (unix **seconds**), or `None` = live tip.
+    ///
+    /// Live tip re-attach: when the user pans back to the newest loaded bar, this is
+    /// cleared so the right edge follows live bar updates again (no sticky cursor).
+    /// Pan is local over already-loaded bars only — never blocks on network (A2; edge
+    /// fetch of older bars is later ship B).
+    pub pan_cursor_ts: Option<i64>,
+    /// Soft hint: last pan step hit the oldest loaded bar (left wall of the buffer).
+    pub pan_at_oldest: bool,
 }
 
 impl Chart {
@@ -297,7 +306,29 @@ impl Chart {
             indicators: Vec::new(),
             indicator_series: HashMap::new(),
             type_styles: HashMap::new(),
+            pan_cursor_ts: None,
+            pan_at_oldest: false,
         }
+    }
+
+    /// Reset pan to live tip (e.g. on instrument/timeframe reload).
+    pub fn reset_pan(&mut self) {
+        self.pan_cursor_ts = None;
+        self.pan_at_oldest = false;
+    }
+
+    /// Index of the bar that ends the visible window (inclusive), or `None` if no bars.
+    ///
+    /// `None` pan cursor → live tip (last bar). Used by pan math and volume alignment.
+    pub fn pan_window_end_index(bars: &[OhlcvBar], pan_cursor_ts: Option<i64>) -> Option<usize> {
+        if bars.is_empty() {
+            return None;
+        }
+        let tip = bars.len() - 1;
+        Some(match pan_cursor_ts {
+            None => tip,
+            Some(ts) => bars.iter().rposition(|b| b.ts <= ts).unwrap_or(0),
+        })
     }
 
     /// Overlay strength for a type: stored type style, else product default.
@@ -757,8 +788,48 @@ impl App {
     pub fn request_chart_load(&mut self) {
         for chart in &mut self.charts {
             chart.series = ChartSeriesState::Loading;
+            chart.reset_pan();
         }
         self.needs_chart_load = true;
+    }
+
+    /// Pan the **focused** chart by `delta` bars over **loaded** history only.
+    ///
+    /// - Negative `delta` moves earlier (←); positive moves later (→).
+    /// - Clamps at oldest and newest loaded bars (no network).
+    /// - Returning to the newest bar re-attaches to the live tip (`pan_cursor_ts = None`).
+    /// - Sets `pan_at_oldest` when the left wall is hit (soft UI hint).
+    /// - No-op outside Normal workspace mode, or without an Available series.
+    /// - Pin placement / prompts own ← → elsewhere — callers should only invoke in Normal.
+    pub fn pan_focused_chart(&mut self, delta: i32) {
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        if !matches!(self.input_mode, InputMode::Normal) {
+            return;
+        }
+        if delta == 0 {
+            return;
+        }
+        let chart = self.focused_chart_mut();
+        let (new_cursor, at_oldest) = {
+            let ChartSeriesState::Available { bars } = &chart.series else {
+                return;
+            };
+            let Some(end_idx) = Chart::pan_window_end_index(bars, chart.pan_cursor_ts) else {
+                return;
+            };
+            let tip = bars.len() - 1;
+            let new_idx = (end_idx as i32 + delta).clamp(0, tip as i32) as usize;
+            if new_idx >= tip {
+                // Live tip re-attach: follow newest bar (and subsequent live updates).
+                (None, false)
+            } else {
+                (Some(bars[new_idx].ts), new_idx == 0)
+            }
+        };
+        chart.pan_cursor_ts = new_cursor;
+        chart.pan_at_oldest = at_oldest;
     }
 
     pub fn chart_load_started(&mut self) {
@@ -1918,7 +1989,9 @@ impl App {
     }
 
     fn request_focused_reload(&mut self) {
-        self.focused_chart_mut().series = ChartSeriesState::Loading;
+        let chart = self.focused_chart_mut();
+        chart.series = ChartSeriesState::Loading;
+        chart.reset_pan();
         self.needs_chart_load = true;
     }
 
@@ -2124,6 +2197,8 @@ impl App {
         chart.indicators = series.indicators;
         chart.indicators.extend(local_pending_pins);
         chart.indicator_series = series.series;
+        // Fresh interest payload: re-attach pan to live tip (independent of dual peer).
+        chart.reset_pan();
         match series.status.as_str() {
             "ok" => {
                 chart.series = ChartSeriesState::Available { bars: series.bars };
@@ -2259,6 +2334,178 @@ mod tests {
         assert_eq!(chart.overlay_strength("ma"), DEFAULT_MA_STRENGTH);
         assert_eq!(chart.overlay_strength("session_vp"), DEFAULT_VP_STRENGTH);
         assert_eq!(chart.overlay_strength("fixed_range_vp"), DEFAULT_VP_STRENGTH);
+    }
+
+    fn sample_bars(n: usize, start_ts: i64, period: i64) -> Vec<OhlcvBar> {
+        (0..n)
+            .map(|i| {
+                let px = 100.0 + i as f64;
+                OhlcvBar {
+                    ts: start_ts + i as i64 * period,
+                    open: px,
+                    high: px + 1.0,
+                    low: px - 1.0,
+                    close: px,
+                    volume: 1_000.0,
+                }
+            })
+            .collect()
+    }
+
+    fn app_with_available_bars(bars: Vec<OhlcvBar>) -> App {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars,
+            chart_id: Some("primary".into()),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn pan_left_moves_over_loaded_bars_and_clamps_at_oldest() {
+        let bars = sample_bars(5, 1_000, 60);
+        let mut app = app_with_available_bars(bars.clone());
+        assert_eq!(app.chart().pan_cursor_ts, None);
+        assert!(!app.chart().pan_at_oldest);
+
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[3].ts));
+        assert!(!app.chart().pan_at_oldest);
+
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[2].ts));
+
+        // Jump past the left wall — clamp at oldest loaded bar.
+        app.pan_focused_chart(-100);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[0].ts));
+        assert!(app.chart().pan_at_oldest);
+
+        // Further left stays clamped; soft-hint flag remains.
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[0].ts));
+        assert!(app.chart().pan_at_oldest);
+    }
+
+    #[test]
+    fn pan_right_to_tip_reattaches_live() {
+        let bars = sample_bars(4, 1_000, 60);
+        let mut app = app_with_available_bars(bars.clone());
+        app.pan_focused_chart(-2);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[1].ts));
+
+        app.pan_focused_chart(1);
+        assert_eq!(app.chart().pan_cursor_ts, Some(bars[2].ts));
+        assert!(!app.chart().pan_at_oldest);
+
+        // Reach newest loaded bar → clear cursor so live updates stick to the tip.
+        app.pan_focused_chart(1);
+        assert_eq!(app.chart().pan_cursor_ts, None);
+        assert!(!app.chart().pan_at_oldest);
+
+        // Extra right stays live-attached.
+        app.pan_focused_chart(5);
+        assert_eq!(app.chart().pan_cursor_ts, None);
+    }
+
+    #[test]
+    fn pan_is_independent_per_dual_chart() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "dual-vertical".into(),
+            charts: vec![
+                WorkspaceChartSnapshot {
+                    id: "top".into(),
+                    instrument: "QQQ".into(),
+                    timeframe: "1D".into(),
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
+                WorkspaceChartSnapshot {
+                    id: "bottom".into(),
+                    instrument: "SPY".into(),
+                    timeframe: "1D".into(),
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
+            ],
+            watchlists: vec![],
+            active_watchlist_id: String::new(),
+        });
+        let top_bars = sample_bars(5, 2_000, 60);
+        let bottom_bars = sample_bars(5, 3_000, 60);
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "QQQ".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: top_bars.clone(),
+            chart_id: Some("top".into()),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        app.apply_chart_series(ChartInterestResponse {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            status: "ok".into(),
+            bars: bottom_bars.clone(),
+            chart_id: Some("bottom".into()),
+            indicators: vec![],
+            series: HashMap::new(),
+        });
+        assert_eq!(app.focused, 0);
+        app.pan_focused_chart(-2);
+        assert_eq!(app.charts[0].pan_cursor_ts, Some(top_bars[2].ts));
+        assert_eq!(app.charts[1].pan_cursor_ts, None);
+
+        app.focus_next();
+        assert_eq!(app.focused, 1);
+        app.pan_focused_chart(-1);
+        assert_eq!(app.charts[0].pan_cursor_ts, Some(top_bars[2].ts));
+        assert_eq!(app.charts[1].pan_cursor_ts, Some(bottom_bars[3].ts));
+    }
+
+    #[test]
+    fn pan_noop_when_indicator_panel_open() {
+        let bars = sample_bars(5, 1_000, 60);
+        let mut app = app_with_available_bars(bars);
+        app.input_mode = InputMode::IndicatorPanel;
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, None);
+    }
+
+    #[test]
+    fn live_bar_update_keeps_panned_cursor() {
+        let bars = sample_bars(3, 1_000, 60);
+        let mut app = app_with_available_bars(bars.clone());
+        app.pan_focused_chart(-1);
+        let pinned = app.chart().pan_cursor_ts;
+        assert_eq!(pinned, Some(bars[1].ts));
+
+        app.apply_bar_update(BarUpdateEvent {
+            instrument: "SPY".into(),
+            timeframe: "1D".into(),
+            completed_bars: vec![],
+            bar: OhlcvBar {
+                ts: bars[2].ts,
+                open: 999.0,
+                high: 1000.0,
+                low: 998.0,
+                close: 999.5,
+                volume: 50.0,
+            },
+        });
+        // Still panned away from tip — cursor unchanged while series tip updates.
+        assert_eq!(app.chart().pan_cursor_ts, pinned);
+        match &app.chart().series {
+            ChartSeriesState::Available { bars: b } => assert_eq!(b[2].close, 999.5),
+            other => panic!("expected Available, got {other:?}"),
+        }
     }
 
     #[test]

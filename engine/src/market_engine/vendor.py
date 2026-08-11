@@ -138,6 +138,36 @@ V1_TIMEFRAMES: frozenset[str] = frozenset(
     {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"}
 )
 
+# A2 deeper initial history (newest N bars on chart interest).
+# Edge-fetch of still-older bars at the left wall is a later ship (B); pan never
+# blocks on network — it only moves over this preloaded buffer.
+#
+# Caps (documented product defaults):
+#   1m  → 3900 ≈ 10 US equity RTH sessions (6.5h × 60). Futures 24×7 ≈ ~2.7 calendar days.
+#   3m  → 2000 ≈ ~10 RTH sessions
+#   5m  → 1500
+#   15m → 1000
+#   30m → 750
+#   1h / 4h / 1D → 500 (prior default depth is enough for multi-week scrub)
+#   1W  → 260  (~5 years of weekly bars)
+DEFAULT_HISTORY_LIMIT = 500
+HISTORY_LIMIT_BY_TIMEFRAME: dict[str, int] = {
+    "1m": 3900,
+    "3m": 2000,
+    "5m": 1500,
+    "15m": 1000,
+    "30m": 750,
+    "1h": 500,
+    "4h": 500,
+    "1D": 500,
+    "1W": 260,
+}
+
+
+def history_limit_for(timeframe: str) -> int:
+    """Newest-bar count to request for ``timeframe`` on chart interest (A2)."""
+    return HISTORY_LIMIT_BY_TIMEFRAME.get(timeframe.strip(), DEFAULT_HISTORY_LIMIT)
+
 # Domain timeframe → LSE vault resolution (case-sensitive product vs lower-case API).
 DOMAIN_TO_LSE_TIMEFRAME: dict[str, str] = {
     "1m": "1m",
@@ -514,7 +544,8 @@ class LseVendor:
         client: Any | None = None,
         *,
         api_key: str | None = None,
-        history_limit: int = 500,
+        history_limit: int | None = None,
+        history_limits: dict[str, int] | None = None,
         start_stream: bool = True,
     ) -> None:
         if client is None:
@@ -522,7 +553,12 @@ class LseVendor:
 
             client = LSE(api_key=api_key)
         self._client = client
-        self._history_limit = history_limit
+        # When set, forces every timeframe to this limit (tests / ops override).
+        self._history_limit_override = history_limit
+        self._history_limits = {
+            **HISTORY_LIMIT_BY_TIMEFRAME,
+            **(history_limits or {}),
+        }
         self._start_stream = start_stream
         self._handlers: dict[str, list[TickHandler]] = {}
         # LSE wire symbol → domain instrument for tick fan-out.
@@ -534,6 +570,12 @@ class LseVendor:
         on = getattr(self._client, "on", None)
         if callable(on):
             on("tick", self._on_lse_tick)
+
+    def history_limit_for(self, timeframe: str) -> int:
+        """Newest-bar count used for this timeframe (A2 caps, or constructor override)."""
+        if self._history_limit_override is not None:
+            return int(self._history_limit_override)
+        return int(self._history_limits.get(timeframe.strip(), DEFAULT_HISTORY_LIMIT))
 
     def fetch_history(self, instrument: str, timeframe: str) -> HistoryResult:
         instrument = instrument.strip().upper()
@@ -547,6 +589,7 @@ class LseVendor:
             )
         lse_tf = DOMAIN_TO_LSE_TIMEFRAME[timeframe]
         lse_sym = domain_to_lse_instrument(instrument)
+        limit = self.history_limit_for(timeframe)
         try:
             # Newest page first: vault order=asc+limit returns the *oldest* rows
             # (e.g. SPY 1m from 2003). Mixing that with live 2020s prices collapses
@@ -554,7 +597,7 @@ class LseVendor:
             rows = self._client.candles(
                 lse_sym,
                 lse_tf,
-                limit=self._history_limit,
+                limit=limit,
                 order="desc",
             )
         except Exception:
