@@ -5,12 +5,8 @@ use chrono_tz::America::New_York;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{
-        canvas::{Canvas, Rectangle},
-        Block, Borders, Clear, Paragraph, StatefulWidget, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap},
     Frame,
 };
 use tui_candlestick_chart::{
@@ -1860,13 +1856,22 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
     let Some(end_idx) = Chart::pan_window_end_index(bars, chart.pan_cursor_ts) else {
         return;
     };
-    let inner_w = area.width.saturating_sub(2).max(8) as usize;
-    let max_bars = inner_w.saturating_mul(2).div_ceil(3).max(16).min(inner_w);
-    // Align volume window end with chart pan (live tip when unpanned).
+    // Type style strength → subplot bar intensity (Volume is not a price overlay).
+    let strength = chart.overlay_strength("volume");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Volume · str {strength:.2} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // One solid bar column per terminal cell (filled █ / ▄ — not hollow Canvas outlines).
+    let max_bars = inner.width as usize;
     let end = end_idx + 1;
     let start = end.saturating_sub(max_bars);
     let visible_bars = &bars[start..end];
-    let n = visible_bars.len() as f64;
     let values: Vec<f64> = vol_series
         .values
         .iter()
@@ -1875,37 +1880,35 @@ fn draw_volume_pane(frame: &mut Frame, area: Rect, chart: &Chart, bars: &[OhlcvB
         .map(|v| v.unwrap_or(0.0))
         .collect();
     let max_v = values.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
-    // Type style strength → subplot bar intensity (Volume is not a price overlay).
-    let strength = chart.overlay_strength("volume");
-    // Slightly wider stems at high strength so intensity reads as more than just hue dim.
-    let body_w = (0.30 + 0.40 * strength.clamp(0.0, 1.0)).clamp(0.25, 0.75);
-    let half_w = body_w / 2.0;
+    let pane_h = inner.height as f64;
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Volume · str {strength:.2} "));
-
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(symbols::Marker::Braille)
-        .x_bounds([0.0, n])
-        .y_bounds([0.0, max_v * 1.05])
-        .paint(move |ctx| {
-            for (i, (bar, &vol)) in visible_bars.iter().zip(values.iter()).enumerate() {
-                let x = i as f64 + 0.5;
-                let up = bar.close >= bar.open;
-                let color = volume_bar_color(up, strength);
-                let height = vol.max(max_v * 0.02);
-                ctx.draw(&Rectangle {
-                    x: x - half_w,
-                    y: 0.0,
-                    width: body_w,
-                    height,
-                    color,
-                });
-            }
-        });
-    frame.render_widget(canvas, area);
+    let buf = frame.buffer_mut();
+    for (i, (bar, &vol)) in visible_bars.iter().zip(values.iter()).enumerate() {
+        if i as u16 >= inner.width {
+            break;
+        }
+        let x = inner.x + i as u16;
+        let up = bar.close >= bar.open;
+        let color = volume_bar_color(up, strength);
+        // Fraction of pane height; always at least a half-block so quiet bars stay visible.
+        let frac = (vol / max_v).clamp(0.0, 1.0);
+        let cells = (frac * pane_h).max(0.5);
+        let full_rows = cells.floor() as u16;
+        let half = cells - full_rows as f64 >= 0.5;
+        // Paint bottom-up solid fill.
+        for row in 0..full_rows.min(inner.height) {
+            let y = inner.y + inner.height - 1 - row;
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol("█");
+            cell.set_style(Style::default().fg(color));
+        }
+        if half && full_rows < inner.height {
+            let y = inner.y + inner.height - 1 - full_rows;
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol("▄");
+            cell.set_style(Style::default().fg(color));
+        }
+    }
 }
 
 fn feed_line(app: &App) -> Line<'static> {
