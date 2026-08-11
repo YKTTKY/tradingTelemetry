@@ -106,24 +106,29 @@ fn draw_help_popup(frame: &mut Frame) {
         row("q", "Quit the app"),
         row("Esc", "Close help, prompt, or panel (Welcome: quit)"),
         section("Welcome"),
-        row("Enter", "Open workspace"),
-        section("Chart & layout"),
-        row("l", "Toggle single ↔ dual-vertical"),
-        row("Tab", "Focus next chart (dual)"),
+        row("Enter", "Open workspace (Welcome only; does not load watchlist symbols)"),
+        section("Normal mode · input focus"),
+        row("↑ / ↓", "Watchlist row select (sidebar)"),
         row("← / →", "Pan focused chart through loaded history"),
+        row("Tab", "Focus next chart (dual layout)"),
+        row("l", "Toggle single ↔ dual-vertical"),
         row("[ / ]", "Previous / next timeframe"),
         row("i", "Change instrument (focused chart)"),
         row("o", "Open / close indicator panel"),
-        section("Watchlist"),
+        Line::from(Span::styled(
+            "  Chart chrome: forming-bar countdown per chart (dual = two independent)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        section("Watchlist (Normal mode)"),
         row("w", "Show / hide sidebar"),
         row("n / p", "Next / previous watchlist sheet"),
-        row("↑ / ↓", "Move selection in active list"),
         row("Enter / Space", "Load selected symbol on focused chart (keep TF + indicators)"),
-        row("r", "Rename active watchlist sheet (Normal mode)"),
+        row("r", "Rename active watchlist sheet"),
         row("a", "Add symbol to active list"),
         row("x / d", "Remove selected symbol"),
-        section("Indicator panel"),
-        row("↑ / ↓", "Select indicator row"),
+        section("Indicator panel (owns keys; watchlist inactive)"),
+        row("↑ / ↓", "Select indicator row (not watchlist)"),
+        row("← / →", "Not pan — panel owns focus while open"),
         row("Space / Enter", "Enable / disable selected (incl. Fixed Range + Anchored)"),
         row("m", "Add MA stack (SMA 10 / 60 / 200)"),
         row("v", "Add Volume (max 1)"),
@@ -142,18 +147,18 @@ fn draw_help_popup(frame: &mut Frame) {
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
         row("x", "Remove selected indicator"),
         row("o / Esc", "Close indicator panel"),
-        section("Fixed Range pin placement"),
+        section("Fixed Range pin placement (← → move pin, not pan)"),
         row("← / →", "Move pin cursor bar-by-bar (h/l also)"),
         row("[ / ]", "Jump pin cursor 10 bars"),
         row("Enter", "Lock start pin, then lock end pin"),
         row("Esc", "Cancel placement (drops new FRVP)"),
-        section("Anchored VP pin placement"),
+        section("Anchored VP pin placement (← → move pin, not pan)"),
         row("← / →", "Move anchor pin bar-by-bar (h/l also)"),
         row("[ / ]", "Jump pin cursor 10 bars"),
         row("9", "Snap to cash open 09:30 America/New_York"),
         row("Enter", "Lock anchor (profile builds to now)"),
         row("Esc", "Cancel placement (drops new AVP)"),
-        section("Text prompts"),
+        section("Text prompts (modal; own keys)"),
         row("Enter", "Apply instrument, watchlist add, or rename"),
         row("Esc", "Cancel prompt"),
         Line::from(Span::styled(
@@ -334,7 +339,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
     } else {
         Paragraph::new(format!(
-            "{} · {} · {}  ·  ? help  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w list  ·  Enter/Sp chart  ·  r rename  ·  n/p sheet  ·  a add  ·  x rem  ·  q  [{}]",
+            "{} · {} · {}  ·  ? help  ·  ←→ pan  ·  ↑↓ list  ·  l layout  ·  [ ] tf  ·  i instr  ·  o ind{}  ·  w list  ·  Enter/Sp chart  ·  r rename  ·  n/p sheet  ·  a add  ·  x rem  ·  q  [{}]",
             app.layout.as_str(),
             focused.instrument,
             focused.timeframe,
@@ -631,8 +636,9 @@ fn draw_charts(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_chart(frame: &mut Frame, area: Rect, app: &App, chart: &Chart, focused: bool) {
-    let focus_mark = if focused { "● " } else { "  " };
-    let title = format!(" {focus_mark}{} ", chart.title());
+    // Wall-clock countdown to next bar open of this chart's timeframe (per-chart chrome).
+    let now_ts = Utc::now().timestamp();
+    let title = chart.chrome_title(focused, now_ts);
     match &chart.series {
         ChartSeriesState::Idle | ChartSeriesState::Loading => {
             let body = Paragraph::new("Loading history…")

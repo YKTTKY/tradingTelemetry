@@ -9,6 +9,7 @@ use crate::ipc::{
     WorkspaceSnapshot,
 };
 use crate::overlay::{clamp_strength, default_strength_for_type};
+use crate::timeframe::{format_bar_countdown, forming_bar_remaining_secs};
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
 pub const UNAVAILABLE_COPY: &str = "Data Currently not Available";
@@ -382,6 +383,28 @@ impl Chart {
 
     pub fn title(&self) -> String {
         format!("{} · {}", self.instrument, self.timeframe)
+    }
+
+    /// Forming-bar countdown label for chart chrome (`m:ss` / …), when a live series tip exists.
+    ///
+    /// Uses the **last loaded bar** (forming incomplete tip) and wall-clock `now_ts` (unix seconds).
+    /// Independent per chart (dual layout shows two countdowns). Returns `None` when the series
+    /// is unavailable/empty/unknown TF so the UI does not invent times.
+    pub fn forming_bar_countdown_label(&self, now_ts: i64) -> Option<String> {
+        let ChartSeriesState::Available { bars } = &self.series else {
+            return None;
+        };
+        let last = bars.last()?;
+        forming_bar_remaining_secs(&self.timeframe, last.ts, now_ts).map(format_bar_countdown)
+    }
+
+    /// Chart block title including optional forming-bar countdown.
+    pub fn chrome_title(&self, focused: bool, now_ts: i64) -> String {
+        let focus_mark = if focused { "● " } else { "  " };
+        match self.forming_bar_countdown_label(now_ts) {
+            Some(cd) => format!(" {focus_mark}{} · {cd} ", self.title()),
+            None => format!(" {focus_mark}{} ", self.title()),
+        }
     }
 
     pub fn has_volume(&self) -> bool {
@@ -2477,6 +2500,105 @@ mod tests {
         app.input_mode = InputMode::IndicatorPanel;
         app.pan_focused_chart(-1);
         assert_eq!(app.chart().pan_cursor_ts, None);
+    }
+
+    #[test]
+    fn watchlist_nav_blocked_when_indicator_panel_open() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
+            watchlists: vec![WatchlistSnapshot {
+                id: "wl1".into(),
+                name: "Core".into(),
+                symbols: vec!["SPY".into(), "QQQ".into(), "IWM".into()],
+            }],
+            active_watchlist_id: "wl1".into(),
+        });
+        app.watchlist_visible = true;
+        app.watchlist_selected = 0;
+        app.input_mode = InputMode::IndicatorPanel;
+
+        app.watchlist_select_delta(1);
+        assert_eq!(app.watchlist_selected, 0, "↑↓ must not move watchlist under panel");
+        assert!(!app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "SPY");
+    }
+
+    #[test]
+    fn pin_placement_left_right_moves_pin_not_pan() {
+        let bars = sample_bars(5, 1_000, 60);
+        let mut app = app_with_available_bars(bars);
+        // Simulate FRVP pin placement mode (owns ← →).
+        app.input_mode = InputMode::FrvpPlacing;
+        app.frvp_place = Some(FrvpPlaceState {
+            chart_id: "primary".into(),
+            indicator_id: "frvp-1".into(),
+            phase: FrvpPinPhase::Start,
+            cursor_bar: 2,
+            start_bar: None,
+            is_new: true,
+        });
+
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, None, "pan must no-op in pin mode");
+
+        app.frvp_place_move(-1);
+        assert_eq!(
+            app.frvp_place.as_ref().map(|p| p.cursor_bar),
+            Some(1),
+            "← moves pin cursor"
+        );
+        assert_eq!(app.chart().pan_cursor_ts, None);
+    }
+
+    #[test]
+    fn forming_bar_countdown_label_from_available_series() {
+        // 1m tip open at 1_000; at now=1_025 remaining is 35s → "0:35".
+        let bars = sample_bars(3, 1_000, 60);
+        let mut chart = Chart::default_single();
+        chart.timeframe = "1m".into();
+        chart.series = ChartSeriesState::Available { bars: bars.clone() };
+        assert_eq!(
+            chart.forming_bar_countdown_label(1_000 + 2 * 60 + 25),
+            Some("0:35".into())
+        );
+        // Loading / empty: no invented countdown.
+        chart.series = ChartSeriesState::Loading;
+        assert_eq!(chart.forming_bar_countdown_label(1_200), None);
+        chart.series = ChartSeriesState::Available { bars: vec![] };
+        assert_eq!(chart.forming_bar_countdown_label(1_200), None);
+    }
+
+    #[test]
+    fn dual_charts_have_independent_countdowns() {
+        // Both tips open at t=10_000; now is 10s into the forming bar.
+        let mut top = Chart::default_dual_top();
+        top.timeframe = "1m".into();
+        top.series = ChartSeriesState::Available {
+            bars: sample_bars(2, 9_940, 60), // tip open 10_000
+        };
+        let mut bottom = Chart::default_dual_bottom();
+        bottom.timeframe = "5m".into();
+        bottom.series = ChartSeriesState::Available {
+            bars: sample_bars(2, 9_700, 300), // tip open 10_000
+        };
+        let now = 10_010;
+        // 1m → 50s left; 5m → 290s left (independent of dual peer).
+        assert_eq!(top.forming_bar_countdown_label(now), Some("0:50".into()));
+        assert_eq!(bottom.forming_bar_countdown_label(now), Some("4:50".into()));
+        let top_title = top.chrome_title(true, now);
+        let bottom_title = bottom.chrome_title(false, now);
+        assert!(top_title.contains("0:50"), "{top_title}");
+        assert!(bottom_title.contains("4:50"), "{bottom_title}");
+        assert!(!top_title.contains("4:50"));
     }
 
     #[test]
