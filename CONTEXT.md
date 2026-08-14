@@ -5,8 +5,9 @@ Personal day-trading terminal (TUI) for watching instruments, charts, and derive
 ## Delivery phases (resolved)
 
 - **Phase A — Chart terminal (first ship):** LSE primary, dual/single layout, watchlists, naked→restored indicators, Session/Fixed Range/Anchored VP, MA, Volume, feed status, HTTP+WS engine+TUI. **No paper trading yet.** Status: done (see `.scratch/phase-a-chart-terminal/`).
-- **Phase A.1 — Chart UX polish (current ship):** vendored cell-based candles + axes, overlay compose + type overlay strength, chart pan + deeper short-TF history (A2), bar countdown, watchlist→chart + rename, indicator panel Available|Current. Async history edge-fetch (B) later. Spec: `.scratch/phase-a1-chart-ux-polish/spec.md`. **No paper trading.**
-- **Phase B — Paper M1+nudge (next after A.1):** multi account settings (as specified), bar-touch fills, order panel, TP/SL lines, keyboard nudge, trade marks (persistent, hideable pairs), positions / filled history / balance history, SQLite. Tick fills and TV-style drag later.
+- **Phase A.1 — Chart UX polish:** vendored cell-based candles + axes, overlay compose + type overlay strength, chart pan + deeper short-TF history (A2), bar countdown, watchlist→chart + rename, indicator panel Available|Current. Spec: `.scratch/phase-a1-chart-ux-polish/spec.md`. Status: done. **No paper trading.**
+- **Phase A.1.1 — Aligned live bars (current ship):** wall clock (New York time) on Feed status; forming bars follow wall clock from live last price when vendor tick time is stale; visible **feed delay**; no new candle renderer. Spec: `.scratch/phase-a1.1-aligned-live-bars/spec.md`. Does **not** fix LSE vault/`tick.ts`. **No paper trading.**
+- **Phase B — Paper M1+nudge (next after A.1.1):** multi account settings (as specified), bar-touch fills, order panel, TP/SL lines, keyboard nudge, trade marks (persistent, hideable pairs), positions / filled history / balance history, SQLite. Tick fills and TV-style drag later.
 
 ## Architecture (v1 intent)
 
@@ -58,7 +59,31 @@ _Avoid_: Interval, resolution, period (unless matching a vendor field name at th
 
 **Bar countdown**:
 Per-chart display of **time remaining in the forming (incomplete) bar** for that chart’s timeframe — i.e. countdown to the next candle open of the selected timeframe. Shown in that chart’s chrome (title/subtitle), not only as a global status. Dual layout: each chart has its own countdown.
-_Avoid_: Session-remaining clock; time since last tick; a single global countdown for all charts
+_Avoid_: Session-remaining clock; time since last tick; a single global countdown for all charts; using countdown as the only stale-tape signal
+
+**Feed status**:
+Engine + vendor connectivity chrome (connected / disconnected, vendor mode, heartbeat). Not a price, not last bar time, not proof that every instrument tip is current.
+_Avoid_: Treating connected as “all series are live”
+
+**New York time**:
+The terminal’s civil timezone: IANA **America/New_York**. That zone is still seasonal (**EDT** in summer, **EST** in winter) until U.S. law and tzdata say otherwise. Product copy may say **ET** / **New York**.
+_Avoid_: Frozen year-round EST; machine local time; claiming EST/EDT have been abolished
+
+**Wall clock**:
+Current **New York time** shown on Feed status next to the heartbeat. Not last bar time and not vendor tape time.
+_Avoid_: Printing the raw unix heartbeat as the clock; calling wall clock “last price time”
+
+**Last bar time**:
+The **open** of the newest bar on that chart (the rightmost candle). Per chart; dual layout has two. Not last print, not wall clock.
+_Avoid_: Last print; last price time; a single last-bar time on Feed status
+
+**Feed delay**:
+How far the latest **vendor tick timestamp** sits behind **wall clock**. Shown so a stale or wrong tape clock is obvious while candles stay aligned. Distinct from bar countdown and from last bar time.
+_Avoid_: Using the X-axis split (one symbol behind another) as the only delay signal; calling this last bar time
+
+**Aligned live bars**:
+Forming bars advance with **wall clock** from live last prices so instruments that share an index (e.g. QQQ and NQ) print together. A vendor tick timestamp that is behind wall clock does not place those bars; that lag belongs on **feed delay**.
+_Avoid_: Dropping a live last price because vendor time is stale; painting delayed vendor time on the axis so related symbols look unsynced
 
 **Workspace**:
 The user's chart shell after the welcome screen: layout mode plus each chart's instrument and timeframe.
