@@ -1,6 +1,6 @@
 # Phase A.1 — Chart UX polish
 
-Status: ready
+Status: done
 
 ## Problem Statement
 
