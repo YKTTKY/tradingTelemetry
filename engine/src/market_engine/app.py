@@ -22,6 +22,7 @@ from market_engine.vendor import (
     Bar,
     MarketDataVendor,
     OptionsChainResult,
+    Tick,
     default_vendor,
 )
 from market_engine.workspace import VALID_LAYOUTS, WorkspaceStore
@@ -145,8 +146,16 @@ def create_app(
     def on_quote_update(symbol: str, payload: dict[str, Any]) -> None:
         hub.note_quote_update(symbol, payload)
 
+    def on_live_tick(tick: Tick) -> None:
+        state.note_vendor_tick(tick.ts)
+
     charts.on_bar_update = on_bar_update
-    quotes = QuoteService(vendor=market_vendor, on_quote_update=on_quote_update)
+    charts.on_live_tick = on_live_tick
+    quotes = QuoteService(
+        vendor=market_vendor,
+        on_quote_update=on_quote_update,
+        on_live_tick=on_live_tick,
+    )
 
     def sync_watchlist_quotes() -> list[dict[str, Any]]:
         """Arm quote interest for every symbol across all lists."""
@@ -334,15 +343,23 @@ def create_app(
         await websocket.accept()
         await hub.add_client(websocket)
         feed_state: FeedState = app.state.feed
+
+        def heartbeat_event() -> dict[str, Any]:
+            return {
+                "type": "heartbeat",
+                "ts": time.time(),
+                "last_vendor_tick_ts": feed_state.last_vendor_tick_ts,
+            }
+
         try:
             await hub.send(websocket, feed_state.to_ws_event())
             # Trivial live event so clients can verify the stream is alive.
-            await hub.send(websocket, {"type": "heartbeat", "ts": time.time()})
+            await hub.send(websocket, heartbeat_event())
             # Keep the connection open until the client disconnects.
             # Live bar_update / quote_update / indicator_update frames from hub.
             while True:
                 await asyncio.sleep(1.0)
-                await hub.send(websocket, {"type": "heartbeat", "ts": time.time()})
+                await hub.send(websocket, heartbeat_event())
         except WebSocketDisconnect:
             return
         finally:

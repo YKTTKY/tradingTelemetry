@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from market_engine.vendor import MarketDataVendor, Tick
+from market_engine.vendor import MarketDataVendor, Tick, TickHandler
 
 QuoteUpdateCallback = Callable[[str, dict[str, Any]], None]
 
@@ -74,6 +74,7 @@ class QuoteService:
 
     vendor: MarketDataVendor
     on_quote_update: QuoteUpdateCallback | None = None
+    on_live_tick: TickHandler | None = None
     _rows: dict[str, QuoteRow] = field(default_factory=dict)
     _subscribed: set[str] = field(default_factory=set)
 
@@ -125,6 +126,8 @@ class QuoteService:
                 self._subscribed.discard(instrument)
 
     def _on_tick(self, tick: Tick) -> None:
+        if self.on_live_tick is not None:
+            self.on_live_tick(tick)
         row = self._rows.get(tick.instrument)
         if row is None or row.status != "ok":
             return

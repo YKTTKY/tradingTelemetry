@@ -16,3 +16,4 @@ def test_snapshot_includes_feed_status_and_fake_vendor_mode():
     assert body["feed"]["status"] == "connected"
     assert body["feed"]["vendor_mode"] == "fake"
     assert body["feed"]["engine"] == "up"
+    assert body["feed"]["last_vendor_tick_ts"] is None

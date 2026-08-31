@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from market_engine.vendor import Bar, HistoryResult, MarketDataVendor, Tick
+from market_engine.vendor import Bar, HistoryResult, MarketDataVendor, Tick, TickHandler
 
 # Domain timeframes → bar period in seconds (unix-bucket alignment).
 TIMEFRAME_SECONDS: dict[str, int] = {
@@ -28,6 +29,30 @@ def bar_open_ts(ts: float, timeframe: str) -> int:
     if period is None:
         raise ValueError(f"unsupported timeframe: {timeframe}")
     return int(ts // period) * period
+
+
+def align_live_tick(tick: Tick, last_bar_ts: int, timeframe: str) -> Tick | None:
+    """Place a live print onto the last-bar timeline.
+
+    In-order vendor time (bar open >= last) is unchanged so fake-vendor sim
+    clocks keep today's apply_tick path.
+
+    When vendor bar-open is behind the last bar, re-bucket on wall clock.
+    Vendor time does not place the bar; delay uses raw ``tick.ts``.
+    Clock skew (wall-clock open still behind last) still drops the print.
+    """
+    vendor_open = bar_open_ts(tick.ts, timeframe)
+    if vendor_open >= last_bar_ts:
+        return tick
+    wall_open = bar_open_ts(time.time(), timeframe)
+    if wall_open < last_bar_ts:
+        return None
+    return Tick(
+        instrument=tick.instrument,
+        price=tick.price,
+        volume=tick.volume,
+        ts=float(wall_open),
+    )
 
 
 def apply_tick(bars: list[Bar], timeframe: str, tick: Tick) -> tuple[list[Bar], Bar] | None:
@@ -92,6 +117,7 @@ class ChartService:
 
     vendor: MarketDataVendor
     on_bar_update: BarUpdateCallback | None = None
+    on_live_tick: TickHandler | None = None
     _slots: dict[str, _ChartSlot] = field(default_factory=dict)
     _subscribed: set[str] = field(default_factory=set)
 
@@ -192,13 +218,20 @@ class ChartService:
         self._subscribed.add(instrument)
 
     def _on_tick(self, tick: Tick) -> None:
+        if self.on_live_tick is not None:
+            self.on_live_tick(tick)
         # Group by (instrument, timeframe) so two charts on the same pair
         # share one update event (hub keys on instrument+timeframe).
         emitted: set[tuple[str, str]] = set()
         for slot in list(self._slots.values()):
             if slot.instrument != tick.instrument:
                 continue
-            change = apply_tick(slot.bars, slot.timeframe, tick)
+            if not slot.bars:
+                continue
+            placed = align_live_tick(tick, slot.bars[-1].ts, slot.timeframe)
+            if placed is None:
+                continue
+            change = apply_tick(slot.bars, slot.timeframe, placed)
             if change is None:
                 continue
             completed, last = change

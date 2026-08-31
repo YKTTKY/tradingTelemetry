@@ -13,7 +13,9 @@ def test_websocket_delivers_feed_status_then_heartbeat():
         assert first["type"] == "feed_status"
         assert first["status"] == "connected"
         assert first["vendor_mode"] == "fake"
+        assert first["last_vendor_tick_ts"] is None
 
         second = ws.receive_json()
         assert second["type"] == "heartbeat"
         assert "ts" in second
+        assert second["last_vendor_tick_ts"] is None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -185,3 +186,155 @@ def test_inject_without_ts_updates_history_tip_not_roll():
             assert update["completed_bars"] == []
             assert update["bar"]["ts"] == last_hist["ts"]
             assert update["bar"]["close"] == 549.0
+
+
+# Seeded 1m series: 11 bars, last open T. Independent literals for aligned-live tests.
+_SPY_1M_START_TS = 1_719_792_000
+_SPY_1M_LAST_TS = 1_719_792_600  # start + 10 × 60
+_MINUTE = 60
+
+
+def _seeded_1m_app():
+    vendor = FakeVendor(auto_ticks=False)
+    vendor.seed_history(
+        "SPY",
+        "1m",
+        closes=tuple(100.0 + i for i in range(11)),
+        start_ts=_SPY_1M_START_TS,
+        period_seconds=_MINUTE,
+        base_volume=1_000.0,
+    )
+    app = create_app(
+        feed=default_feed_state("fake"),
+        vendor=vendor,
+        conflate_interval_s=_CONFLATE_S,
+    )
+    return app, vendor
+
+
+def test_stale_vendor_tick_paints_tip_on_wall_clock_bucket():
+    """Vendor tick.ts behind last bar still applies last price on wall-clock minute.
+
+    Last bar T, tick ts = T − 30m, frozen wall T + 5m → tip open is the
+    wall-clock 1m bucket (T + 5m); no invented gap bars.
+    """
+    app, vendor = _seeded_1m_app()
+    tick_ts = float(_SPY_1M_LAST_TS - 30 * _MINUTE)  # 1_719_790_800
+    wall_ts = float(_SPY_1M_LAST_TS + 5 * _MINUTE)  # 1_719_792_900
+    price = 123.45
+
+    with TestClient(app) as client:
+        hist = client.post(
+            "/v1/chart/interest",
+            json={"instrument": "SPY", "timeframe": "1m"},
+        ).json()
+        assert hist["status"] == "ok"
+        last_hist = hist["bars"][-1]
+        assert last_hist["ts"] == _SPY_1M_LAST_TS
+        assert last_hist["close"] == 110.0
+
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+
+            with patch("market_engine.chart.time.time", return_value=wall_ts):
+                vendor.inject_tick("SPY", price=price, volume=50.0, ts=tick_ts)
+            time.sleep(_CONFLATE_S * 2.5)
+
+            update = _receive_of_type(ws, "bar_update")
+            assert update["instrument"] == "SPY"
+            assert update["timeframe"] == "1m"
+            completed = update["completed_bars"]
+            assert len(completed) == 1
+            assert completed[0]["ts"] == _SPY_1M_LAST_TS
+            assert completed[0]["close"] == 110.0
+
+            bar = update["bar"]
+            assert bar["ts"] == 1_719_792_900
+            assert bar["open"] == 123.45
+            assert bar["high"] == 123.45
+            assert bar["low"] == 123.45
+            assert bar["close"] == 123.45
+            assert bar["volume"] == 50.0
+
+
+def test_stale_vendor_tick_records_raw_ts_as_last_vendor_tick_ts():
+    """Feed delay uses raw vendor tick.ts even when the bar is wall-clock placed."""
+    app, vendor = _seeded_1m_app()
+    tick_ts = float(_SPY_1M_LAST_TS - 30 * _MINUTE)  # 1_719_790_800
+    wall_ts = float(_SPY_1M_LAST_TS + 5 * _MINUTE)  # 1_719_792_900
+
+    with TestClient(app) as client:
+        before = client.get("/v1/snapshot").json()["feed"]
+        assert before.get("last_vendor_tick_ts") is None
+
+        client.post("/v1/chart/interest", json={"instrument": "SPY", "timeframe": "1m"})
+
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            with patch("market_engine.chart.time.time", return_value=wall_ts):
+                vendor.inject_tick("SPY", price=123.45, volume=50.0, ts=tick_ts)
+            time.sleep(_CONFLATE_S * 2.5)
+            _receive_of_type(ws, "bar_update")
+
+            feed = client.get("/v1/snapshot").json()["feed"]
+            assert feed["last_vendor_tick_ts"] == 1_719_790_800
+
+            hb = _receive_of_type(ws, "heartbeat")
+            assert hb["last_vendor_tick_ts"] == 1_719_790_800
+
+
+def test_wall_clock_skew_still_drops_stale_tick():
+    """Wall-clock bar open behind last bar still drops; raw tick.ts is recorded."""
+    app, vendor = _seeded_1m_app()
+    tick_ts = float(_SPY_1M_LAST_TS - 30 * _MINUTE)  # 1_719_790_800
+    wall_ts = float(_SPY_1M_LAST_TS - _MINUTE)  # 1_719_792_540
+
+    with TestClient(app) as client:
+        client.post("/v1/chart/interest", json={"instrument": "SPY", "timeframe": "1m"})
+
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            with patch("market_engine.chart.time.time", return_value=wall_ts):
+                vendor.inject_tick("SPY", price=999.0, volume=1.0, ts=tick_ts)
+            time.sleep(_CONFLATE_S * 2.5)
+
+            types = []
+            for _ in range(4):
+                msg = ws.receive_json()
+                types.append(msg.get("type"))
+                if msg.get("type") == "bar_update":
+                    break
+            assert "bar_update" not in types
+
+            feed = client.get("/v1/snapshot").json()["feed"]
+            assert feed["last_vendor_tick_ts"] == 1_719_790_800
+
+
+def test_stale_vendor_tick_updates_last_bar_when_wall_is_same_bucket():
+    """Stale tick.ts with wall still in the last bar's minute updates that bar."""
+    app, vendor = _seeded_1m_app()
+    tick_ts = float(_SPY_1M_LAST_TS - 30 * _MINUTE)
+    wall_ts = float(_SPY_1M_LAST_TS + 15)
+
+    with TestClient(app) as client:
+        hist = client.post(
+            "/v1/chart/interest",
+            json={"instrument": "SPY", "timeframe": "1m"},
+        ).json()
+        last_hist = hist["bars"][-1]
+
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            with patch("market_engine.chart.time.time", return_value=wall_ts):
+                vendor.inject_tick("SPY", price=111.0, volume=25.0, ts=tick_ts)
+            time.sleep(_CONFLATE_S * 2.5)
+
+            update = _receive_of_type(ws, "bar_update")
+            assert update["completed_bars"] == []
+            bar = update["bar"]
+            assert bar["ts"] == _SPY_1M_LAST_TS
+            assert bar["open"] == last_hist["open"]
+            assert bar["close"] == 111.0
+            assert bar["high"] >= 111.0
+            assert bar["low"] <= min(last_hist["low"], 111.0)
+            assert bar["volume"] == last_hist["volume"] + 25.0

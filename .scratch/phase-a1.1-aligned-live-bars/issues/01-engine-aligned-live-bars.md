@@ -4,17 +4,17 @@
 
 **Blocked by:** none
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `apply_tick` (or the live apply wrapper) keeps today’s behavior when `bar_open(tick.ts) >= last.ts`
-- [ ] When `bar_open(tick.ts) < last.ts`, re-bucket on `time.time()` and update or roll; never fill skipped minutes
-- [ ] Wall-clock open still `< last.ts` → still drop (clock skew)
-- [ ] Every live vendor tick records raw `tick.ts` as `last_vendor_tick_ts` (even if the bar is placed on wall clock)
-- [ ] Snapshot `feed` includes `last_vendor_tick_ts` (omit/null if none)
-- [ ] WS exposes the same field (additive on `feed_status` and/or `heartbeat`)
-- [ ] Fake-vendor contract test: last bar `T`, tick `ts = T − 30m`, frozen wall `T + 5m` → tip open is wall bucket, close is tick price
-- [ ] Existing live-bar / sim-clock tests still pass (in-order sim `ts` unchanged)
-- [ ] No TUI work in this ticket (see 02)
+- [x] `apply_tick` (or the live apply wrapper) keeps today’s behavior when `bar_open(tick.ts) >= last.ts`
+- [x] When `bar_open(tick.ts) < last.ts`, re-bucket on `time.time()` and update or roll; never fill skipped minutes
+- [x] Wall-clock open still `< last.ts` → still drop (clock skew)
+- [x] Every live vendor tick records raw `tick.ts` as `last_vendor_tick_ts` (even if the bar is placed on wall clock)
+- [x] Snapshot `feed` includes `last_vendor_tick_ts` (omit/null if none)
+- [x] WS exposes the same field (additive on `feed_status` and/or `heartbeat`)
+- [x] Fake-vendor contract test: last bar `T`, tick `ts = T − 30m`, frozen wall `T + 5m` → tip open is wall bucket, close is tick price
+- [x] Existing live-bar / sim-clock tests still pass (in-order sim `ts` unchanged)
+- [x] No TUI work in this ticket (see 02)
 
 ## Notes
 
@@ -24,3 +24,7 @@
 - Optional short comment on the stale-ts branch: vendor time does not place the bar; delay uses raw `tick.ts`
 
 ## Comments
+
+- **Aligned live bars:** `align_live_tick` in `chart.py` is the live apply wrapper. In-order vendor time still goes to unchanged `apply_tick` (fake sim clock). Stale vendor bar-open re-buckets on `time.time()`; vendor time does not place the bar; delay uses raw `tick.ts`. One hop, no filler bars. Clock skew (wall open still behind last) still drops.
+- **last_vendor_tick_ts:** raw `tick.ts` on every live chart/watchlist tick (`FeedState.note_vendor_tick`), including wall-clock place and clock-skew drop. Snapshot `feed.last_vendor_tick_ts` is `null` until the first tick. Same field on `feed_status` (connect) and `heartbeat` (live). Engine does not send wall clock.
+- **Tests:** `test_ipc_live_bars.py` — hop at T+5m, same-bucket update, clock-skew drop, raw ts on snapshot+heartbeat. Existing in-order live-bar tests unchanged.
