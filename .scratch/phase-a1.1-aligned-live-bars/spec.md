@@ -1,6 +1,6 @@
 # Phase A.1.1 — Aligned live bars + feed clocks
 
-Status: ready
+Status: done
 
 ## Problem Statement
 

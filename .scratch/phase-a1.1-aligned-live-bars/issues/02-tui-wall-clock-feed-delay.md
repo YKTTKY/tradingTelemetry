@@ -4,17 +4,17 @@
 
 **Blocked by:** 01 — Engine: aligned live bars + last vendor tick time
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Feed status shows current America/New_York time (e.g. `11:17:44 EDT`) beside `heartbeat=<unix>`
-- [ ] Label follows tzdata (`EDT` / `EST`); do not hardcode year-round EST
-- [ ] Feed delay shown compact (`26m`, `5s`, `1h 02m`) when `now − last_vendor_tick_ts >= 5s`
-- [ ] Delay hidden when `< 5s` or `last_vendor_tick_ts` missing
-- [ ] One delay for the desk (not per chart)
-- [ ] Welcome Feed status line matches workspace (same clocks)
-- [ ] Unit tests for NY clock formatting and delay formatting
-- [ ] Help/chrome copy does not call this “last price time”
-- [ ] No candlestick widget / Y-scale / gap-fill changes
+- [x] Feed status shows current America/New_York time (e.g. `11:17:44 EDT`) beside `heartbeat=<unix>`
+- [x] Label follows tzdata (`EDT` / `EST`); do not hardcode year-round EST
+- [x] Feed delay shown compact (`26m`, `5s`, `1h 02m`) when `now − last_vendor_tick_ts >= 5s`
+- [x] Delay hidden when `< 5s` or `last_vendor_tick_ts` missing
+- [x] One delay for the desk (not per chart)
+- [x] Welcome Feed status line matches workspace (same clocks)
+- [x] Unit tests for NY clock formatting and delay formatting
+- [x] Help/chrome copy does not call this “last price time”
+- [x] No candlestick widget / Y-scale / gap-fill changes
 
 ## Notes
 
@@ -24,3 +24,7 @@
 - Heartbeat remains engine unix (liveness). Wall clock is local `now` in `America/New_York`.
 
 ## Comments
+
+- **Wall clock:** `format_ny_wall_clock` in `tui/src/feed_clock.rs` uses `America/New_York` + tzdata abbreviation (`EDT`/`EST`). `feed_line` (Welcome + workspace) appends it next to unix heartbeat from local `Utc::now()` each draw.
+- **Feed delay:** one `App.last_vendor_tick_ts` for the desk, from snapshot / `feed_status` / `heartbeat`. Compact `5s` / `26m` / `1h 02m`; hidden under 5s or when no vendor tick. Not last bar time.
+- **Tests:** NY clock (summer EDT / winter EST), delay hide/format, status-line suffix, snapshot JSON field, snapshot+heartbeat apply.

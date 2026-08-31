@@ -1,6 +1,7 @@
 //! Trading Telemetry TUI — Welcome → workspace charts over engine HTTP+WS.
 
 mod app;
+mod feed_clock;
 mod ipc;
 mod overlay;
 mod timeframe;

@@ -532,6 +532,8 @@ pub struct App {
     /// Quotes stashed with the deferred Welcome snapshot.
     pub pending_quotes: Vec<QuoteRow>,
     pub last_heartbeat_ts: Option<f64>,
+    /// Latest vendor tick timestamp (unix seconds) for feed delay. One value for the desk.
+    pub last_vendor_tick_ts: Option<f64>,
     /// When true, the main loop should POST chart interest for every chart.
     pub needs_chart_load: bool,
     /// When Some, the main loop should POST layout change to the engine.
@@ -582,6 +584,7 @@ impl Default for App {
             pending_workspace: None,
             pending_quotes: Vec::new(),
             last_heartbeat_ts: None,
+            last_vendor_tick_ts: None,
             needs_chart_load: false,
             pending_layout: None,
             watchlist_visible: true,
@@ -2319,6 +2322,7 @@ impl App {
                 quotes,
                 indicators,
             } => {
+                self.last_vendor_tick_ts = feed.last_vendor_tick_ts;
                 self.set_feed(feed);
                 if let Some(ws) = workspace {
                     if self.screen == Screen::Welcome {
@@ -2348,20 +2352,30 @@ impl App {
             IpcEvent::FeedStatus {
                 status,
                 vendor_mode,
+                last_vendor_tick_ts,
             } => {
                 let engine = self
                     .feed
                     .as_ref()
                     .map(|f| f.engine.clone())
                     .unwrap_or_else(|| "up".into());
+                self.last_vendor_tick_ts = last_vendor_tick_ts;
                 self.set_feed(FeedSnapshot {
                     status,
                     vendor_mode,
                     engine,
+                    last_vendor_tick_ts,
                 });
             }
-            IpcEvent::Heartbeat { ts } => {
+            IpcEvent::Heartbeat {
+                ts,
+                last_vendor_tick_ts,
+            } => {
                 self.last_heartbeat_ts = Some(ts);
+                self.last_vendor_tick_ts = last_vendor_tick_ts;
+                if let Some(feed) = self.feed.as_mut() {
+                    feed.last_vendor_tick_ts = last_vendor_tick_ts;
+                }
                 if matches!(self.connection, ConnectionStatus::Connecting) {
                     self.connection = ConnectionStatus::Connected;
                 }
@@ -2939,6 +2953,7 @@ mod tests {
                 status: "connected".into(),
                 vendor_mode: "fake".into(),
                 engine: "up".into(),
+                last_vendor_tick_ts: None,
             },
             workspace: None,
             quotes: vec![],
@@ -2946,6 +2961,35 @@ mod tests {
         });
         assert_eq!(app.connection, ConnectionStatus::Connected);
         assert_eq!(app.vendor_mode_label(), "fake");
+        assert_eq!(app.last_vendor_tick_ts, None);
+    }
+
+    #[test]
+    fn snapshot_and_heartbeat_record_last_vendor_tick_ts() {
+        let mut app = App::default();
+        app.apply_ipc(IpcEvent::Snapshot {
+            feed: FeedSnapshot {
+                status: "connected".into(),
+                vendor_mode: "lse".into(),
+                engine: "up".into(),
+                last_vendor_tick_ts: Some(1_719_790_800.0),
+            },
+            workspace: None,
+            quotes: vec![],
+            indicators: HashMap::new(),
+        });
+        assert_eq!(app.last_vendor_tick_ts, Some(1_719_790_800.0));
+
+        app.apply_ipc(IpcEvent::Heartbeat {
+            ts: 1_719_792_400.0,
+            last_vendor_tick_ts: Some(1_719_790_830.0),
+        });
+        assert_eq!(app.last_heartbeat_ts, Some(1_719_792_400.0));
+        assert_eq!(app.last_vendor_tick_ts, Some(1_719_790_830.0));
+        assert_eq!(
+            app.feed.as_ref().and_then(|f| f.last_vendor_tick_ts),
+            Some(1_719_790_830.0)
+        );
     }
 
     #[test]
@@ -3336,6 +3380,7 @@ mod tests {
                 status: "connected".into(),
                 vendor_mode: "fake".into(),
                 engine: "up".into(),
+                last_vendor_tick_ts: None,
             },
             workspace: Some(WorkspaceSnapshot {
                 layout_mode: "dual-vertical".into(),

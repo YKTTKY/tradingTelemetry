@@ -88,11 +88,14 @@ impl EngineEndpoint {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FeedSnapshot {
     pub status: String,
     pub vendor_mode: String,
     pub engine: String,
+    /// Latest vendor `tick.ts` (unix seconds). `None` until the first live tick.
+    #[serde(default)]
+    pub last_vendor_tick_ts: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -666,9 +669,11 @@ pub enum IpcEvent {
     FeedStatus {
         status: String,
         vendor_mode: String,
+        last_vendor_tick_ts: Option<f64>,
     },
     Heartbeat {
         ts: f64,
+        last_vendor_tick_ts: Option<f64>,
     },
     ChartSeries(ChartInterestResponse),
     BarUpdate(BarUpdateEvent),
@@ -985,10 +990,13 @@ async fn connect_session(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown")
                                 .to_string();
+                            let last_vendor_tick_ts =
+                                value.get("last_vendor_tick_ts").and_then(|v| v.as_f64());
                             if tx
                                 .send(IpcEvent::FeedStatus {
                                     status,
                                     vendor_mode,
+                                    last_vendor_tick_ts,
                                 })
                                 .is_err()
                             {
@@ -997,7 +1005,15 @@ async fn connect_session(
                         }
                         Some("heartbeat") => {
                             let ts = value.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            if tx.send(IpcEvent::Heartbeat { ts }).is_err() {
+                            let last_vendor_tick_ts =
+                                value.get("last_vendor_tick_ts").and_then(|v| v.as_f64());
+                            if tx
+                                .send(IpcEvent::Heartbeat {
+                                    ts,
+                                    last_vendor_tick_ts,
+                                })
+                                .is_err()
+                            {
                                 return Ok(());
                             }
                         }
@@ -1052,6 +1068,27 @@ async fn connect_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feed_snapshot_reads_last_vendor_tick_ts() {
+        let with_tick: FeedSnapshot = serde_json::from_str(
+            r#"{"status":"connected","vendor_mode":"lse","engine":"up","last_vendor_tick_ts":1719790800.0}"#,
+        )
+        .unwrap();
+        assert_eq!(with_tick.last_vendor_tick_ts, Some(1_719_790_800.0));
+
+        let none_yet: FeedSnapshot = serde_json::from_str(
+            r#"{"status":"connected","vendor_mode":"fake","engine":"up","last_vendor_tick_ts":null}"#,
+        )
+        .unwrap();
+        assert_eq!(none_yet.last_vendor_tick_ts, None);
+
+        let omitted: FeedSnapshot = serde_json::from_str(
+            r#"{"status":"connected","vendor_mode":"fake","engine":"up"}"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.last_vendor_tick_ts, None);
+    }
 
     #[test]
     fn ws_url_rewrites_http_scheme() {

@@ -6,8 +6,8 @@ Personal day-trading terminal (TUI) for watching instruments, charts, and derive
 
 - **Phase A — Chart terminal (first ship):** LSE primary, dual/single layout, watchlists, naked→restored indicators, Session/Fixed Range/Anchored VP, MA, Volume, feed status, HTTP+WS engine+TUI. **No paper trading yet.** Status: done (see `.scratch/phase-a-chart-terminal/`).
 - **Phase A.1 — Chart UX polish:** vendored cell-based candles + axes, overlay compose + type overlay strength, chart pan + deeper short-TF history (A2), bar countdown, watchlist→chart + rename, indicator panel Available|Current. Spec: `.scratch/phase-a1-chart-ux-polish/spec.md`. Status: done. **No paper trading.**
-- **Phase A.1.1 — Aligned live bars (current ship):** wall clock (New York time) on Feed status; forming bars follow wall clock from live last price when vendor tick time is stale; visible **feed delay**; no new candle renderer. Spec: `.scratch/phase-a1.1-aligned-live-bars/spec.md`. Does **not** fix LSE vault/`tick.ts`. **No paper trading.**
-- **Phase B — Paper M1+nudge (next after A.1.1):** multi account settings (as specified), bar-touch fills, order panel, TP/SL lines, keyboard nudge, trade marks (persistent, hideable pairs), positions / filled history / balance history, SQLite. Tick fills and TV-style drag later.
+- **Phase A.1.1 — Aligned live bars:** wall clock (New York time) on Feed status; forming bars follow wall clock from live last price when vendor tick time is stale; visible **feed delay**; no new candle renderer. Spec: `.scratch/phase-a1.1-aligned-live-bars/spec.md`. Status: done. Does **not** fix LSE vault/`tick.ts`. **No paper trading.**
+- **Phase B — Paper M1+nudge (next):** multi account settings (as specified), bar-touch fills, order panel, TP/SL lines, keyboard nudge, trade marks (persistent, hideable pairs), positions / filled history / balance history, SQLite. Tick fills and TV-style drag later.
 
 ## Architecture (v1 intent)
 

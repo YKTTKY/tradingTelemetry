@@ -17,6 +17,7 @@ use crate::app::{
     App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, IndicatorListSide, InputMode,
     LayoutMode, Screen, AVAILABLE_INDICATOR_TYPES, UNAVAILABLE_COPY,
 };
+use crate::feed_clock::format_feed_clocks;
 use crate::ipc::{OhlcvBar, QuoteRow};
 use crate::overlay::{
     paint_overlays, volume_bar_color, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
@@ -116,6 +117,10 @@ fn draw_help_popup(frame: &mut Frame) {
         row("o", "Open / close indicator panel"),
         Line::from(Span::styled(
             "  Chart chrome: forming-bar countdown per chart (dual = two independent)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Feed status: New York wall clock beside heartbeat; feed delay hidden under 5s",
             Style::default().fg(Color::DarkGray),
         )),
         section("Watchlist (Normal mode)"),
@@ -1924,6 +1929,7 @@ fn feed_line(app: &App) -> Line<'static> {
         .last_heartbeat_ts
         .map(|ts| format!("  heartbeat={ts:.0}"))
         .unwrap_or_default();
+    let clocks = format_feed_clocks(Utc::now(), app.last_vendor_tick_ts);
     let err = app
         .last_indicator_error
         .as_ref()
@@ -1933,7 +1939,7 @@ fn feed_line(app: &App) -> Line<'static> {
     Line::from(vec![
         Span::raw("feed: "),
         Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::raw(format!("  vendor={vendor}{hb}")),
+        Span::raw(format!("  vendor={vendor}{hb}{clocks}")),
         Span::styled(err, Style::default().fg(Color::Red)),
     ])
 }
