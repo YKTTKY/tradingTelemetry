@@ -76,14 +76,31 @@ impl EngineEndpoint {
             .expect("indicators path joins base")
     }
 
+    pub fn paper_orders_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/orders")
+            .expect("paper orders path joins base")
+    }
+
+    pub fn paper_orders_modify_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/orders/modify")
+            .expect("paper orders modify path joins base")
+    }
+
+    pub fn paper_orders_cancel_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/orders/cancel")
+            .expect("paper orders cancel path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
             "https" => "wss",
             _ => "ws",
         };
-        ws.set_scheme(scheme)
-            .expect("scheme is valid for this URL");
+        ws.set_scheme(scheme).expect("scheme is valid for this URL");
         ws.join("/v1/ws").expect("ws path joins base")
     }
 }
@@ -612,6 +629,29 @@ pub struct BalanceHistoryRow {
     pub balance: f64,
 }
 
+/// Resting working order on the active paper account (lines + order side panel).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct WorkingOrderSnapshot {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub instrument: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(rename = "type", default)]
+    pub order_type: String,
+    #[serde(default)]
+    pub qty: f64,
+    #[serde(default)]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub stop: Option<f64>,
+    #[serde(default)]
+    pub placed_ts: i64,
+}
+
 /// Additive snapshot slice. Missing `paper` key deserializes to an empty desk.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 pub struct PaperSnapshot {
@@ -621,6 +661,8 @@ pub struct PaperSnapshot {
     pub accounts: Vec<PaperAccountSnapshot>,
     #[serde(default)]
     pub defaults: PaperDefaults,
+    #[serde(default)]
+    pub working_orders: Vec<WorkingOrderSnapshot>,
     #[serde(default)]
     pub positions: Vec<PaperPositionRow>,
     #[serde(default)]
@@ -683,6 +725,35 @@ pub struct WatchlistSymbolRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WatchlistRenameRequest {
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperOrderPlaceRequest {
+    pub instrument: String,
+    pub side: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub qty: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperOrderModifyRequest {
+    pub order_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperOrderCancelRequest {
+    pub order_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -793,6 +864,9 @@ pub enum IpcEvent {
         message: String,
     },
     WatchlistFailed {
+        message: String,
+    },
+    PaperFailed {
         message: String,
     },
     IndicatorsFailed {
@@ -1039,6 +1113,94 @@ pub async fn post_watchlist_rename(
     Ok(response)
 }
 
+async fn post_paper_json<T: serde::Serialize>(
+    url: Url,
+    body: &T,
+) -> Result<PaperSnapshot, IpcError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let resp = client.post(url).json(body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("detail").map(|d| {
+                    d.as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| d.to_string())
+                })
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if text.is_empty() {
+                    status.to_string()
+                } else {
+                    text
+                }
+            });
+        return Err(IpcError::Status(detail));
+    }
+    Ok(resp.json().await?)
+}
+
+pub async fn post_paper_place(
+    endpoint: &EngineEndpoint,
+    instrument: &str,
+    side: &str,
+    order_type: &str,
+    qty: f64,
+    limit: Option<f64>,
+    stop: Option<f64>,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_orders_url(),
+        &PaperOrderPlaceRequest {
+            instrument: instrument.to_string(),
+            side: side.to_string(),
+            order_type: order_type.to_string(),
+            qty,
+            limit,
+            stop,
+        },
+    )
+    .await
+}
+
+pub async fn post_paper_modify(
+    endpoint: &EngineEndpoint,
+    order_id: &str,
+    qty: Option<f64>,
+    limit: Option<f64>,
+    stop: Option<f64>,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_orders_modify_url(),
+        &PaperOrderModifyRequest {
+            order_id: order_id.to_string(),
+            qty,
+            limit,
+            stop,
+        },
+    )
+    .await
+}
+
+pub async fn post_paper_cancel(
+    endpoint: &EngineEndpoint,
+    order_id: &str,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_orders_cancel_url(),
+        &PaperOrderCancelRequest {
+            order_id: order_id.to_string(),
+        },
+    )
+    .await
+}
+
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
 pub async fn run_ipc_loop(endpoint: EngineEndpoint, tx: mpsc::UnboundedSender<IpcEvent>) {
     loop {
@@ -1253,6 +1415,7 @@ mod tests {
         assert!(with_paper.paper.positions.is_empty());
         assert!(with_paper.paper.filled_order_history.is_empty());
         assert!(with_paper.paper.balance_history.is_empty());
+        assert!(with_paper.paper.working_orders.is_empty());
 
         let without: SnapshotBody = serde_json::from_str(
             r#"{
@@ -1266,7 +1429,55 @@ mod tests {
         assert!(without.paper.accounts.is_empty());
         assert!(without.paper.active_account_id.is_empty());
         assert!(without.paper.positions.is_empty());
+        assert!(without.paper.working_orders.is_empty());
         assert_eq!(without.feed.last_vendor_tick_ts, None);
+    }
+
+    #[test]
+    fn snapshot_deserializes_working_orders_additively() {
+        let with_orders: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [{"id":"pa_1","name":"Paper","currency":"USD","balance":100000.0}],
+                    "working_orders": [{
+                        "id": "wo_1",
+                        "account_id": "pa_1",
+                        "instrument": "SPY",
+                        "side": "buy",
+                        "type": "limit",
+                        "qty": 10,
+                        "limit": 540.0,
+                        "stop": null,
+                        "placed_ts": 1719792000
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(with_orders.paper.working_orders.len(), 1);
+        let wo = &with_orders.paper.working_orders[0];
+        assert_eq!(wo.id, "wo_1");
+        assert_eq!(wo.instrument, "SPY");
+        assert_eq!(wo.side, "buy");
+        assert_eq!(wo.order_type, "limit");
+        assert_eq!(wo.qty, 10.0);
+        assert_eq!(wo.limit, Some(540.0));
+        assert_eq!(wo.stop, None);
+        assert_eq!(wo.placed_ts, 1_719_792_000);
+
+        let omitted_orders: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": []
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(omitted_orders.paper.working_orders.is_empty());
     }
 
     #[test]

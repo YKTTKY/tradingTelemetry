@@ -105,6 +105,13 @@ class QuoteService:
 
         return [self._rows[s].to_dict() for s in wanted]
 
+    def last_price(self, symbol: str) -> float | None:
+        """Last quote for ``symbol`` if this desk already has a live/ok row."""
+        row = self._rows.get(symbol.strip().upper())
+        if row is None or row.last is None:
+            return None
+        return float(row.last)
+
     def _load_quote(self, symbol: str) -> QuoteRow:
         result = self.vendor.fetch_history(symbol, "1D")
         closes = [b.close for b in result.bars] if result.available else []

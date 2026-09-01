@@ -3,12 +3,15 @@
 use std::collections::HashMap;
 
 use crate::ipc::{
-    BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IpcEvent,
-    IndicatorConfig, IndicatorSeriesData, IndicatorTypeStyle, IndicatorUpdateEvent,
-    IndicatorsApplyResponse, OhlcvBar, PaperAccountSnapshot, PaperSnapshot, QuoteRow,
-    QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
+    BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IndicatorConfig,
+    IndicatorSeriesData, IndicatorTypeStyle, IndicatorUpdateEvent, IndicatorsApplyResponse,
+    IpcEvent, OhlcvBar, PaperAccountSnapshot, PaperSnapshot, QuoteRow, QuoteUpdateEvent,
+    WatchlistSnapshot, WorkingOrderSnapshot, WorkspaceSnapshot,
 };
-use crate::overlay::{clamp_strength, default_strength_for_type};
+use crate::overlay::{
+    OverlayLevel, WorkingOrderLineSpec, clamp_strength, default_strength_for_type,
+    working_levels_for_instrument,
+};
 use crate::timeframe::{format_bar_countdown, forming_bar_remaining_secs};
 
 /// Exact empty-state copy when the vendor cannot serve the chart series.
@@ -24,9 +27,7 @@ pub const CHART_TOP: &str = "top";
 pub const CHART_BOTTOM: &str = "bottom";
 
 /// v1 product timeframes only (domain). Cycle order is coarse → fine wrap.
-pub const V1_TIMEFRAMES: [&str; 9] = [
-    "1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W",
-];
+pub const V1_TIMEFRAMES: [&str; 9] = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -203,10 +204,16 @@ pub struct AvpPlaceState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
-    InstrumentPrompt { buffer: String },
-    WatchlistAddPrompt { buffer: String },
+    InstrumentPrompt {
+        buffer: String,
+    },
+    WatchlistAddPrompt {
+        buffer: String,
+    },
     /// Rename the active watchlist sheet (display name).
-    WatchlistRenamePrompt { buffer: String },
+    WatchlistRenamePrompt {
+        buffer: String,
+    },
     /// Indicator panel for the focused chart (add / toggle / configure).
     IndicatorPanel,
     /// Togglable paper desk panel (owns keys while open; shortcut TBD).
@@ -273,6 +280,89 @@ pub struct PendingTypeStylesApply {
     pub type_styles: HashMap<String, IndicatorTypeStyle>,
 }
 
+/// Pending paper working-order mutation (engine owns the book).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingPaperOp {
+    Place {
+        instrument: String,
+        side: String,
+        order_type: String,
+        qty: f64,
+        limit: Option<f64>,
+        stop: Option<f64>,
+    },
+    Modify {
+        order_id: String,
+        qty: Option<f64>,
+        limit: Option<f64>,
+        stop: Option<f64>,
+    },
+    Cancel {
+        order_id: String,
+    },
+}
+
+/// Buy or sell on the order side panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+impl OrderSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
+/// Working-order kind on the order side panel (not a filled history type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingOrderKind {
+    Market,
+    Limit,
+    Stop,
+}
+
+impl WorkingOrderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Market => "market",
+            Self::Limit => "limit",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// Place/modify form owned by the paper panel (not a working-orders table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderSidePanel {
+    pub side: OrderSide,
+    pub kind: WorkingOrderKind,
+    pub qty: f64,
+    pub limit: f64,
+    pub stop: f64,
+    pub selected_order_id: Option<String>,
+}
+
+impl Default for OrderSidePanel {
+    fn default() -> Self {
+        Self {
+            side: OrderSide::Buy,
+            kind: WorkingOrderKind::Limit,
+            qty: 1.0,
+            limit: 0.0,
+            stop: 0.0,
+            selected_order_id: None,
+        }
+    }
+}
+
+pub const ORDER_QTY_STEP: f64 = 1.0;
+pub const ORDER_PRICE_STEP: f64 = 0.01;
+
 pub const MAX_MA_LINES: usize = 3;
 pub const MAX_SESSION_VP: usize = 1;
 pub const MAX_FIXED_RANGE_VP: usize = 4;
@@ -303,9 +393,13 @@ pub enum ChartSeriesState {
     /// Interest not requested yet (or reload pending).
     Idle,
     Loading,
-    Available { bars: Vec<OhlcvBar> },
+    Available {
+        bars: Vec<OhlcvBar>,
+    },
     Unavailable,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// One workspace chart: engine chart_id + instrument + timeframe + series state.
@@ -333,7 +427,11 @@ pub struct Chart {
 }
 
 impl Chart {
-    pub fn new(id: impl Into<String>, instrument: impl Into<String>, timeframe: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        instrument: impl Into<String>,
+        timeframe: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             instrument: instrument.into(),
@@ -378,19 +476,16 @@ impl Chart {
     /// Set overlay strength for an indicator type on this chart (clamped).
     pub fn set_overlay_strength(&mut self, indicator_type: impl Into<String>, strength: f64) {
         let key = indicator_type.into();
-        self.type_styles
-            .insert(key, IndicatorTypeStyle::with_strength(clamp_strength(strength)));
+        self.type_styles.insert(
+            key,
+            IndicatorTypeStyle::with_strength(clamp_strength(strength)),
+        );
     }
 
     /// Strength map suitable for the overlay paint pass (explicit + defaults for known paint types).
     pub fn overlay_strength_map(&self) -> HashMap<String, f64> {
         let mut map = HashMap::new();
-        for key in [
-            "ma",
-            "session_vp",
-            "fixed_range_vp",
-            "anchored_vp",
-        ] {
+        for key in ["ma", "session_vp", "fixed_range_vp", "anchored_vp"] {
             map.insert(key.to_string(), self.overlay_strength(key));
         }
         for (k, v) in &self.type_styles {
@@ -480,11 +575,7 @@ impl Chart {
         self.indicators
             .iter()
             .filter(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
-            .filter_map(|cfg| {
-                self.indicator_series
-                    .get(&cfg.id)
-                    .map(|s| (cfg, s))
-            })
+            .filter_map(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
             .collect()
     }
 
@@ -493,11 +584,7 @@ impl Chart {
         self.indicators
             .iter()
             .filter(|i| i.indicator_type == "anchored_vp" && i.enabled)
-            .filter_map(|cfg| {
-                self.indicator_series
-                    .get(&cfg.id)
-                    .map(|s| (cfg, s))
-            })
+            .filter_map(|cfg| self.indicator_series.get(&cfg.id).map(|s| (cfg, s)))
             .collect()
     }
 
@@ -573,6 +660,12 @@ pub struct App {
     pub help_open: bool,
     /// Engine paper desk (accounts + empty Position / history tables).
     pub paper: PaperSnapshot,
+    /// Place/modify/cancel form; visible with the paper panel.
+    pub order_side: OrderSidePanel,
+    /// When Some, main loop POSTs place/modify/cancel to the engine.
+    pub pending_paper: Option<PendingPaperOp>,
+    /// Last engine rejection from place/modify/cancel (shown on the order side panel).
+    pub last_paper_error: Option<String>,
     pub should_quit: bool,
 }
 
@@ -609,6 +702,9 @@ impl Default for App {
             last_indicator_error: None,
             help_open: false,
             paper: PaperSnapshot::default(),
+            order_side: OrderSidePanel::default(),
+            pending_paper: None,
+            last_paper_error: None,
             should_quit: false,
         }
     }
@@ -693,9 +789,7 @@ impl App {
         if id == self.active_watchlist_id {
             return;
         }
-        self.pending_watchlist = Some(PendingWatchlistOp::SetActive {
-            watchlist_id: id,
-        });
+        self.pending_watchlist = Some(PendingWatchlistOp::SetActive { watchlist_id: id });
     }
 
     pub fn begin_watchlist_add_prompt(&mut self) {
@@ -820,15 +914,10 @@ impl App {
     }
 
     pub fn apply_quote_update(&mut self, update: QuoteUpdateEvent) {
-        self.quotes
-            .insert(update.symbol.clone(), update.to_row());
+        self.quotes.insert(update.symbol.clone(), update.to_row());
     }
 
-    pub fn apply_watchlist_state(
-        &mut self,
-        workspace: WorkspaceSnapshot,
-        quotes: Vec<QuoteRow>,
-    ) {
+    pub fn apply_watchlist_state(&mut self, workspace: WorkspaceSnapshot, quotes: Vec<QuoteRow>) {
         // Watchlist mutations return a full workspace snapshot, but only membership /
         // active sheet / names should change here. Rebuilding charts via apply_workspace
         // would drop live series (Idle) without re-arming chart interest.
@@ -984,10 +1073,7 @@ impl App {
         }
     }
 
-    pub fn apply_indicator_payloads(
-        &mut self,
-        payloads: HashMap<String, ChartIndicatorsPayload>,
-    ) {
+    pub fn apply_indicator_payloads(&mut self, payloads: HashMap<String, ChartIndicatorsPayload>) {
         for (chart_id, payload) in payloads {
             if let Some(chart) = self.charts.iter_mut().find(|c| c.id == chart_id) {
                 // Always take engine configs (including empty = naked).
@@ -1061,6 +1147,8 @@ impl App {
         match self.input_mode {
             InputMode::Normal => {
                 self.input_mode = InputMode::PaperPanel;
+                self.order_side = OrderSidePanel::default();
+                self.seed_order_side_prices();
             }
             InputMode::PaperPanel => {
                 self.input_mode = InputMode::Normal;
@@ -1077,10 +1165,248 @@ impl App {
 
     pub fn apply_paper(&mut self, paper: PaperSnapshot) {
         self.paper = paper;
+        self.last_paper_error = None;
+        self.sync_order_side_selection();
     }
 
     pub fn active_paper_account(&self) -> Option<&PaperAccountSnapshot> {
         self.paper.active_account()
+    }
+
+    /// Instrument for place/modify: the **focused chart**, not the watchlist row.
+    pub fn order_side_instrument(&self) -> &str {
+        self.focused_chart().instrument.as_str()
+    }
+
+    pub fn working_orders_for_instrument(&self, instrument: &str) -> Vec<&WorkingOrderSnapshot> {
+        self.paper
+            .working_orders
+            .iter()
+            .filter(|o| o.instrument.eq_ignore_ascii_case(instrument))
+            .collect()
+    }
+
+    /// Working **lines** for one chart instrument (market orders have no price line).
+    pub fn working_overlay_levels(&self, instrument: &str, x0: f64, x1: f64) -> Vec<OverlayLevel> {
+        let specs: Vec<WorkingOrderLineSpec> = self
+            .paper
+            .working_orders
+            .iter()
+            .map(|o| WorkingOrderLineSpec {
+                instrument: o.instrument.clone(),
+                side: o.side.clone(),
+                order_type: o.order_type.clone(),
+                limit: o.limit,
+                stop: o.stop,
+            })
+            .collect();
+        working_levels_for_instrument(&specs, instrument, x0, x1)
+    }
+
+    pub fn paper_request_started(&mut self) {
+        self.pending_paper = None;
+    }
+
+    pub fn paper_cycle_side(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.order_side.selected_order_id.is_some() {
+            return;
+        }
+        self.order_side.side = match self.order_side.side {
+            OrderSide::Buy => OrderSide::Sell,
+            OrderSide::Sell => OrderSide::Buy,
+        };
+    }
+
+    pub fn paper_set_side(&mut self, side: OrderSide) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.order_side.selected_order_id.is_some() {
+            return;
+        }
+        self.order_side.side = side;
+    }
+
+    pub fn paper_set_kind(&mut self, kind: WorkingOrderKind) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.order_side.selected_order_id.is_some() {
+            return;
+        }
+        self.order_side.kind = kind;
+    }
+
+    pub fn paper_nudge_qty(&mut self, steps: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if steps == 0 {
+            return;
+        }
+        let next = self.order_side.qty + f64::from(steps) * ORDER_QTY_STEP;
+        self.order_side.qty = if next < ORDER_QTY_STEP {
+            ORDER_QTY_STEP
+        } else {
+            next
+        };
+    }
+
+    pub fn paper_nudge_price(&mut self, steps: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if steps == 0 {
+            return;
+        }
+        match self.order_side.kind {
+            WorkingOrderKind::Limit => {
+                let next = self.order_side.limit + f64::from(steps) * ORDER_PRICE_STEP;
+                self.order_side.limit = if next < ORDER_PRICE_STEP {
+                    ORDER_PRICE_STEP
+                } else {
+                    next
+                };
+            }
+            WorkingOrderKind::Stop => {
+                let next = self.order_side.stop + f64::from(steps) * ORDER_PRICE_STEP;
+                self.order_side.stop = if next < ORDER_PRICE_STEP {
+                    ORDER_PRICE_STEP
+                } else {
+                    next
+                };
+            }
+            WorkingOrderKind::Market => {}
+        }
+    }
+
+    /// Cycle working orders for the focused instrument, including a None (place) slot.
+    pub fn paper_select_working_delta(&mut self, delta: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if delta == 0 {
+            return;
+        }
+        let inst = self.order_side_instrument().to_string();
+        let mut ids: Vec<Option<String>> = vec![None];
+        ids.extend(
+            self.working_orders_for_instrument(&inst)
+                .into_iter()
+                .map(|o| Some(o.id.clone())),
+        );
+        if ids.len() == 1 {
+            self.order_side.selected_order_id = None;
+            return;
+        }
+        let cur = ids
+            .iter()
+            .position(|id| *id == self.order_side.selected_order_id)
+            .unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(ids.len() as i32) as usize;
+        self.order_side.selected_order_id = ids[next].clone();
+        self.sync_order_side_selection();
+    }
+
+    pub fn paper_submit(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.order_side.qty <= 0.0 {
+            self.last_paper_error = Some("qty must be > 0".into());
+            return;
+        }
+        let instrument = self.order_side_instrument().to_string();
+        let side = self.order_side.side.as_str().to_string();
+        let order_type = self.order_side.kind.as_str().to_string();
+        let qty = self.order_side.qty;
+        let (limit, stop) = match self.order_side.kind {
+            WorkingOrderKind::Market => (None, None),
+            WorkingOrderKind::Limit => {
+                if self.order_side.limit <= 0.0 {
+                    self.last_paper_error = Some("limit is required".into());
+                    return;
+                }
+                (Some(self.order_side.limit), None)
+            }
+            WorkingOrderKind::Stop => {
+                if self.order_side.stop <= 0.0 {
+                    self.last_paper_error = Some("stop is required".into());
+                    return;
+                }
+                (None, Some(self.order_side.stop))
+            }
+        };
+        if let Some(order_id) = self.order_side.selected_order_id.clone() {
+            self.pending_paper = Some(PendingPaperOp::Modify {
+                order_id,
+                qty: Some(qty),
+                limit,
+                stop,
+            });
+        } else {
+            self.pending_paper = Some(PendingPaperOp::Place {
+                instrument,
+                side,
+                order_type,
+                qty,
+                limit,
+                stop,
+            });
+        }
+    }
+
+    pub fn paper_cancel_selected(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        let Some(order_id) = self.order_side.selected_order_id.clone() else {
+            return;
+        };
+        self.pending_paper = Some(PendingPaperOp::Cancel { order_id });
+    }
+
+    fn seed_order_side_prices(&mut self) {
+        let inst = self.order_side_instrument().to_string();
+        let last = self.quotes.get(&inst).and_then(|q| q.last);
+        if let Some(last) = last {
+            if self.order_side.limit <= 0.0 {
+                self.order_side.limit = last;
+            }
+            if self.order_side.stop <= 0.0 {
+                self.order_side.stop = last;
+            }
+        }
+    }
+
+    fn sync_order_side_selection(&mut self) {
+        let Some(id) = self.order_side.selected_order_id.clone() else {
+            return;
+        };
+        let Some(wo) = self.paper.working_orders.iter().find(|o| o.id == id) else {
+            self.order_side.selected_order_id = None;
+            return;
+        };
+        self.order_side.side = if wo.side.eq_ignore_ascii_case("sell") {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        self.order_side.kind = match wo.order_type.as_str() {
+            "market" => WorkingOrderKind::Market,
+            "stop" => WorkingOrderKind::Stop,
+            _ => WorkingOrderKind::Limit,
+        };
+        self.order_side.qty = wo.qty;
+        if let Some(limit) = wo.limit {
+            self.order_side.limit = limit;
+        }
+        if let Some(stop) = wo.stop {
+            self.order_side.stop = stop;
+        }
     }
 
     /// Tab: switch Available ↔ Current while the indicator panel owns focus.
@@ -1319,7 +1645,9 @@ impl App {
             if existing_lengths.contains(&length) {
                 continue;
             }
-            chart.indicators.push(IndicatorConfig::ma(format!("ma{length}"), "sma", length));
+            chart
+                .indicators
+                .push(IndicatorConfig::ma(format!("ma{length}"), "sma", length));
             added = true;
         }
         // If all defaults present but under max (custom lengths), add a short SMA.
@@ -1400,7 +1728,10 @@ impl App {
     ///
     /// Does **not** POST to the engine until both pins are confirmed with Enter.
     pub fn indicator_add_fixed_range_vp(&mut self) {
-        if !matches!(self.input_mode, InputMode::IndicatorPanel | InputMode::Normal) {
+        if !matches!(
+            self.input_mode,
+            InputMode::IndicatorPanel | InputMode::Normal
+        ) {
             return;
         }
         if matches!(self.input_mode, InputMode::FrvpPlacing) {
@@ -1434,11 +1765,13 @@ impl App {
             _ => 0,
         };
         let chart_id = chart.id.clone();
-        chart.indicators.push(IndicatorConfig::fixed_range_vp_default(
-            id.clone(),
-            provisional_ts,
-            provisional_ts,
-        ));
+        chart
+            .indicators
+            .push(IndicatorConfig::fixed_range_vp_default(
+                id.clone(),
+                provisional_ts,
+                provisional_ts,
+            ));
         // Disable until placed so we don't draw a junk full-width profile.
         if let Some(last) = chart.indicators.last_mut() {
             last.enabled = false;
@@ -1586,8 +1919,7 @@ impl App {
                     cfg.enabled = true;
                 } else {
                     // Draft was wiped mid-placement (interest race) — recreate so pin work is not lost.
-                    let mut cfg =
-                        IndicatorConfig::fixed_range_vp_default(ind_id, start_ts, end_ts);
+                    let mut cfg = IndicatorConfig::fixed_range_vp_default(ind_id, start_ts, end_ts);
                     cfg.enabled = true;
                     self.charts[chart_idx].indicators.push(cfg);
                 }
@@ -1647,9 +1979,8 @@ impl App {
             .filter(|i| i.indicator_type == "anchored_vp")
             .count();
         if count >= MAX_ANCHORED_VP {
-            self.last_indicator_error = Some(format!(
-                "Anchored VP limit is {MAX_ANCHORED_VP} per chart"
-            ));
+            self.last_indicator_error =
+                Some(format!("Anchored VP limit is {MAX_ANCHORED_VP} per chart"));
             return;
         }
         let id = format!("avp{}", count + 1);
@@ -1687,8 +2018,7 @@ impl App {
             .filter(|i| i.indicator_type == "gex")
             .count();
         if count >= MAX_GEX {
-            self.last_indicator_error =
-                Some(format!("GEX limit is {MAX_GEX} per chart"));
+            self.last_indicator_error = Some(format!("GEX limit is {MAX_GEX} per chart"));
             return;
         }
         chart.indicators.push(IndicatorConfig::gex("gex"));
@@ -1709,8 +2039,7 @@ impl App {
             .filter(|i| i.indicator_type == "garch")
             .count();
         if count >= MAX_GARCH {
-            self.last_indicator_error =
-                Some(format!("GARCH limit is {MAX_GARCH} per chart"));
+            self.last_indicator_error = Some(format!("GARCH limit is {MAX_GARCH} per chart"));
             return;
         }
         chart.indicators.push(IndicatorConfig::garch("garch"));
@@ -2108,9 +2437,7 @@ impl App {
             }
             best_i
         };
-        let clamp_i = |i: i32| -> usize {
-            i.clamp(0, (bar_ts.len() as i32 - 1).max(0)) as usize
-        };
+        let clamp_i = |i: i32| -> usize { i.clamp(0, (bar_ts.len() as i32 - 1).max(0)) as usize };
         match which {
             0 => {
                 let i = clamp_i(nearest(start) as i32 + delta);
@@ -2307,8 +2634,7 @@ impl App {
 
     pub fn prompt_push_char(&mut self, c: char) {
         match &mut self.input_mode {
-            InputMode::InstrumentPrompt { buffer }
-            | InputMode::WatchlistAddPrompt { buffer } => {
+            InputMode::InstrumentPrompt { buffer } | InputMode::WatchlistAddPrompt { buffer } => {
                 // Instruments are alnum; allow `.` and `-` for future vendor symbols.
                 if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
                     if buffer.len() < 16 {
@@ -2463,6 +2789,9 @@ impl App {
             }
             IpcEvent::WatchlistFailed { message: _ } => {
                 // Leave membership unchanged; trader can retry.
+            }
+            IpcEvent::PaperFailed { message } => {
+                self.last_paper_error = Some(message);
             }
             IpcEvent::IndicatorsFailed { message } => {
                 // Leave local indicator draft; surface engine reason (often 422 detail).
@@ -2643,7 +2972,10 @@ mod tests {
         let chart = Chart::default_single();
         assert_eq!(chart.overlay_strength("ma"), DEFAULT_MA_STRENGTH);
         assert_eq!(chart.overlay_strength("session_vp"), DEFAULT_VP_STRENGTH);
-        assert_eq!(chart.overlay_strength("fixed_range_vp"), DEFAULT_VP_STRENGTH);
+        assert_eq!(
+            chart.overlay_strength("fixed_range_vp"),
+            DEFAULT_VP_STRENGTH
+        );
     }
 
     fn sample_bars(n: usize, start_ts: i64, period: i64) -> Vec<OhlcvBar> {
@@ -2814,7 +3146,10 @@ mod tests {
         app.input_mode = InputMode::IndicatorPanel;
 
         app.watchlist_select_delta(1);
-        assert_eq!(app.watchlist_selected, 0, "↑↓ must not move watchlist under panel");
+        assert_eq!(
+            app.watchlist_selected, 0,
+            "↑↓ must not move watchlist under panel"
+        );
         assert!(!app.load_selected_watchlist_symbol());
         assert_eq!(app.focused_chart().instrument, "SPY");
     }
@@ -2835,7 +3170,11 @@ mod tests {
         });
 
         app.pan_focused_chart(-1);
-        assert_eq!(app.chart().pan_cursor_ts, None, "pan must no-op in pin mode");
+        assert_eq!(
+            app.chart().pan_cursor_ts,
+            None,
+            "pan must no-op in pin mode"
+        );
 
         app.frvp_place_move(-1);
         assert_eq!(
@@ -2963,7 +3302,10 @@ mod tests {
             active_watchlist_id: String::new(),
         });
         assert_eq!(app.charts[0].overlay_strength("ma"), 0.55);
-        assert_eq!(app.charts[0].overlay_strength("session_vp"), DEFAULT_VP_STRENGTH);
+        assert_eq!(
+            app.charts[0].overlay_strength("session_vp"),
+            DEFAULT_VP_STRENGTH
+        );
     }
 
     #[test]
@@ -3005,7 +3347,7 @@ mod tests {
             },
             workspace: None,
             quotes: vec![],
-                    indicators: HashMap::new(),
+            indicators: HashMap::new(),
             paper: PaperSnapshot::default(),
         });
         assert_eq!(app.connection, ConnectionStatus::Connected);
@@ -3072,7 +3414,7 @@ mod tests {
                 volume: 1_000_000.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         match &app.chart().series {
@@ -3095,7 +3437,7 @@ mod tests {
             status: "unavailable".into(),
             bars: vec![],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         assert_eq!(app.chart().series, ChartSeriesState::Unavailable);
@@ -3119,7 +3461,7 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("other".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         assert_eq!(app.chart().series, ChartSeriesState::Loading);
@@ -3142,7 +3484,7 @@ mod tests {
                 volume: 50_900_000.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
@@ -3186,7 +3528,7 @@ mod tests {
                 volume: 50_900_000.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
@@ -3237,7 +3579,7 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
@@ -3278,7 +3620,7 @@ mod tests {
             status: "ok".into(),
             bars: vec![],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         assert_eq!(app.chart().timeframe, "1D");
@@ -3322,7 +3664,7 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
 
@@ -3411,7 +3753,7 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("primary".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         // Late failure from previous SPY interest must not clobber QQQ.
@@ -3439,15 +3781,15 @@ mod tests {
                         id: "top".into(),
                         instrument: "ES".into(),
                         timeframe: "1D".into(),
-                                            indicators: vec![],
-                                            type_styles: HashMap::new(),
+                        indicators: vec![],
+                        type_styles: HashMap::new(),
                     },
                     WorkspaceChartSnapshot {
                         id: "bottom".into(),
                         instrument: "QQQ".into(),
                         timeframe: "1h".into(),
-                                            indicators: vec![],
-                                            type_styles: HashMap::new(),
+                        indicators: vec![],
+                        type_styles: HashMap::new(),
                     },
                 ],
                 watchlists: vec![
@@ -3490,7 +3832,10 @@ mod tests {
         assert_eq!(app.charts[1].timeframe, "1h");
         assert!(app.needs_chart_load);
         assert_eq!(app.active_watchlist_id, "core");
-        assert_eq!(app.active_symbols(), &["SPY".to_string(), "QQQ".to_string()]);
+        assert_eq!(
+            app.active_symbols(),
+            &["SPY".to_string(), "QQQ".to_string()]
+        );
         assert_eq!(app.quote_for("SPY").map(|q| q.last), Some(Some(548.0)));
     }
 
@@ -3803,7 +4148,7 @@ mod tests {
                 volume: 1.0,
             }],
             chart_id: Some("top".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         app.apply_chart_series(ChartInterestResponse {
@@ -3819,7 +4164,7 @@ mod tests {
                 volume: 2.0,
             }],
             chart_id: Some("bottom".into()),
-                    indicators: vec![],
+            indicators: vec![],
             series: HashMap::new(),
         });
         app.apply_bar_update(BarUpdateEvent {
@@ -3866,9 +4211,9 @@ mod tests {
                 id: "primary".into(),
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
-                                    indicators: vec![],
-                                    type_styles: HashMap::new(),
-                    }],
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
             watchlists: vec![
                 WatchlistSnapshot {
                     id: "core".into(),
@@ -3928,9 +4273,9 @@ mod tests {
                 id: "primary".into(),
                 instrument: "SPY".into(),
                 timeframe: "1D".into(),
-                                    indicators: vec![],
-                                    type_styles: HashMap::new(),
-                    }],
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
             watchlists: vec![WatchlistSnapshot {
                 id: "core".into(),
                 name: "Core".into(),
@@ -4051,7 +4396,9 @@ mod tests {
         app.enter_workspace();
         app.input_mode = InputMode::IndicatorPanel;
         let chart = app.focused_chart_mut();
-        chart.indicators.push(IndicatorConfig::ma("ma10", "sma", 10));
+        chart
+            .indicators
+            .push(IndicatorConfig::ma("ma10", "sma", 10));
         chart.indicators.push(IndicatorConfig::volume("volume"));
         chart
             .indicators
@@ -4323,7 +4670,10 @@ mod tests {
         app.type_style_nudge(-4);
         app.type_style_confirm();
         assert!(app.type_style_edit.is_none());
-        assert!((app.focused_chart().overlay_strength("ma") - (DEFAULT_MA_STRENGTH - 0.20)).abs() < 1e-9);
+        assert!(
+            (app.focused_chart().overlay_strength("ma") - (DEFAULT_MA_STRENGTH - 0.20)).abs()
+                < 1e-9
+        );
         let pending = app.pending_type_styles.expect("armed for engine");
         assert_eq!(pending.chart_id, "primary");
         assert!(
@@ -4379,7 +4729,9 @@ mod tests {
         app.enter_workspace();
         app.input_mode = InputMode::IndicatorPanel;
         let chart = app.focused_chart_mut();
-        chart.indicators.push(IndicatorConfig::ma("ma10", "sma", 10));
+        chart
+            .indicators
+            .push(IndicatorConfig::ma("ma10", "sma", 10));
         chart.indicators.push(IndicatorConfig::volume("volume"));
         app.indicator_list_side = IndicatorListSide::Available;
         app.indicator_clear_except_volume();
@@ -4425,16 +4777,16 @@ mod tests {
                     id: "top".into(),
                     instrument: "QQQ".into(),
                     timeframe: "1D".into(),
-                                        indicators: vec![],
-                                        type_styles: HashMap::new(),
-                    },
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
                 WorkspaceChartSnapshot {
                     id: "bottom".into(),
                     instrument: "SPY".into(),
                     timeframe: "1D".into(),
-                                        indicators: vec![],
-                                        type_styles: HashMap::new(),
-                    },
+                    indicators: vec![],
+                    type_styles: HashMap::new(),
+                },
             ],
             watchlists: vec![],
             active_watchlist_id: String::new(),
@@ -4476,9 +4828,32 @@ mod tests {
                 leverage_enabled: false,
                 leverage_multiple: 1.0,
             },
+            working_orders: vec![],
             positions: vec![],
             filled_order_history: vec![],
             balance_history: vec![],
+        }
+    }
+
+    fn sample_working_order(
+        id: &str,
+        instrument: &str,
+        side: &str,
+        order_type: &str,
+        qty: f64,
+        limit: Option<f64>,
+        stop: Option<f64>,
+    ) -> WorkingOrderSnapshot {
+        WorkingOrderSnapshot {
+            id: id.into(),
+            account_id: "pa_1".into(),
+            instrument: instrument.into(),
+            side: side.into(),
+            order_type: order_type.into(),
+            qty,
+            limit,
+            stop,
+            placed_ts: 1_719_792_000,
         }
     }
 
@@ -4502,6 +4877,7 @@ mod tests {
         assert!(app.paper.positions.is_empty());
         assert!(app.paper.filled_order_history.is_empty());
         assert!(app.paper.balance_history.is_empty());
+        assert!(app.paper.working_orders.is_empty());
     }
 
     #[test]
@@ -4595,5 +4971,164 @@ mod tests {
         assert_eq!(app.input_mode, InputMode::Normal);
         app.watchlist_select_delta(1);
         assert_eq!(app.watchlist_selected, 1);
+    }
+
+    #[test]
+    fn order_side_panel_place_defaults_to_focused_chart_instrument() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_workspace(dual_workspace());
+        app.focused = 0;
+        app.toggle_paper_panel();
+        assert_eq!(app.order_side_instrument(), "QQQ");
+        app.order_side.kind = WorkingOrderKind::Limit;
+        app.order_side.qty = 3.0;
+        app.order_side.limit = 480.0;
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Place {
+                instrument: "QQQ".into(),
+                side: "buy".into(),
+                order_type: "limit".into(),
+                qty: 3.0,
+                limit: Some(480.0),
+                stop: None,
+            })
+        );
+
+        app.pending_paper = None;
+        app.close_paper_panel();
+        app.focused = 1;
+        app.toggle_paper_panel();
+        assert_eq!(app.order_side_instrument(), "SPY");
+        app.paper_set_kind(WorkingOrderKind::Market);
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Place {
+                instrument: "SPY".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                qty: 1.0,
+                limit: None,
+                stop: None,
+            })
+        );
+    }
+
+    #[test]
+    fn order_side_panel_modify_and_cancel_selected_working_order() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        assert_eq!(app.order_side.selected_order_id.as_deref(), Some("wo_1"));
+        assert_eq!(app.order_side.qty, 10.0);
+        assert_eq!(app.order_side.limit, 540.0);
+
+        app.paper_nudge_qty(-6);
+        app.paper_nudge_price(50);
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Modify {
+                order_id: "wo_1".into(),
+                qty: Some(4.0),
+                limit: Some(540.5),
+                stop: None,
+            })
+        );
+
+        app.pending_paper = None;
+        app.paper_cancel_selected();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Cancel {
+                order_id: "wo_1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn working_overlay_lines_only_on_matching_instrument() {
+        let mut app = App::default();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![
+            sample_working_order("wo_spy_l", "SPY", "buy", "limit", 1.0, Some(540.0), None),
+            sample_working_order("wo_spy_s", "SPY", "sell", "stop", 1.0, None, Some(530.0)),
+            sample_working_order("wo_spy_m", "SPY", "buy", "market", 1.0, None, None),
+            sample_working_order("wo_qqq", "QQQ", "buy", "limit", 1.0, Some(480.0), None),
+        ];
+        app.apply_paper(desk);
+
+        let spy = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert_eq!(spy.len(), 2);
+        assert!(spy.iter().all(|l| l.type_key == "working_order"));
+        assert_eq!(spy[0].price, 540.0);
+        assert_eq!(spy[1].price, 530.0);
+        let qqq = app.working_overlay_levels("QQQ", 0.0, 10.0);
+        assert_eq!(qqq.len(), 1);
+        assert_eq!(qqq[0].price, 480.0);
+        assert!(app.working_overlay_levels("IWM", 0.0, 10.0).is_empty());
+    }
+
+    #[test]
+    fn paper_panel_keys_idle_until_open() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.paper_cycle_side();
+        app.paper_submit();
+        assert_eq!(app.order_side.side, OrderSide::Buy);
+        assert!(app.pending_paper.is_none());
+        app.toggle_paper_panel();
+        app.paper_cycle_side();
+        assert_eq!(app.order_side.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn order_side_panel_reports_missing_limit_instead_of_silent_noop() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.paper_set_kind(WorkingOrderKind::Limit);
+        app.order_side.limit = 0.0;
+        app.paper_submit();
+        assert!(app.pending_paper.is_none());
+        assert_eq!(app.last_paper_error.as_deref(), Some("limit is required"));
+    }
+
+    #[test]
+    fn order_side_panel_locks_type_while_a_working_order_is_selected() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        app.paper_set_kind(WorkingOrderKind::Stop);
+        app.paper_set_side(OrderSide::Sell);
+        assert_eq!(app.order_side.kind, WorkingOrderKind::Limit);
+        assert_eq!(app.order_side.side, OrderSide::Buy);
     }
 }

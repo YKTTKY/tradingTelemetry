@@ -82,6 +82,32 @@ class PaperActiveBody(BaseModel):
     account_id: str = Field(min_length=1)
 
 
+class PaperOrderPlaceBody(BaseModel):
+    """Place a working order on the active paper account."""
+
+    instrument: str = Field(min_length=1)
+    side: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    qty: float
+    limit: float | None = None
+    stop: float | None = None
+
+
+class PaperOrderModifyBody(BaseModel):
+    """Modify qty / limit / stop on a resting working order."""
+
+    order_id: str = Field(min_length=1)
+    qty: float | None = None
+    limit: float | None = None
+    stop: float | None = None
+
+
+class PaperOrderCancelBody(BaseModel):
+    """Cancel a resting working order."""
+
+    order_id: str = Field(min_length=1)
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -405,6 +431,55 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return publish_paper("active_changed")
+
+    def resolve_last_price(instrument: str) -> float | None:
+        last = quotes.last_price(instrument)
+        if last is not None:
+            return last
+        result = market_vendor.fetch_history(instrument, "1D")
+        if result.available and result.bars:
+            return float(result.bars[-1].close)
+        return None
+
+    @app.post("/v1/paper/orders")
+    def place_paper_order(body: PaperOrderPlaceBody) -> dict[str, Any]:
+        try:
+            paper.place_order(
+                instrument=body.instrument,
+                side=body.side,
+                order_type=body.type,
+                qty=body.qty,
+                limit=body.limit,
+                stop=body.stop,
+                last_price=resolve_last_price(body.instrument),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("order_placed")
+
+    @app.post("/v1/paper/orders/modify")
+    def modify_paper_order(body: PaperOrderModifyBody) -> dict[str, Any]:
+        try:
+            existing = paper.working_orders.get(body.order_id.strip())
+            instrument = existing.instrument if existing is not None else ""
+            paper.modify_order(
+                body.order_id,
+                qty=body.qty,
+                limit=body.limit,
+                stop=body.stop,
+                last_price=resolve_last_price(instrument) if instrument else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("order_modified")
+
+    @app.post("/v1/paper/orders/cancel")
+    def cancel_paper_order(body: PaperOrderCancelBody) -> dict[str, Any]:
+        try:
+            paper.cancel_order(body.order_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("order_cancelled")
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

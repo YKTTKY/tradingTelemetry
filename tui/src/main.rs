@@ -11,20 +11,23 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use app::{App, IndicatorListSide, InputMode, PendingWatchlistOp, Screen};
+use app::{
+    App, IndicatorListSide, InputMode, OrderSide, PendingPaperOp, PendingWatchlistOp, Screen,
+    WorkingOrderKind,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ipc::{
-    post_chart_interest, post_indicators, post_type_styles, post_watchlist_active,
+    EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_cancel,
+    post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
     post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
     run_ipc_loop,
-    EngineEndpoint, IpcEvent,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 const DEFAULT_ENGINE: &str = "http://127.0.0.1:8765";
@@ -91,9 +94,7 @@ async fn run_loop(
                     PendingWatchlistOp::Remove { symbol } => {
                         post_watchlist_remove(&ep, &symbol).await
                     }
-                    PendingWatchlistOp::Rename { name } => {
-                        post_watchlist_rename(&ep, &name).await
-                    }
+                    PendingWatchlistOp::Rename { name } => post_watchlist_rename(&ep, &name).await,
                 };
                 match result {
                     Ok(body) => {
@@ -122,6 +123,44 @@ async fn run_loop(
                     }
                     Err(err) => {
                         let _ = tx.send(IpcEvent::IndicatorsFailed {
+                            message: err.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
+        if let Some(op) = app.pending_paper.clone() {
+            app.paper_request_started();
+            let ep = endpoint.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = match op {
+                    PendingPaperOp::Place {
+                        instrument,
+                        side,
+                        order_type,
+                        qty,
+                        limit,
+                        stop,
+                    } => {
+                        post_paper_place(&ep, &instrument, &side, &order_type, qty, limit, stop)
+                            .await
+                    }
+                    PendingPaperOp::Modify {
+                        order_id,
+                        qty,
+                        limit,
+                        stop,
+                    } => post_paper_modify(&ep, &order_id, qty, limit, stop).await,
+                    PendingPaperOp::Cancel { order_id } => post_paper_cancel(&ep, &order_id).await,
+                };
+                match result {
+                    Ok(paper) => {
+                        let _ = tx.send(IpcEvent::PaperUpdate(paper));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(IpcEvent::PaperFailed {
                             message: err.to_string(),
                         });
                     }
@@ -237,6 +276,19 @@ fn handle_key(app: &mut App, code: KeyCode) {
         InputMode::PaperPanel => match code {
             KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
             KeyCode::Esc => app.close_paper_panel(),
+            KeyCode::Enter => app.paper_submit(),
+            KeyCode::Up => app.paper_select_working_delta(-1),
+            KeyCode::Down | KeyCode::Tab => app.paper_select_working_delta(1),
+            KeyCode::Left => app.paper_nudge_price(-1),
+            KeyCode::Right => app.paper_nudge_price(1),
+            KeyCode::Char('+') | KeyCode::Char('=') => app.paper_nudge_qty(1),
+            KeyCode::Char('-') | KeyCode::Char('_') => app.paper_nudge_qty(-1),
+            KeyCode::Char('b') | KeyCode::Char('B') => app.paper_set_side(OrderSide::Buy),
+            KeyCode::Char('s') | KeyCode::Char('S') => app.paper_set_side(OrderSide::Sell),
+            KeyCode::Char('m') | KeyCode::Char('M') => app.paper_set_kind(WorkingOrderKind::Market),
+            KeyCode::Char('l') | KeyCode::Char('L') => app.paper_set_kind(WorkingOrderKind::Limit),
+            KeyCode::Char('t') | KeyCode::Char('T') => app.paper_set_kind(WorkingOrderKind::Stop),
+            KeyCode::Char('x') | KeyCode::Char('X') => app.paper_cancel_selected(),
             KeyCode::Char('q') => app.quit(),
             _ => {}
         },

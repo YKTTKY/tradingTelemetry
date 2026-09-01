@@ -3,25 +3,23 @@
 use chrono::{Offset, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap},
-    Frame,
 };
-use tui_candlestick_chart::{
-    Candle, CandleStickChart, CandleStickChartState, ChartView,
-};
+use tui_candlestick_chart::{Candle, CandleStickChart, CandleStickChartState, ChartView};
 
 use crate::app::{
-    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, IndicatorListSide, InputMode,
-    LayoutMode, Screen, AVAILABLE_INDICATOR_TYPES, UNAVAILABLE_COPY,
+    AVAILABLE_INDICATOR_TYPES, App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase,
+    IndicatorListSide, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
 };
 use crate::feed_clock::format_feed_clocks;
 use crate::ipc::{OhlcvBar, QuoteRow};
 use crate::overlay::{
-    paint_overlays, volume_bar_color, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
-    OverlayPin, MAX_VP_HIST_PANE_FRACTION,
+    MAX_VP_HIST_PANE_FRACTION, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
+    OverlayPin, paint_overlays, volume_bar_color,
 };
 use crate::timeframe::product_timeframe_to_interval;
 
@@ -106,7 +104,10 @@ fn draw_help_popup(frame: &mut Frame) {
         row("q", "Quit the app"),
         row("Esc", "Close help, prompt, or panel (Welcome: quit)"),
         section("Welcome"),
-        row("Enter", "Open workspace (Welcome only; does not load watchlist symbols)"),
+        row(
+            "Enter",
+            "Open workspace (Welcome only; does not load watchlist symbols)",
+        ),
         section("Normal mode · input focus"),
         row("↑ / ↓", "Watchlist row select (sidebar)"),
         row("← / →", "Pan focused chart through loaded history"),
@@ -126,18 +127,30 @@ fn draw_help_popup(frame: &mut Frame) {
         section("Watchlist (Normal mode)"),
         row("w", "Show / hide sidebar"),
         row("n / p", "Next / previous watchlist sheet"),
-        row("Enter / Space", "Load selected symbol on focused chart (keep TF + indicators)"),
+        row(
+            "Enter / Space",
+            "Load selected symbol on focused chart (keep TF + indicators)",
+        ),
         row("r", "Rename active watchlist sheet"),
         row("a", "Add symbol to active list"),
         row("x / d", "Remove selected symbol"),
         section("Indicator panel · Available | Current (owns keys; watchlist inactive)"),
-        row("Tab", "Switch active list Available ↔ Current (default Current)"),
+        row(
+            "Tab",
+            "Switch active list Available ↔ Current (default Current)",
+        ),
         row("↑ / ↓", "Move within the active list (not watchlist)"),
         row("← / →", "Not pan — panel owns focus while open"),
         section("Available (left · catalog)"),
         row("Space / Enter", "Add selected type (respects max counts)"),
-        row("c", "Type style popup — overlay strength for that type on this chart"),
-        row("m v p f a y g", "Quick-add shortcuts (MA · Vol · SVP · FRVP · AVP · GEX · GARCH)"),
+        row(
+            "c",
+            "Type style popup — overlay strength for that type on this chart",
+        ),
+        row(
+            "m v p f a y g",
+            "Quick-add shortcuts (MA · Vol · SVP · FRVP · AVP · GEX · GARCH)",
+        ),
         section("Current (right · instances)"),
         row("Space / Enter", "Enable / disable selected instance"),
         row("x", "Remove selected indicator"),
@@ -151,8 +164,14 @@ fn draw_help_popup(frame: &mut Frame) {
         row("1 2 3", "VP: toggle POC / VAH / VAL"),
         row("o / Esc", "Close indicator panel"),
         section("Type style popup (from Available · c)"),
-        row("← / → or +/-", "Nudge strength (0–1): MA/VP overlay intensity; Volume subplot bar intensity"),
-        row("Enter", "Apply strength to all instances of that type on focused chart"),
+        row(
+            "← / → or +/-",
+            "Nudge strength (0–1): MA/VP overlay intensity; Volume subplot bar intensity",
+        ),
+        row(
+            "Enter",
+            "Apply strength to all instances of that type on focused chart",
+        ),
         row("Esc", "Cancel without saving"),
         section("Fixed Range pin placement (← → move pin, not pan)"),
         row("← / →", "Move pin cursor bar-by-bar (h/l also)"),
@@ -212,7 +231,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         | InputMode::WatchlistAddPrompt { .. }
         | InputMode::WatchlistRenamePrompt { .. } => 3,
         InputMode::IndicatorPanel => 12,
-        InputMode::PaperPanel => 16,
+        InputMode::PaperPanel => 18,
         InputMode::FrvpPlacing | InputMode::AvpPlacing => 3,
         InputMode::Normal => 0,
     };
@@ -348,7 +367,9 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             .active_paper_account()
             .map(|a| a.name.as_str())
             .unwrap_or("—");
-        Paragraph::new(format!("Paper · {name}  ·  Esc close  ·  ? help"))
+        Paragraph::new(format!(
+            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  ↑↓ select  Enter  x cancel  ·  Esc close  ·  ? help"
+        ))
             .style(Style::default().fg(Color::DarkGray))
     } else if panel_open {
         let side = match app.indicator_list_side {
@@ -378,17 +399,19 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(28),
             Constraint::Percentage(24),
-            Constraint::Percentage(24),
-            Constraint::Percentage(24),
+            Constraint::Percentage(20),
+            Constraint::Percentage(18),
+            Constraint::Percentage(20),
+            Constraint::Percentage(18),
         ])
         .split(area);
 
-    draw_paper_settings(frame, cols[0], app);
+    draw_order_side_panel(frame, cols[0], app);
+    draw_paper_settings(frame, cols[1], app);
     draw_paper_table(
         frame,
-        cols[1],
+        cols[2],
         " Position ",
         "symbol  side  qty  avg  uPnL",
         app.paper
@@ -399,7 +422,7 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
     );
     draw_paper_table(
         frame,
-        cols[2],
+        cols[3],
         " Filled order history ",
         "symbol  side  type  qty  fill",
         app.paper
@@ -410,7 +433,7 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
     );
     draw_paper_table(
         frame,
-        cols[3],
+        cols[4],
         " Balance history ",
         "time  balance",
         app.paper
@@ -419,6 +442,72 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
             .map(|row| format!("{:.2}", row.balance))
             .collect(),
     );
+}
+
+fn draw_order_side_panel(frame: &mut Frame, area: Rect, app: &App) {
+    use crate::app::{OrderSide, WorkingOrderKind};
+
+    let selected = app.order_side.selected_order_id.as_deref();
+    let title = if selected.is_some() {
+        " Order side · modify "
+    } else {
+        " Order side · place "
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(format!(
+        "instr  {}",
+        app.order_side_instrument()
+    )));
+    let side = match app.order_side.side {
+        OrderSide::Buy => "buy",
+        OrderSide::Sell => "sell",
+    };
+    let kind = match app.order_side.kind {
+        WorkingOrderKind::Market => "market",
+        WorkingOrderKind::Limit => "limit",
+        WorkingOrderKind::Stop => "stop",
+    };
+    lines.push(Line::from(format!("side   {side}   (b/s)")));
+    lines.push(Line::from(format!("type   {kind}   (m/l/t)")));
+    lines.push(Line::from(format!(
+        "qty    {:.0}   (+/-)",
+        app.order_side.qty
+    )));
+    match app.order_side.kind {
+        WorkingOrderKind::Limit => {
+            lines.push(Line::from(format!(
+                "limit  {:.2}   (←/→)",
+                app.order_side.limit
+            )));
+        }
+        WorkingOrderKind::Stop => {
+            lines.push(Line::from(format!(
+                "stop   {:.2}   (←/→)",
+                app.order_side.stop
+            )));
+        }
+        WorkingOrderKind::Market => {
+            lines.push(Line::from("px     market (no line)"));
+        }
+    }
+    if let Some(id) = selected {
+        lines.push(Line::from(format!("sel    {id}")));
+    } else {
+        lines.push(Line::from("sel    (new)"));
+    }
+    if let Some(err) = app.last_paper_error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::LightRed),
+        )));
+    }
+
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string()),
+    );
+    frame.render_widget(body, area);
 }
 
 fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
@@ -492,13 +581,7 @@ fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(body, area);
 }
 
-fn draw_paper_table(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    header: &str,
-    rows: Vec<String>,
-) {
+fn draw_paper_table(frame: &mut Frame, area: Rect, title: &str, header: &str, rows: Vec<String>) {
     let mut lines = vec![Line::from(Span::styled(
         header.to_string(),
         Style::default()
@@ -611,8 +694,7 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
         )));
     } else {
         for (i, ind) in chart.indicators.iter().enumerate() {
-            let selected =
-                active && i == app.indicator_selected.min(chart.indicators.len() - 1);
+            let selected = active && i == app.indicator_selected.min(chart.indicators.len() - 1);
             let mark = if selected { "› " } else { "  " };
             let on = if ind.enabled { "on " } else { "off" };
             let optional_status = |id: &str| -> String {
@@ -684,8 +766,8 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
 
             // MA rows: show stable paint color name, tinted to match the chart stroke.
             if ind.indicator_type == "ma" {
-                let (ma_color, ma_name) = ma_slot_for_indicator(chart, &ind.id)
-                    .unwrap_or_else(|| ma_slot(0));
+                let (ma_color, ma_name) =
+                    ma_slot_for_indicator(chart, &ind.id).unwrap_or_else(|| ma_slot(0));
                 let head = format!(
                     "{mark}[{on}] MA {} {}",
                     ind.ma_type.as_deref().unwrap_or("sma").to_uppercase(),
@@ -693,9 +775,7 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
                 );
                 let color_style = if ind.enabled {
                     if selected {
-                        Style::default()
-                            .fg(ma_color)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(ma_color).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(ma_color)
                     }
@@ -730,9 +810,7 @@ fn draw_current_list(frame: &mut Frame, area: Rect, app: &App, chart: &Chart) {
                         "ext-"
                     };
                     let pins = if !ind.enabled
-                        && (ind.start.is_none()
-                            || ind.end.is_none()
-                            || ind.start == ind.end)
+                        && (ind.start.is_none() || ind.end.is_none() || ind.start == ind.end)
                     {
                         "pins?"
                     } else {
@@ -918,8 +996,14 @@ fn watchlist_row(symbol: &str, quote: Option<&QuoteRow>, selected: bool) -> Line
     let sym = format!("{symbol:<6}");
     match quote {
         Some(q) if q.status == "ok" => {
-            let last = q.last.map(|v| format!("{v:>8.2}")).unwrap_or_else(|| format!("{:>8}", "—"));
-            let chg = q.change.map(|v| format!("{v:>+8.2}")).unwrap_or_else(|| format!("{:>8}", "—"));
+            let last = q
+                .last
+                .map(|v| format!("{v:>8.2}"))
+                .unwrap_or_else(|| format!("{:>8}", "—"));
+            let chg = q
+                .change
+                .map(|v| format!("{v:>+8.2}"))
+                .unwrap_or_else(|| format!("{:>8}", "—"));
             let pct = q
                 .change_pct
                 .map(|v| format!("{:>+6.2}%", v * 100.0))
@@ -988,9 +1072,7 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App, chart: &Chart, focused: 
             frame.render_widget(body, area);
         }
         ChartSeriesState::Unavailable => {
-            let copy = app
-                .empty_state_copy_for(chart)
-                .unwrap_or(UNAVAILABLE_COPY);
+            let copy = app.empty_state_copy_for(chart).unwrap_or(UNAVAILABLE_COPY);
             let body = Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -1034,7 +1116,11 @@ fn draw_price_and_volume(
     if bars.is_empty() {
         let body = Paragraph::new(UNAVAILABLE_COPY)
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title(title.to_string()));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            );
         frame.render_widget(body, area);
         return;
     }
@@ -1128,7 +1214,11 @@ fn draw_candles(
             chart.timeframe
         ))
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title(title.to_string()));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title.to_string()),
+        );
         frame.render_widget(body, area);
         return;
     };
@@ -1136,7 +1226,11 @@ fn draw_candles(
     if widget_candles.is_empty() {
         let body = Paragraph::new(UNAVAILABLE_COPY)
             .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).title(title.to_string()));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title.to_string()),
+            );
         frame.render_widget(body, area);
         return;
     }
@@ -1278,10 +1372,7 @@ fn draw_candles(
     let y_span = (view.y_max - view.y_min).max(f64::EPSILON);
 
     // Map full-series index → global start for pin helpers.
-    let start = bars
-        .iter()
-        .position(|b| b.ts == visible[0].ts)
-        .unwrap_or(0);
+    let start = bars.iter().position(|b| b.ts == visible[0].ts).unwrap_or(0);
 
     let mut layers = OverlayLayers::default();
 
@@ -1364,8 +1455,14 @@ fn draw_candles(
         });
     }
 
+    layers.working.extend(app.working_overlay_levels(
+        &chart.instrument,
+        0.0,
+        (n_cols - 1.0).max(0.0),
+    ));
+
     // Cell-based compose on the same buffer as candles (no Braille Canvas world).
-    // Paint order inside paint_overlays: hist → levels → MA → pins.
+    // Paint order inside paint_overlays: hist → levels → MA → working lines → pins.
     let strengths = chart.overlay_strength_map();
     paint_overlays(frame.buffer_mut(), &view, &layers, &strengths);
 }
@@ -1382,9 +1479,7 @@ fn collect_frvp_pin_labels(
     y_span: f64,
 ) -> Vec<(f64, f64, String, Color)> {
     let mut out: Vec<(f64, f64, String, Color)> = Vec::new();
-    let pin_y = |bar: &OhlcvBar| -> f64 {
-        (bar.high + y_span * 0.04).min(max_p - y_span * 0.01)
-    };
+    let pin_y = |bar: &OhlcvBar| -> f64 { (bar.high + y_span * 0.04).min(max_p - y_span * 0.01) };
     let bar_x = |global_i: usize| -> Option<(f64, &OhlcvBar)> {
         if global_i < view_start || global_i >= view_start + visible.len() {
             return None;
@@ -1466,12 +1561,7 @@ fn collect_frvp_pin_labels(
                 };
                 out.push((x, pin_y(bar), glyph.into(), Color::Yellow));
                 // Extra bright stem down the wick so the pin is hard to miss.
-                out.push((
-                    x,
-                    bar.high,
-                    "●".into(),
-                    Color::Yellow,
-                ));
+                out.push((x, bar.high, "●".into(), Color::Yellow));
             }
         }
     }
@@ -1543,7 +1633,7 @@ fn hist_color_for_opacity(name: Option<&str>, opacity: Option<f64>) -> Option<Co
 /// Distinct soft defaults so Session / FRVP / AVP don't look identical (TV-like).
 fn default_vp_hist_color(type_key: &str) -> Color {
     match type_key {
-        "session_vp" => Color::Rgb(70, 110, 160),   // steel blue
+        "session_vp" => Color::Rgb(70, 110, 160),     // steel blue
         "fixed_range_vp" => Color::Rgb(140, 90, 170), // purple
         "anchored_vp" => Color::Rgb(50, 140, 150),    // teal
         _ => Color::DarkGray,
@@ -1558,7 +1648,10 @@ fn capped_vp_box_width(span: f64, box_width_pct: f64, pane_width: f64) -> f64 {
 }
 
 fn build_session_vp_draw(
-    svp: Option<(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)>,
+    svp: Option<(
+        &crate::ipc::IndicatorConfig,
+        &crate::ipc::IndicatorSeriesData,
+    )>,
     visible: &[OhlcvBar],
     n: f64,
     pane_width: f64,
@@ -1597,7 +1690,10 @@ fn build_session_vp_draw(
     let val_color = vp_level_color("val", cfg.val.as_ref().and_then(|s| s.color.as_deref()));
     // Skip levels when opacity is explicitly 0.
     let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
-        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+        style
+            .and_then(|s| s.opacity)
+            .map(|o| o > 0.0)
+            .unwrap_or(true)
     };
 
     // Map bar ts → x index within the visible window (nearest open).
@@ -1682,14 +1778,14 @@ fn build_session_vp_draw(
         }
     }
 
-    VpOverlayDraw {
-        hist_rects,
-        levels,
-    }
+    VpOverlayDraw { hist_rects, levels }
 }
 
 fn build_fixed_range_vp_draw(
-    frvps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+    frvps: &[(
+        &crate::ipc::IndicatorConfig,
+        &crate::ipc::IndicatorSeriesData,
+    )],
     visible: &[OhlcvBar],
     n: f64,
     pane_width: f64,
@@ -1722,7 +1818,10 @@ fn build_fixed_range_vp_draw(
     };
 
     let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
-        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+        style
+            .and_then(|s| s.opacity)
+            .map(|o| o > 0.0)
+            .unwrap_or(true)
     };
 
     let mut hist_rects: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
@@ -1754,10 +1853,7 @@ fn build_fixed_range_vp_draw(
         let val_color = vp_level_color("val", cfg.val.as_ref().and_then(|s| s.color.as_deref()));
 
         for profile in &series.profiles {
-            let range_start = profile
-                .range_start
-                .or(cfg.start)
-                .unwrap_or(vis_start);
+            let range_start = profile.range_start.or(cfg.start).unwrap_or(vis_start);
             let range_end = profile.range_end.or(cfg.end).unwrap_or(vis_end);
             let levels_end = profile
                 .levels_end
@@ -1772,15 +1868,9 @@ fn build_fixed_range_vp_draw(
             let x_hist_end = ts_to_x(range_end);
             let x_levels_end = ts_to_x(levels_end);
             let (hist_lo, hist_hi) = if x_hist_end >= x_start {
-                (
-                    x_start.min(n - 0.5).max(0.0),
-                    x_hist_end.min(n).max(0.5),
-                )
+                (x_start.min(n - 0.5).max(0.0), x_hist_end.min(n).max(0.5))
             } else {
-                (
-                    x_hist_end.min(n - 0.5).max(0.0),
-                    x_start.min(n).max(0.5),
-                )
+                (x_hist_end.min(n - 0.5).max(0.0), x_start.min(n).max(0.5))
             };
             let levels_hi = x_levels_end.min(n).max(hist_hi);
             let span = (hist_hi - hist_lo).max(1.0);
@@ -1835,14 +1925,14 @@ fn build_fixed_range_vp_draw(
         }
     }
 
-    VpOverlayDraw {
-        hist_rects,
-        levels,
-    }
+    VpOverlayDraw { hist_rects, levels }
 }
 
 fn build_anchored_vp_draw(
-    avps: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+    avps: &[(
+        &crate::ipc::IndicatorConfig,
+        &crate::ipc::IndicatorSeriesData,
+    )],
     visible: &[OhlcvBar],
     n: f64,
     pane_width: f64,
@@ -1878,7 +1968,10 @@ fn build_anchored_vp_draw(
     };
 
     let level_visible = |style: Option<&crate::ipc::LevelStyle>| {
-        style.and_then(|s| s.opacity).map(|o| o > 0.0).unwrap_or(true)
+        style
+            .and_then(|s| s.opacity)
+            .map(|o| o > 0.0)
+            .unwrap_or(true)
     };
 
     let mut hist_rects: Vec<(f64, f64, f64, f64, Color)> = Vec::new();
@@ -1927,15 +2020,9 @@ fn build_anchored_vp_draw(
             let x_hist_end = ts_to_x(range_end);
             let x_levels_end = ts_to_x(levels_end);
             let (hist_lo, hist_hi) = if x_hist_end >= x_start {
-                (
-                    x_start.min(n - 0.5).max(0.0),
-                    x_hist_end.min(n).max(0.5),
-                )
+                (x_start.min(n - 0.5).max(0.0), x_hist_end.min(n).max(0.5))
             } else {
-                (
-                    x_hist_end.min(n - 0.5).max(0.0),
-                    x_start.min(n).max(0.5),
-                )
+                (x_hist_end.min(n - 0.5).max(0.0), x_start.min(n).max(0.5))
             };
             let levels_hi = x_levels_end.min(n).max(hist_hi);
             let span = (hist_hi - hist_lo).max(1.0);
@@ -1989,15 +2076,15 @@ fn build_anchored_vp_draw(
         }
     }
 
-    VpOverlayDraw {
-        hist_rects,
-        levels,
-    }
+    VpOverlayDraw { hist_rects, levels }
 }
 
 fn ma_legend(
     chart: &Chart,
-    ma_lines: &[(&crate::ipc::IndicatorConfig, &crate::ipc::IndicatorSeriesData)],
+    ma_lines: &[(
+        &crate::ipc::IndicatorConfig,
+        &crate::ipc::IndicatorSeriesData,
+    )],
 ) -> String {
     if ma_lines.is_empty() {
         return String::new();
@@ -2099,7 +2186,10 @@ fn feed_line(app: &App) -> Line<'static> {
 
     Line::from(vec![
         Span::raw("feed: "),
-        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("  vendor={vendor}{hb}{clocks}")),
         Span::styled(err, Style::default().fg(Color::Red)),
     ])

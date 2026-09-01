@@ -4,21 +4,21 @@
 
 **Blocked by:** 01 — Paper desk
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Order side panel can place market / limit / stop with side and qty; instrument defaults to the **focused chart**
-- [ ] Place rejected when qty cannot be fully supported (buying power / account rules already on the desk) — **no partials**, no stub **working order**
-- [ ] Modify qty / limit / stop on a resting **working order**; cancel removes it
-- [ ] Dual layout: place/modify target the focused chart’s **instrument**; **lines** paint only on charts whose **instrument** matches
-- [ ] Working **lines** live on the existing price pane (same overlay family as VP levels), distinct from MA polylines; no new candle renderer
-- [ ] Market **working orders** are accepted and stored; do **not** implement **bar-touch fill** in this ticket
-- [ ] No dense permanent working-orders table in the TUI
-- [ ] Snapshot `paper` includes **working orders** so reconnecting TUI redraws lines
-- [ ] Place / modify / cancel emit discrete paper WS events (not `bar_update`)
-- [ ] SQLite persists **working orders** across engine restart
-- [ ] Paper panel / order side panel open → owns keys (indicator-panel pattern)
-- [ ] Fake-vendor IPC tests for place / modify / cancel / persist. TUI tests for overlay lines and additive serde.
-- [ ] TUI never calls a vendor.
+- [x] Order side panel can place market / limit / stop with side and qty; instrument defaults to the **focused chart**
+- [x] Place rejected when qty cannot be fully supported (buying power / account rules already on the desk) — **no partials**, no stub **working order**
+- [x] Modify qty / limit / stop on a resting **working order**; cancel removes it
+- [x] Dual layout: place/modify target the focused chart’s **instrument**; **lines** paint only on charts whose **instrument** matches
+- [x] Working **lines** live on the existing price pane (same overlay family as VP levels), distinct from MA polylines; no new candle renderer
+- [x] Market **working orders** are accepted and stored; do **not** implement **bar-touch fill** in this ticket
+- [x] No dense permanent working-orders table in the TUI
+- [x] Snapshot `paper` includes **working orders** so reconnecting TUI redraws lines
+- [x] Place / modify / cancel emit discrete paper WS events (not `bar_update`)
+- [x] SQLite persists **working orders** across engine restart
+- [x] Paper panel / order side panel open → owns keys (indicator-panel pattern)
+- [x] Fake-vendor IPC tests for place / modify / cancel / persist. TUI tests for overlay lines and additive serde.
+- [x] TUI never calls a vendor.
 
 ## Notes
 

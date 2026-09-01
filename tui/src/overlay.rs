@@ -1,6 +1,6 @@
 //! Overlay compose + type overlay strength for the price pane.
 //!
-//! Paint order (after candles/axes): VP hist → levels → MA → pins.
+//! Paint order (after candles/axes): VP hist → levels → MA → working lines → pins.
 //! Overlays never replace candle body/wick glyphs (candles stay readable).
 
 use ratatui::{
@@ -35,12 +35,22 @@ pub const VOLUME_UP_COLOR: Color = Color::Rgb(52, 208, 88);
 /// Full-strength down volume bar (matches candle red family).
 pub const VOLUME_DOWN_COLOR: Color = Color::Rgb(234, 74, 90);
 
+/// Overlay type key for working-order price lines (not MA polylines).
+pub const WORKING_ORDER_TYPE_KEY: &str = "working_order";
+/// Buy working-order line (distinct from VP POC/VAH/VAL).
+pub const WORKING_BUY_COLOR: Color = Color::Rgb(255, 196, 64);
+/// Sell working-order line (distinct from VP POC/VAH/VAL).
+pub const WORKING_SELL_COLOR: Color = Color::Rgb(196, 96, 255);
+/// Full-strength working lines (not a user type-style this ship).
+pub const DEFAULT_WORKING_ORDER_STRENGTH: f64 = 1.0;
+
 /// Product default overlay strength for an indicator type (type style).
 pub fn default_strength_for_type(indicator_type: &str) -> f64 {
     match indicator_type {
         "ma" => DEFAULT_MA_STRENGTH,
         "session_vp" | "fixed_range_vp" | "anchored_vp" => DEFAULT_VP_STRENGTH,
         "volume" => DEFAULT_VOLUME_STRENGTH,
+        "working_order" => DEFAULT_WORKING_ORDER_STRENGTH,
         _ => DEFAULT_OVERLAY_STRENGTH,
     }
 }
@@ -162,12 +172,69 @@ pub struct OverlayPin {
     pub color: Color,
 }
 
+/// One resting working order as a price-pane line spec (limit/stop only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkingOrderLineSpec {
+    pub instrument: String,
+    pub side: String,
+    pub order_type: String,
+    pub limit: Option<f64>,
+    pub stop: Option<f64>,
+}
+
+/// Trigger price for a resting limit/stop. Market working orders have no line.
+pub fn working_line_price(order_type: &str, limit: Option<f64>, stop: Option<f64>) -> Option<f64> {
+    let price = match order_type {
+        "limit" => limit?,
+        "stop" => stop?,
+        _ => return None,
+    };
+    if price.is_finite() && price > 0.0 {
+        Some(price)
+    } else {
+        None
+    }
+}
+
+/// Horizontal working-order line (same overlay family as VP levels).
+pub fn working_order_overlay_level(side: &str, price: f64, x0: f64, x1: f64) -> OverlayLevel {
+    OverlayLevel {
+        x0,
+        x1,
+        price,
+        color: if side.eq_ignore_ascii_case("buy") {
+            WORKING_BUY_COLOR
+        } else {
+            WORKING_SELL_COLOR
+        },
+        type_key: WORKING_ORDER_TYPE_KEY.into(),
+    }
+}
+
+/// Working **lines** only on charts whose **instrument** matches. Market skipped.
+pub fn working_levels_for_instrument(
+    orders: &[WorkingOrderLineSpec],
+    instrument: &str,
+    x0: f64,
+    x1: f64,
+) -> Vec<OverlayLevel> {
+    orders
+        .iter()
+        .filter(|o| o.instrument.eq_ignore_ascii_case(instrument))
+        .filter_map(|o| {
+            let price = working_line_price(&o.order_type, o.limit, o.stop)?;
+            Some(working_order_overlay_level(&o.side, price, x0, x1))
+        })
+        .collect()
+}
+
 /// Layers ready for the price-pane compose pass.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverlayLayers {
     pub hist: Vec<OverlayHistBar>,
     pub levels: Vec<OverlayLevel>,
     pub lines: Vec<OverlayLine>,
+    pub working: Vec<OverlayLevel>,
     pub pins: Vec<OverlayPin>,
 }
 
@@ -182,8 +249,8 @@ pub fn resolve_strength(type_key: &str, styles: &std::collections::HashMap<Strin
 
 /// Paint overlays into `buf` on the same cell grid as the candlestick widget.
 ///
-/// Order: VP hist → levels → MA lines → pins. Candle glyphs are never replaced
-/// (MA/VP skip those cells so green/red stays intact).
+/// Order: VP hist → levels → MA lines → working lines → pins. Candle glyphs are
+/// never replaced (MA/VP skip those cells so green/red stays intact).
 pub fn paint_overlays(
     buf: &mut Buffer,
     view: &ChartView,
@@ -211,6 +278,13 @@ pub fn paint_overlays(
     }
     // MA: Braille sub-cell strokes (smooth curves) merged onto candles without a wipe.
     paint_lines_braille(buf, view, area, &layers.lines, strengths);
+    for level in &layers.working {
+        let s = resolve_strength(&level.type_key, strengths);
+        if s <= 0.0 {
+            continue;
+        }
+        paint_level(buf, view, area, level, s);
+    }
     for pin in &layers.pins {
         paint_pin(buf, view, area, pin);
     }
@@ -233,7 +307,10 @@ fn price_to_row_clamped(view: &ChartView, price: f64) -> Option<u16> {
 }
 
 fn cell_in_area(area: Rect, x: u16, y: u16) -> bool {
-    x >= area.x && x < area.x.saturating_add(area.width) && y >= area.y && y < area.y.saturating_add(area.height)
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
 }
 
 fn under_fg(buf: &Buffer, x: u16, y: u16) -> Color {
@@ -361,12 +438,7 @@ fn paint_level(
 ///  0x04 0x20
 ///  0x40 0x80
 /// ```
-const BRAILLE_DOTS: [[u8; 2]; 4] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BRAILLE_DOTS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 fn braille_char(mask: u8) -> char {
     char::from_u32(0x2800 + mask as u32).unwrap_or('\u{2800}')
@@ -492,11 +564,7 @@ fn paint_pin(buf: &mut Buffer, view: &ChartView, area: Rect, pin: &OverlayPin) {
     }
     let cell = &mut buf[(cx, cy)];
     cell.set_symbol(&pin.glyph);
-    cell.set_style(
-        Style::default()
-            .fg(pin.color)
-            .add_modifier(Modifier::BOLD),
-    );
+    cell.set_style(Style::default().fg(pin.color).add_modifier(Modifier::BOLD));
 }
 
 #[cfg(test)]
@@ -594,7 +662,10 @@ mod tests {
         let fg = buf[(x0, y)].style().fg.expect("ma fg");
         let (r, g, b) = color_to_rgb(fg);
         // Must match dim_to_background, not blend with gray under.
-        assert_eq!((r, g, b), color_to_rgb(dim_to_background(Color::Rgb(0, 200, 255), 0.35)));
+        assert_eq!(
+            (r, g, b),
+            color_to_rgb(dim_to_background(Color::Rgb(0, 200, 255), 0.35))
+        );
         assert!(b > g && r == 0, "expected dim cyan, got ({r},{g},{b})");
     }
 
@@ -857,9 +928,83 @@ mod tests {
         let strengths = HashMap::new();
         paint_overlays(&mut buf, &view, &layers, &strengths);
         assert_eq!(buf[(seed_x, seed_y)].symbol(), "▲");
+        assert_eq!(buf[(seed_x, seed_y)].style().fg, Some(Color::Magenta));
+    }
+
+    fn sample_working_orders() -> Vec<WorkingOrderLineSpec> {
+        vec![
+            WorkingOrderLineSpec {
+                instrument: "SPY".into(),
+                side: "buy".into(),
+                order_type: "limit".into(),
+                limit: Some(150.0),
+                stop: None,
+            },
+            WorkingOrderLineSpec {
+                instrument: "SPY".into(),
+                side: "sell".into(),
+                order_type: "stop".into(),
+                limit: None,
+                stop: Some(140.0),
+            },
+            WorkingOrderLineSpec {
+                instrument: "SPY".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                limit: None,
+                stop: None,
+            },
+            WorkingOrderLineSpec {
+                instrument: "QQQ".into(),
+                side: "buy".into(),
+                order_type: "limit".into(),
+                limit: Some(160.0),
+                stop: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn working_lines_are_price_levels_not_ma_polylines() {
+        let levels = working_levels_for_instrument(&sample_working_orders(), "SPY", 0.0, 20.0);
         assert_eq!(
-            buf[(seed_x, seed_y)].style().fg,
-            Some(Color::Magenta)
+            levels.len(),
+            2,
+            "market has no line; QQQ is other instrument"
         );
+        assert!(levels.iter().all(|l| l.type_key == WORKING_ORDER_TYPE_KEY));
+        assert_eq!(levels[0].price, 150.0);
+        assert_eq!(levels[0].color, WORKING_BUY_COLOR);
+        assert_eq!(levels[1].price, 140.0);
+        assert_eq!(levels[1].color, WORKING_SELL_COLOR);
+        let qqq = working_levels_for_instrument(&sample_working_orders(), "QQQ", 0.0, 20.0);
+        assert_eq!(qqq.len(), 1);
+        assert_eq!(qqq[0].price, 160.0);
+        assert!(
+            working_levels_for_instrument(&sample_working_orders(), "IWM", 0.0, 20.0).is_empty()
+        );
+        assert_eq!(working_line_price("market", None, None), None);
+        assert_eq!(working_line_price("limit", Some(150.0), None), Some(150.0));
+        assert_eq!(working_line_price("stop", None, Some(140.0)), Some(140.0));
+    }
+
+    #[test]
+    fn working_line_paints_as_level_after_ma() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let y = view.price_to_row(150.0).unwrap();
+        let x = area.x + 15;
+        buf[(x, y)].set_symbol(" ");
+
+        let mut layers = OverlayLayers::default();
+        layers
+            .working
+            .push(working_order_overlay_level("buy", 150.0, 15.0, 16.0));
+        let strengths = HashMap::new();
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+
+        assert_eq!(buf[(x, y)].symbol(), "─");
+        assert_eq!(buf[(x, y)].style().fg, Some(WORKING_BUY_COLOR));
     }
 }
