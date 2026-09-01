@@ -100,6 +100,12 @@ impl EngineEndpoint {
             .expect("paper positions close path joins base")
     }
 
+    pub fn paper_positions_bracket_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/positions/bracket")
+            .expect("paper positions bracket path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -627,6 +633,10 @@ pub struct PaperPositionRow {
     pub avg_price: f64,
     #[serde(default)]
     pub unrealized_pnl: f64,
+    #[serde(default)]
+    pub take_profit: Option<f64>,
+    #[serde(default)]
+    pub stop_loss: Option<f64>,
 }
 
 /// Append-only filled order history row (one entry or exit leg).
@@ -692,6 +702,10 @@ pub struct WorkingOrderSnapshot {
     pub stop: Option<f64>,
     #[serde(default)]
     pub placed_ts: i64,
+    #[serde(default)]
+    pub bracket_id: Option<String>,
+    #[serde(default)]
+    pub role: String,
 }
 
 /// Additive snapshot slice. Missing `paper` key deserializes to an empty desk.
@@ -780,6 +794,10 @@ pub struct PaperOrderPlaceRequest {
     pub limit: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take_profit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -801,6 +819,13 @@ pub struct PaperOrderCancelRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PaperPositionCloseRequest {
     pub instrument: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperPositionBracketRequest {
+    pub instrument: String,
+    pub take_profit: f64,
+    pub stop_loss: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1201,6 +1226,8 @@ pub async fn post_paper_place(
     qty: f64,
     limit: Option<f64>,
     stop: Option<f64>,
+    take_profit: Option<f64>,
+    stop_loss: Option<f64>,
 ) -> Result<PaperSnapshot, IpcError> {
     post_paper_json(
         endpoint.paper_orders_url(),
@@ -1211,6 +1238,8 @@ pub async fn post_paper_place(
             qty,
             limit,
             stop,
+            take_profit,
+            stop_loss,
         },
     )
     .await
@@ -1256,6 +1285,23 @@ pub async fn post_paper_close(
         endpoint.paper_positions_close_url(),
         &PaperPositionCloseRequest {
             instrument: instrument.to_string(),
+        },
+    )
+    .await
+}
+
+pub async fn post_paper_attach_bracket(
+    endpoint: &EngineEndpoint,
+    instrument: &str,
+    take_profit: f64,
+    stop_loss: f64,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_positions_bracket_url(),
+        &PaperPositionBracketRequest {
+            instrument: instrument.to_string(),
+            take_profit,
+            stop_loss,
         },
     )
     .await
@@ -1600,6 +1646,86 @@ mod tests {
         assert!(omitted.paper.positions.is_empty());
         assert!(omitted.paper.filled_order_history.is_empty());
         assert!(omitted.paper.balance_history.is_empty());
+        assert_eq!(pos.take_profit, None);
+        assert_eq!(pos.stop_loss, None);
+    }
+
+    #[test]
+    fn snapshot_deserializes_bracket_fields_additively() {
+        let body: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [{"id":"pa_1","name":"Paper","currency":"USD","balance":98886.5}],
+                    "working_orders": [
+                        {
+                            "id": "wo_tp",
+                            "account_id": "pa_1",
+                            "instrument": "SPY",
+                            "side": "sell",
+                            "type": "limit",
+                            "qty": 10,
+                            "limit": 112.0,
+                            "role": "tp",
+                            "bracket_id": "br_1",
+                            "placed_ts": 1719792000
+                        },
+                        {
+                            "id": "wo_sl",
+                            "account_id": "pa_1",
+                            "instrument": "SPY",
+                            "side": "sell",
+                            "type": "stop",
+                            "qty": 10,
+                            "stop": 108.0,
+                            "role": "sl",
+                            "bracket_id": "br_1",
+                            "placed_ts": 1719792000
+                        }
+                    ],
+                    "positions": [{
+                        "symbol": "SPY",
+                        "side": "long",
+                        "qty": 10,
+                        "avg_price": 111.0,
+                        "unrealized_pnl": 5.0,
+                        "take_profit": 112.0,
+                        "stop_loss": 108.0
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(body.paper.positions[0].take_profit, Some(112.0));
+        assert_eq!(body.paper.positions[0].stop_loss, Some(108.0));
+        assert_eq!(body.paper.working_orders.len(), 2);
+        assert_eq!(body.paper.working_orders[0].role, "tp");
+        assert_eq!(body.paper.working_orders[0].bracket_id.as_deref(), Some("br_1"));
+        assert_eq!(body.paper.working_orders[1].role, "sl");
+        assert_eq!(body.paper.working_orders[1].bracket_id.as_deref(), Some("br_1"));
+
+        let omitted: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [],
+                    "working_orders": [{
+                        "id": "wo_1",
+                        "instrument": "SPY",
+                        "side": "buy",
+                        "type": "limit",
+                        "qty": 1,
+                        "limit": 540.0
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.paper.working_orders[0].role, "");
+        assert_eq!(omitted.paper.working_orders[0].bracket_id, None);
+        assert!(omitted.paper.positions.is_empty());
     }
 
     #[test]

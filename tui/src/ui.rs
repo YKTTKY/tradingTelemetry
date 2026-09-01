@@ -368,7 +368,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             .map(|a| a.name.as_str())
             .unwrap_or("—");
         Paragraph::new(format!(
-            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  ↑↓ select  Enter  x cancel  f flatten  ·  Esc close  ·  ? help"
+            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  [/] tp  ;/' sl  a attach  ↑↓ select  Enter  x cancel  f flatten  ·  Esc close  ·  ? help"
         ))
             .style(Style::default().fg(Color::DarkGray))
     } else if panel_open {
@@ -413,7 +413,7 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
         frame,
         cols[2],
         " Position ",
-        "symbol  side  qty  avg  uPnL",
+        "symbol  side  qty  avg  uPnL  tp  sl",
         app.paper
             .positions
             .iter()
@@ -445,10 +445,16 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(crate) fn format_position_row(row: &PaperPositionRow) -> String {
-    format!(
+    let mut line = format!(
         "{}  {}  {:.0}  {:.2}  {:+.2}",
         row.symbol, row.side, row.qty, row.avg_price, row.unrealized_pnl
-    )
+    );
+    if let (Some(tp), Some(sl)) = (row.take_profit, row.stop_loss) {
+        if tp > 0.0 && sl > 0.0 {
+            line.push_str(&format!("  tp {tp:.2}  sl {sl:.2}"));
+        }
+    }
+    line
 }
 
 fn opt_price(value: Option<f64>) -> String {
@@ -456,6 +462,14 @@ fn opt_price(value: Option<f64>) -> String {
         .filter(|v| *v > 0.0)
         .map(|v| format!("{v:.2}"))
         .unwrap_or_else(|| "-".into())
+}
+
+fn opt_form_price(value: f64) -> String {
+    if value > 0.0 {
+        format!("{value:.2}")
+    } else {
+        "-".into()
+    }
 }
 
 pub(crate) fn format_filled_order_row(row: &FilledOrderRow) -> String {
@@ -525,6 +539,15 @@ fn draw_order_side_panel(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from("px     market (no line)"));
         }
     }
+    lines.push(Line::from(format!(
+        "tp     {}   ([/])",
+        opt_form_price(app.order_side.take_profit)
+    )));
+    lines.push(Line::from(format!(
+        "sl     {}   (;/')",
+        opt_form_price(app.order_side.stop_loss)
+    )));
+    lines.push(Line::from("a      attach TP/SL on position"));
     if let Some(id) = selected {
         lines.push(Line::from(format!("sel    {id}")));
     } else {
@@ -2243,8 +2266,26 @@ mod tests {
             qty: 10.0,
             avg_price: 111.0,
             unrealized_pnl: 5.5,
+            ..PaperPositionRow::default()
         };
         assert_eq!(format_position_row(&row), "SPY  long  10  111.00  +5.50");
+    }
+
+    #[test]
+    fn position_row_shows_tp_sl_when_bracket_attached() {
+        let row = PaperPositionRow {
+            symbol: "SPY".into(),
+            side: "long".into(),
+            qty: 10.0,
+            avg_price: 111.0,
+            unrealized_pnl: 5.5,
+            take_profit: Some(112.0),
+            stop_loss: Some(108.0),
+        };
+        assert_eq!(
+            format_position_row(&row),
+            "SPY  long  10  111.00  +5.50  tp 112.00  sl 108.00"
+        );
     }
 
     #[test]

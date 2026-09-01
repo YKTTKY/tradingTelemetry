@@ -290,6 +290,8 @@ pub enum PendingPaperOp {
         qty: f64,
         limit: Option<f64>,
         stop: Option<f64>,
+        take_profit: Option<f64>,
+        stop_loss: Option<f64>,
     },
     Modify {
         order_id: String,
@@ -302,6 +304,11 @@ pub enum PendingPaperOp {
     },
     Close {
         instrument: String,
+    },
+    AttachBracket {
+        instrument: String,
+        take_profit: f64,
+        stop_loss: f64,
     },
 }
 
@@ -347,6 +354,8 @@ pub struct OrderSidePanel {
     pub qty: f64,
     pub limit: f64,
     pub stop: f64,
+    pub take_profit: f64,
+    pub stop_loss: f64,
     pub selected_order_id: Option<String>,
 }
 
@@ -358,6 +367,8 @@ impl Default for OrderSidePanel {
             qty: 1.0,
             limit: 0.0,
             stop: 0.0,
+            take_profit: 0.0,
+            stop_loss: 0.0,
             selected_order_id: None,
         }
     }
@@ -365,6 +376,23 @@ impl Default for OrderSidePanel {
 
 pub const ORDER_QTY_STEP: f64 = 1.0;
 pub const ORDER_PRICE_STEP: f64 = 0.01;
+
+fn nudge_price_from(current: f64, steps: i32, last: Option<f64>) -> f64 {
+    if steps == 0 {
+        return current;
+    }
+    let base = if current > 0.0 {
+        current
+    } else {
+        last.filter(|v| *v > 0.0).unwrap_or(0.0)
+    };
+    let next = base + f64::from(steps) * ORDER_PRICE_STEP;
+    if next <= 0.0 {
+        0.0
+    } else {
+        next
+    }
+}
 
 pub const MAX_MA_LINES: usize = 3;
 pub const MAX_SESSION_VP: usize = 1;
@@ -1350,16 +1378,92 @@ impl App {
                 limit,
                 stop,
             });
-        } else {
-            self.pending_paper = Some(PendingPaperOp::Place {
-                instrument,
-                side,
-                order_type,
-                qty,
-                limit,
-                stop,
-            });
+            return;
         }
+        let (take_profit, stop_loss) = match self.bracket_prices() {
+            Ok(pair) => pair,
+            Err(msg) => {
+                self.last_paper_error = Some(msg);
+                return;
+            }
+        };
+        self.pending_paper = Some(PendingPaperOp::Place {
+            instrument,
+            side,
+            order_type,
+            qty,
+            limit,
+            stop,
+            take_profit,
+            stop_loss,
+        });
+    }
+
+    fn bracket_prices(&self) -> Result<(Option<f64>, Option<f64>), String> {
+        let tp = self.order_side.take_profit;
+        let sl = self.order_side.stop_loss;
+        let tp_set = tp > 0.0;
+        let sl_set = sl > 0.0;
+        if tp_set && sl_set {
+            Ok((Some(tp), Some(sl)))
+        } else if !tp_set && !sl_set {
+            Ok((None, None))
+        } else {
+            Err("bracket requires take_profit and stop_loss".into())
+        }
+    }
+
+    /// Attach or replace TP/SL children on the focused instrument's open position.
+    pub fn paper_attach_bracket(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        let instrument = self.order_side_instrument().to_string();
+        let has_pos = self
+            .paper
+            .positions
+            .iter()
+            .any(|p| p.symbol.eq_ignore_ascii_case(&instrument) && p.qty > 0.0);
+        if !has_pos {
+            self.last_paper_error = Some("no open position".into());
+            return;
+        }
+        if self.order_side.take_profit <= 0.0 || self.order_side.stop_loss <= 0.0 {
+            self.last_paper_error = Some("bracket requires take_profit and stop_loss".into());
+            return;
+        }
+        self.pending_paper = Some(PendingPaperOp::AttachBracket {
+            instrument,
+            take_profit: self.order_side.take_profit,
+            stop_loss: self.order_side.stop_loss,
+        });
+    }
+
+    pub fn paper_nudge_take_profit(&mut self, steps: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        self.order_side.take_profit = nudge_price_from(
+            self.order_side.take_profit,
+            steps,
+            self.quote_last_for_order(),
+        );
+    }
+
+    pub fn paper_nudge_stop_loss(&mut self, steps: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        self.order_side.stop_loss = nudge_price_from(
+            self.order_side.stop_loss,
+            steps,
+            self.quote_last_for_order(),
+        );
+    }
+
+    fn quote_last_for_order(&self) -> Option<f64> {
+        let inst = self.order_side_instrument().to_string();
+        self.quotes.get(&inst).and_then(|q| q.last)
     }
 
     pub fn paper_cancel_selected(&mut self) {
@@ -1400,6 +1504,23 @@ impl App {
                 self.order_side.stop = last;
             }
         }
+        if let Some(pos) = self
+            .paper
+            .positions
+            .iter()
+            .find(|p| p.symbol.eq_ignore_ascii_case(&inst))
+        {
+            if self.order_side.take_profit <= 0.0 {
+                if let Some(tp) = pos.take_profit {
+                    self.order_side.take_profit = tp;
+                }
+            }
+            if self.order_side.stop_loss <= 0.0 {
+                if let Some(sl) = pos.stop_loss {
+                    self.order_side.stop_loss = sl;
+                }
+            }
+        }
     }
 
     fn sync_order_side_selection(&mut self) {
@@ -1426,6 +1547,15 @@ impl App {
         }
         if let Some(stop) = wo.stop {
             self.order_side.stop = stop;
+        }
+        if wo.role == "tp" {
+            if let Some(limit) = wo.limit {
+                self.order_side.take_profit = limit;
+            }
+        } else if wo.role == "sl" {
+            if let Some(stop) = wo.stop {
+                self.order_side.stop_loss = stop;
+            }
         }
     }
 
@@ -4876,6 +5006,8 @@ mod tests {
             limit,
             stop,
             placed_ts: 1_719_792_000,
+            bracket_id: None,
+            role: String::new(),
         }
     }
 
@@ -5016,6 +5148,8 @@ mod tests {
                 qty: 3.0,
                 limit: Some(480.0),
                 stop: None,
+                take_profit: None,
+                stop_loss: None,
             })
         );
 
@@ -5035,6 +5169,8 @@ mod tests {
                 qty: 1.0,
                 limit: None,
                 stop: None,
+                take_profit: None,
+                stop_loss: None,
             })
         );
     }
@@ -5164,6 +5300,7 @@ mod tests {
             qty: 10.0,
             avg_price: 111.0,
             unrealized_pnl: 5.0,
+            ..PaperPositionRow::default()
         }];
         desk.filled_order_history = vec![FilledOrderRow {
             id: "fo_1".into(),
@@ -5203,6 +5340,7 @@ mod tests {
             qty: 10.0,
             avg_price: 111.0,
             unrealized_pnl: 0.0,
+            ..PaperPositionRow::default()
         }];
         app.apply_paper(desk);
         app.paper_close_focused();
@@ -5225,5 +5363,128 @@ mod tests {
         app.toggle_paper_panel();
         app.paper_close_focused();
         assert!(app.pending_paper.is_none());
+    }
+
+    #[test]
+    fn order_side_panel_place_includes_tp_sl_when_set() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.order_side.kind = WorkingOrderKind::Market;
+        app.order_side.qty = 10.0;
+        app.order_side.take_profit = 112.0;
+        app.order_side.stop_loss = 108.0;
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Place {
+                instrument: "SPY".into(),
+                side: "buy".into(),
+                order_type: "market".into(),
+                qty: 10.0,
+                limit: None,
+                stop: None,
+                take_profit: Some(112.0),
+                stop_loss: Some(108.0),
+            })
+        );
+    }
+
+    #[test]
+    fn order_side_panel_place_omits_tp_sl_when_unset() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.paper_set_kind(WorkingOrderKind::Limit);
+        app.order_side.qty = 3.0;
+        app.order_side.limit = 480.0;
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Place {
+                instrument: "SPY".into(),
+                side: "buy".into(),
+                order_type: "limit".into(),
+                qty: 3.0,
+                limit: Some(480.0),
+                stop: None,
+                take_profit: None,
+                stop_loss: None,
+            })
+        );
+    }
+
+    #[test]
+    fn order_side_panel_rejects_partial_bracket_fields() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.order_side.kind = WorkingOrderKind::Market;
+        app.order_side.take_profit = 112.0;
+        app.paper_submit();
+        assert!(app.pending_paper.is_none());
+        assert_eq!(
+            app.last_paper_error.as_deref(),
+            Some("bracket requires take_profit and stop_loss")
+        );
+    }
+
+    #[test]
+    fn order_side_panel_attach_bracket_on_open_position() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.positions = vec![PaperPositionRow {
+            symbol: "SPY".into(),
+            side: "long".into(),
+            qty: 10.0,
+            avg_price: 111.0,
+            unrealized_pnl: 0.0,
+            take_profit: None,
+            stop_loss: None,
+        }];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.order_side.take_profit = 112.0;
+        app.order_side.stop_loss = 108.0;
+        app.paper_attach_bracket();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::AttachBracket {
+                instrument: "SPY".into(),
+                take_profit: 112.0,
+                stop_loss: 108.0,
+            })
+        );
+    }
+
+    #[test]
+    fn order_side_panel_attach_noops_without_position() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.order_side.take_profit = 112.0;
+        app.order_side.stop_loss = 108.0;
+        app.paper_attach_bracket();
+        assert!(app.pending_paper.is_none());
+    }
+
+    #[test]
+    fn working_overlay_draws_tp_sl_child_lines() {
+        let mut app = App::default();
+        let mut desk = sample_paper_desk();
+        let mut tp = sample_working_order("wo_tp", "SPY", "sell", "limit", 10.0, Some(112.0), None);
+        tp.role = "tp".into();
+        tp.bracket_id = Some("br_1".into());
+        let mut sl = sample_working_order("wo_sl", "SPY", "sell", "stop", 10.0, None, Some(108.0));
+        sl.role = "sl".into();
+        sl.bracket_id = Some("br_1".into());
+        desk.working_orders = vec![tp, sl];
+        app.apply_paper(desk);
+        let spy = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert_eq!(spy.len(), 2);
+        assert!(spy.iter().all(|l| l.type_key == "working_order"));
+        assert_eq!(spy[0].price, 112.0);
+        assert_eq!(spy[1].price, 108.0);
     }
 }

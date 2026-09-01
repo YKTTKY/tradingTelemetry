@@ -4,18 +4,18 @@
 
 **Blocked by:** 03 — Bar-touch fills
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Order side panel can place an entry with TP/SL, or attach/modify TP/SL on an open **position**
-- [ ] Engine keeps children as **working orders** until fill or cancel; they draw as working **lines** (02 overlay)
-- [ ] TP fill writes an exit history leg, cancels SL, and flattens/reduces the **position** by the child qty (v1: full position qty — no partials)
-- [ ] SL fill does the reverse (exit leg + cancel TP)
-- [ ] A round-turn is **two** **filled order history** rows (entry leg + exit leg)
-- [ ] Cancel parent entry before fill cancels children too
-- [ ] Position row shows TP/SL prices when a **bracket** is attached
-- [ ] Persist **brackets** in SQLite; snapshot + discrete paper WS keep the TUI in sync
-- [ ] Fake-vendor IPC: TP through last-bar/roll cancels SL (and reverse). TUI: bracket fields on the order side panel; TP/SL on the position row.
-- [ ] Do not add a permanent working-orders table to list children
+- [x] Order side panel can place an entry with TP/SL, or attach/modify TP/SL on an open **position**
+- [x] Engine keeps children as **working orders** until fill or cancel; they draw as working **lines** (02 overlay)
+- [x] TP fill writes an exit history leg, cancels SL, and flattens/reduces the **position** by the child qty (v1: full position qty — no partials)
+- [x] SL fill does the reverse (exit leg + cancel TP)
+- [x] A round-turn is **two** **filled order history** rows (entry leg + exit leg)
+- [x] Cancel parent entry before fill cancels children too
+- [x] Position row shows TP/SL prices when a **bracket** is attached
+- [x] Persist **brackets** in SQLite; snapshot + discrete paper WS keep the TUI in sync
+- [x] Fake-vendor IPC: TP through last-bar/roll cancels SL (and reverse). TUI: bracket fields on the order side panel; TP/SL on the position row.
+- [x] Do not add a permanent working-orders table to list children
 
 ## Notes
 

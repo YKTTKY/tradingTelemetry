@@ -850,3 +850,486 @@ def test_times_in_snapshot_are_unix_not_civil_labels(tmp_path: Path):
     assert "EDT" not in str(fill)
     assert "EST" not in str(fill)
     assert "America/New_York" not in str(fill)
+
+
+def _by_role(orders: list[dict]) -> dict[str, dict]:
+    return {str(o.get("role") or "entry"): o for o in orders}
+
+
+def test_place_entry_with_tp_sl_creates_child_working_orders(tmp_path: Path):
+    """A bracket is a parent entry plus TP/SL child working orders (not new entry types)."""
+    client, _ = _paper_client(tmp_path)
+    placed = _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    assert placed.status_code == 200, placed.text
+    paper = placed.json()
+    assert len(paper["working_orders"]) == 3
+    by_role = _by_role(paper["working_orders"])
+    assert set(by_role) == {"entry", "tp", "sl"}
+
+    entry = by_role["entry"]
+    tp = by_role["tp"]
+    sl = by_role["sl"]
+    assert entry["type"] == "market"
+    assert entry["side"] == "buy"
+    assert entry["qty"] == 10
+    assert tp["type"] == "limit"
+    assert tp["side"] == "sell"
+    assert tp["limit"] == 112.0
+    assert tp["qty"] == 10
+    assert sl["type"] == "stop"
+    assert sl["side"] == "sell"
+    assert sl["stop"] == 108.0
+    assert sl["qty"] == 10
+    bracket_id = entry["bracket_id"]
+    assert bracket_id
+    assert tp["bracket_id"] == bracket_id
+    assert sl["bracket_id"] == bracket_id
+    assert paper["positions"] == []
+    assert paper["filled_order_history"] == []
+
+
+def test_place_bracket_requires_both_tp_and_sl_no_stub(tmp_path: Path):
+    client, _ = _paper_client(tmp_path)
+    only_tp = _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=2,
+        limit=108.0,
+        take_profit=112.0,
+    )
+    assert only_tp.status_code == 422
+    assert client.get("/v1/snapshot").json()["paper"]["working_orders"] == []
+
+    only_sl = _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=2,
+        limit=108.0,
+        stop_loss=105.0,
+    )
+    assert only_sl.status_code == 422
+    assert client.get("/v1/snapshot").json()["paper"]["working_orders"] == []
+
+
+def test_sell_entry_bracket_children_are_buy_exits(tmp_path: Path):
+    client, _ = _paper_client(tmp_path)
+    paper = _place(
+        client,
+        instrument="SPY",
+        side="sell",
+        type="limit",
+        qty=4,
+        limit=111.0,
+        take_profit=108.0,
+        stop_loss=112.0,
+    ).json()
+    by_role = _by_role(paper["working_orders"])
+    assert by_role["entry"]["side"] == "sell"
+    assert by_role["tp"]["side"] == "buy"
+    assert by_role["tp"]["type"] == "limit"
+    assert by_role["tp"]["limit"] == 108.0
+    assert by_role["sl"]["side"] == "buy"
+    assert by_role["sl"]["type"] == "stop"
+    assert by_role["sl"]["stop"] == 112.0
+
+
+def test_cancel_parent_entry_cancels_bracket_children(tmp_path: Path):
+    client, _ = _paper_client(tmp_path)
+    paper = _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=3,
+        limit=108.0,
+        take_profit=112.0,
+        stop_loss=105.0,
+    ).json()
+    parent_id = _by_role(paper["working_orders"])["entry"]["id"]
+    cancelled = client.post("/v1/paper/orders/cancel", json={"order_id": parent_id})
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["working_orders"] == []
+    snap = client.get("/v1/snapshot").json()["paper"]
+    assert snap["working_orders"] == []
+    assert snap["positions"] == []
+
+
+def test_bracket_persists_across_engine_restart(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    vendor1 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor1, "SPY")
+    client1, _ = _client(workspace_path=store, vendor=vendor1)
+    paper = _place(
+        client1,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=8,
+        limit=108.0,
+        take_profit=112.0,
+        stop_loss=105.0,
+    ).json()
+    before = _by_role(paper["working_orders"])
+    ids = {role: before[role]["id"] for role in ("entry", "tp", "sl")}
+    bracket_id = before["entry"]["bracket_id"]
+
+    vendor2 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor2, "SPY")
+    client2, _ = _client(workspace_path=store, vendor=vendor2)
+    restored = _by_role(client2.get("/v1/snapshot").json()["paper"]["working_orders"])
+    assert set(restored) == {"entry", "tp", "sl"}
+    assert restored["entry"]["id"] == ids["entry"]
+    assert restored["tp"]["id"] == ids["tp"]
+    assert restored["sl"]["id"] == ids["sl"]
+    assert restored["tp"]["limit"] == 112.0
+    assert restored["sl"]["stop"] == 105.0
+    assert restored["tp"]["bracket_id"] == bracket_id
+    assert restored["sl"]["bracket_id"] == bracket_id
+
+
+def test_children_do_not_fill_while_parent_entry_is_working(tmp_path: Path):
+    """TP/SL rest while the parent is working; they are not standalone entries."""
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=5,
+        limit=100.0,
+        take_profit=112.0,
+        stop_loss=107.0,
+    )
+    # Last-bar low through 107 would fill SL if children were live; parent 100 is not touched.
+    vendor.inject_tick("SPY", price=107.25, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert len(paper["working_orders"]) == 3
+    assert paper["positions"] == []
+    assert paper["filled_order_history"] == []
+    by_role = _by_role(paper["working_orders"])
+    assert by_role["sl"]["stop"] == 107.0
+    assert by_role["entry"]["limit"] == 100.0
+
+
+def test_parent_fill_keeps_children_and_position_shows_tp_sl(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    by_role = _by_role(paper["working_orders"])
+    assert set(by_role) == {"tp", "sl"}
+    assert by_role["tp"]["limit"] == 112.0
+    assert by_role["sl"]["stop"] == 108.0
+    assert len(paper["positions"]) == 1
+    pos = paper["positions"][0]
+    assert pos["symbol"] == "SPY"
+    assert pos["side"] == "long"
+    assert pos["qty"] == 10
+    assert pos["take_profit"] == 112.0
+    assert pos["stop_loss"] == 108.0
+    assert len(paper["filled_order_history"]) == 1
+    assert paper["filled_order_history"][0]["side"] == "buy"
+    assert paper["filled_order_history"][0]["type"] == "market"
+
+
+def test_tp_fill_writes_exit_leg_cancels_sl_and_flattens(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick("SPY", price=112.5, volume=20.0, ts=float(_SPY_1M_LAST_TS + 6))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"] == []
+    assert len(paper["filled_order_history"]) == 2
+    entry, exit_leg = paper["filled_order_history"]
+    assert entry["side"] == "buy"
+    assert entry["type"] == "market"
+    assert entry["qty"] == 10
+    assert exit_leg["side"] == "sell"
+    assert exit_leg["type"] == "limit"
+    assert exit_leg["qty"] == 10
+    assert exit_leg["fill_price"] == 112.0
+    assert exit_leg["limit"] == 112.0
+    # 10 * 111.25 + 1 commission, then 10 * 112 - 1 commission
+    assert paper["accounts"][0]["balance"] == 100_005.5
+
+
+def test_sl_fill_writes_exit_leg_cancels_tp_and_flattens(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick("SPY", price=107.25, volume=20.0, ts=float(_SPY_1M_LAST_TS + 6))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"] == []
+    assert len(paper["filled_order_history"]) == 2
+    entry, exit_leg = paper["filled_order_history"]
+    assert entry["type"] == "market"
+    assert exit_leg["side"] == "sell"
+    assert exit_leg["type"] == "stop"
+    assert exit_leg["fill_price"] == 108.0
+    assert exit_leg["stop"] == 108.0
+    assert paper["accounts"][0]["balance"] == 99_965.5
+
+
+def test_tp_through_new_bar_roll_cancels_sl(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=5,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick(
+        "SPY",
+        price=113.0,
+        volume=10.0,
+        ts=float(_SPY_1M_LAST_TS + _MINUTE),
+    )
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"] == []
+    assert len(paper["filled_order_history"]) == 2
+    assert paper["filled_order_history"][1]["type"] == "limit"
+    assert paper["filled_order_history"][1]["fill_price"] == 112.0
+
+
+def test_attach_and_modify_bracket_on_open_position(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    opened = client.get("/v1/snapshot").json()["paper"]
+    assert opened["positions"][0]["qty"] == 10
+    assert opened["working_orders"] == []
+    assert opened["positions"][0].get("take_profit") in (None, 0, 0.0)
+    assert opened["positions"][0].get("stop_loss") in (None, 0, 0.0)
+
+    attached = client.post(
+        "/v1/paper/positions/bracket",
+        json={"instrument": "SPY", "take_profit": 112.0, "stop_loss": 108.0},
+    )
+    assert attached.status_code == 200, attached.text
+    paper = attached.json()
+    by_role = _by_role(paper["working_orders"])
+    assert set(by_role) == {"tp", "sl"}
+    assert by_role["tp"]["limit"] == 112.0
+    assert by_role["sl"]["stop"] == 108.0
+    assert paper["positions"][0]["take_profit"] == 112.0
+    assert paper["positions"][0]["stop_loss"] == 108.0
+    assert len(paper["filled_order_history"]) == 1
+
+    modified = client.post(
+        "/v1/paper/positions/bracket",
+        json={"instrument": "SPY", "take_profit": 113.0, "stop_loss": 107.0},
+    )
+    assert modified.status_code == 200, modified.text
+    paper = modified.json()
+    by_role = _by_role(paper["working_orders"])
+    assert by_role["tp"]["limit"] == 113.0
+    assert by_role["sl"]["stop"] == 107.0
+    assert paper["positions"][0]["take_profit"] == 113.0
+    assert paper["positions"][0]["stop_loss"] == 107.0
+    assert len(paper["working_orders"]) == 2
+
+    missing = client.post(
+        "/v1/paper/positions/bracket",
+        json={"instrument": "QQQ", "take_profit": 220.0, "stop_loss": 190.0},
+    )
+    assert missing.status_code == 422
+
+
+def test_attached_bracket_persists_on_position_across_restart(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    vendor1 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor1, "SPY")
+    client1, _ = _client(workspace_path=store, vendor=vendor1)
+    _place(client1, instrument="SPY", side="buy", type="market", qty=6)
+    vendor1.inject_tick("SPY", price=111.0, volume=5.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    client1.post(
+        "/v1/paper/positions/bracket",
+        json={"instrument": "SPY", "take_profit": 115.0, "stop_loss": 106.0},
+    )
+
+    vendor2 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor2, "SPY")
+    client2, _ = _client(workspace_path=store, vendor=vendor2)
+    paper = client2.get("/v1/snapshot").json()["paper"]
+    assert paper["positions"][0]["qty"] == 6
+    assert paper["positions"][0]["take_profit"] == 115.0
+    assert paper["positions"][0]["stop_loss"] == 106.0
+    by_role = _by_role(paper["working_orders"])
+    assert set(by_role) == {"tp", "sl"}
+    assert by_role["tp"]["limit"] == 115.0
+    assert by_role["sl"]["stop"] == 106.0
+
+
+def test_close_position_cancels_attached_bracket_children(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    client.post(
+        "/v1/paper/positions/bracket",
+        json={"instrument": "SPY", "take_profit": 112.0, "stop_loss": 108.0},
+    )
+    closed = client.post("/v1/paper/positions/close", json={"instrument": "SPY"})
+    assert closed.status_code == 200, closed.text
+    paper = closed.json()
+    assert paper["positions"] == []
+    assert paper["working_orders"] == []
+    assert len(paper["filled_order_history"]) == 2
+    assert paper["filled_order_history"][1]["type"] == "close"
+
+
+def test_bracket_place_and_tp_fill_emit_discrete_paper_ws_events(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    with client:
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            placed = _place(
+                client,
+                instrument="SPY",
+                side="buy",
+                type="market",
+                qty=2,
+                take_profit=112.0,
+                stop_loss=108.0,
+            ).json()
+            assert len(placed["working_orders"]) == 3
+
+            vendor.inject_tick(
+                "SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5)
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+            vendor.inject_tick(
+                "SPY", price=112.5, volume=10.0, ts=float(_SPY_1M_LAST_TS + 6)
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+
+            events: list[dict] = []
+            deadline = time.time() + 2.0
+            while time.time() < deadline and len(events) < 3:
+                msg = ws.receive_json()
+                if msg.get("type") == "paper_update":
+                    events.append(msg)
+
+            reasons = [ev.get("reason") for ev in events]
+            assert reasons[0] == "order_placed"
+            assert len(events[0]["paper"]["working_orders"]) == 3
+            fill_events = [ev for ev in events if ev.get("reason") == "order_filled"]
+            assert len(fill_events) == 2
+            assert len(fill_events[0]["paper"]["filled_order_history"]) == 1
+            assert len(fill_events[0]["paper"]["working_orders"]) == 2
+            assert fill_events[-1]["paper"]["working_orders"] == []
+            assert len(fill_events[-1]["paper"]["filled_order_history"]) == 2
+            assert fill_events[-1]["paper"]["positions"] == []
+
+
+def test_sl_through_new_bar_roll_cancels_tp(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=5,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick(
+        "SPY",
+        price=107.0,
+        volume=10.0,
+        ts=float(_SPY_1M_LAST_TS + _MINUTE),
+    )
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"] == []
+    assert len(paper["filled_order_history"]) == 2
+    assert paper["filled_order_history"][1]["type"] == "stop"
+    assert paper["filled_order_history"][1]["fill_price"] == 108.0
+
+
+def test_bracket_children_qty_tracks_full_position_qty(tmp_path: Path):
+    """v1 children rest the full position qty; a TP fill flattens, no remainder."""
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    _place(client, instrument="SPY", side="buy", type="market", qty=5)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 2))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["positions"][0]["qty"] == 15
+    by_role = _by_role(paper["working_orders"])
+    assert by_role["tp"]["qty"] == 15
+    assert by_role["sl"]["qty"] == 15
+
+    vendor.inject_tick("SPY", price=112.5, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"] == []
+    assert paper["filled_order_history"][-1]["qty"] == 15
+    assert paper["filled_order_history"][-1]["type"] == "limit"

@@ -91,6 +91,8 @@ class PaperOrderPlaceBody(BaseModel):
     qty: float
     limit: float | None = None
     stop: float | None = None
+    take_profit: float | None = None
+    stop_loss: float | None = None
 
 
 class PaperOrderModifyBody(BaseModel):
@@ -112,6 +114,14 @@ class PaperPositionCloseBody(BaseModel):
     """Flatten an open position on the active paper account (exit history leg)."""
 
     instrument: str = Field(min_length=1)
+
+
+class PaperPositionBracketBody(BaseModel):
+    """Attach or modify TP/SL children on an open position."""
+
+    instrument: str = Field(min_length=1)
+    take_profit: float
+    stop_loss: float
 
 
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
@@ -482,6 +492,8 @@ def create_app(
                 limit=body.limit,
                 stop=body.stop,
                 last_price=last_price_for_instrument(body.instrument),
+                take_profit=body.take_profit,
+                stop_loss=body.stop_loss,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -528,6 +540,19 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         sync_paper_interest()
         return publish_paper("position_closed")
+
+    @app.post("/v1/paper/positions/bracket")
+    def attach_paper_bracket(body: PaperPositionBracketBody) -> dict[str, Any]:
+        try:
+            paper.attach_bracket(
+                instrument=body.instrument,
+                take_profit=body.take_profit,
+                stop_loss=body.stop_loss,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_paper_interest()
+        return publish_paper("bracket_attached")
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

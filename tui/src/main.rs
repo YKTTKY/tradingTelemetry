@@ -21,8 +21,9 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ipc::{
-    EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_cancel,
-    post_paper_close, post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
+    EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_attach_bracket,
+    post_paper_cancel, post_paper_close, post_paper_modify, post_paper_place, post_type_styles,
+    post_watchlist_active,
     post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
     run_ipc_loop,
 };
@@ -143,9 +144,21 @@ async fn run_loop(
                         qty,
                         limit,
                         stop,
+                        take_profit,
+                        stop_loss,
                     } => {
-                        post_paper_place(&ep, &instrument, &side, &order_type, qty, limit, stop)
-                            .await
+                        post_paper_place(
+                            &ep,
+                            &instrument,
+                            &side,
+                            &order_type,
+                            qty,
+                            limit,
+                            stop,
+                            take_profit,
+                            stop_loss,
+                        )
+                        .await
                     }
                     PendingPaperOp::Modify {
                         order_id,
@@ -157,6 +170,11 @@ async fn run_loop(
                     PendingPaperOp::Close { instrument } => {
                         post_paper_close(&ep, &instrument).await
                     }
+                    PendingPaperOp::AttachBracket {
+                        instrument,
+                        take_profit,
+                        stop_loss,
+                    } => post_paper_attach_bracket(&ep, &instrument, take_profit, stop_loss).await,
                 };
                 match result {
                     Ok(paper) => {
@@ -293,6 +311,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('t') | KeyCode::Char('T') => app.paper_set_kind(WorkingOrderKind::Stop),
             KeyCode::Char('x') | KeyCode::Char('X') => app.paper_cancel_selected(),
             KeyCode::Char('f') | KeyCode::Char('F') => app.paper_close_focused(),
+            KeyCode::Char('a') | KeyCode::Char('A') => app.paper_attach_bracket(),
+            KeyCode::Char('[') => app.paper_nudge_take_profit(-1),
+            KeyCode::Char(']') => app.paper_nudge_take_profit(1),
+            KeyCode::Char(';') => app.paper_nudge_stop_loss(-1),
+            KeyCode::Char('\'') => app.paper_nudge_stop_loss(1),
             KeyCode::Char('q') => app.quit(),
             _ => {}
         },
