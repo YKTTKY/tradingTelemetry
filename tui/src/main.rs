@@ -234,6 +234,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(c) => app.prompt_push_char(c),
             _ => {}
         },
+        InputMode::PaperPanel => match code {
+            KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
+            KeyCode::Esc => app.close_paper_panel(),
+            KeyCode::Char('q') => app.quit(),
+            _ => {}
+        },
         InputMode::IndicatorPanel => {
             // Type-style popup (Available · `c`) owns keys until confirm/cancel.
             if app.type_style_edit.is_some() {

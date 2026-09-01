@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::ipc::{
     BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IpcEvent,
     IndicatorConfig, IndicatorSeriesData, IndicatorTypeStyle, IndicatorUpdateEvent,
-    IndicatorsApplyResponse, OhlcvBar, QuoteRow, QuoteUpdateEvent, WatchlistSnapshot,
-    WorkspaceSnapshot,
+    IndicatorsApplyResponse, OhlcvBar, PaperAccountSnapshot, PaperSnapshot, QuoteRow,
+    QuoteUpdateEvent, WatchlistSnapshot, WorkspaceSnapshot,
 };
 use crate::overlay::{clamp_strength, default_strength_for_type};
 use crate::timeframe::{format_bar_countdown, forming_bar_remaining_secs};
@@ -209,6 +209,8 @@ pub enum InputMode {
     WatchlistRenamePrompt { buffer: String },
     /// Indicator panel for the focused chart (add / toggle / configure).
     IndicatorPanel,
+    /// Togglable paper desk panel (owns keys while open; shortcut TBD).
+    PaperPanel,
     /// Two-pin Fixed Range VP placement on the focused chart.
     FrvpPlacing,
     /// Single-pin Anchored VP placement on the focused chart.
@@ -569,6 +571,8 @@ pub struct App {
     pub last_indicator_error: Option<String>,
     /// Floating keyboard-shortcut help overlay (does not replace input_mode).
     pub help_open: bool,
+    /// Engine paper desk (accounts + empty Position / history tables).
+    pub paper: PaperSnapshot,
     pub should_quit: bool,
 }
 
@@ -604,6 +608,7 @@ impl Default for App {
             avp_place: None,
             last_indicator_error: None,
             help_open: false,
+            paper: PaperSnapshot::default(),
             should_quit: false,
         }
     }
@@ -1040,6 +1045,42 @@ impl App {
             self.type_style_edit = None;
             self.input_mode = InputMode::Normal;
         }
+    }
+
+    /// Toggle the paper panel (local UI control; keyboard shortcut TBD).
+    ///
+    /// Open → owns input focus like the indicator panel. Watchlist arrows and
+    /// chart pan stay idle until it closes.
+    pub fn toggle_paper_panel(&mut self) {
+        if self.help_open {
+            return;
+        }
+        if self.screen != Screen::Workspace {
+            return;
+        }
+        match self.input_mode {
+            InputMode::Normal => {
+                self.input_mode = InputMode::PaperPanel;
+            }
+            InputMode::PaperPanel => {
+                self.input_mode = InputMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn close_paper_panel(&mut self) {
+        if matches!(self.input_mode, InputMode::PaperPanel) {
+            self.input_mode = InputMode::Normal;
+        }
+    }
+
+    pub fn apply_paper(&mut self, paper: PaperSnapshot) {
+        self.paper = paper;
+    }
+
+    pub fn active_paper_account(&self) -> Option<&PaperAccountSnapshot> {
+        self.paper.active_account()
     }
 
     /// Tab: switch Available ↔ Current while the indicator panel owns focus.
@@ -2285,6 +2326,7 @@ impl App {
             }
             InputMode::Normal
             | InputMode::IndicatorPanel
+            | InputMode::PaperPanel
             | InputMode::FrvpPlacing
             | InputMode::AvpPlacing => {}
         }
@@ -2299,6 +2341,7 @@ impl App {
             }
             InputMode::Normal
             | InputMode::IndicatorPanel
+            | InputMode::PaperPanel
             | InputMode::FrvpPlacing
             | InputMode::AvpPlacing => {}
         }
@@ -2321,9 +2364,11 @@ impl App {
                 workspace,
                 quotes,
                 indicators,
+                paper,
             } => {
                 self.last_vendor_tick_ts = feed.last_vendor_tick_ts;
                 self.set_feed(feed);
+                self.apply_paper(paper);
                 if let Some(ws) = workspace {
                     if self.screen == Screen::Welcome {
                         // Defer until Enter so Welcome stays clean; still stash for restore.
@@ -2391,6 +2436,9 @@ impl App {
             }
             IpcEvent::IndicatorUpdate(update) => {
                 self.apply_indicator_update(update);
+            }
+            IpcEvent::PaperUpdate(paper) => {
+                self.apply_paper(paper);
             }
             IpcEvent::IndicatorsApplied(body) => {
                 self.apply_indicators_response(body);
@@ -2587,7 +2635,7 @@ fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::WorkspaceChartSnapshot;
+    use crate::ipc::{PaperDefaults, WorkspaceChartSnapshot};
     use crate::overlay::{DEFAULT_MA_STRENGTH, DEFAULT_VP_STRENGTH};
 
     #[test]
@@ -2958,6 +3006,7 @@ mod tests {
             workspace: None,
             quotes: vec![],
                     indicators: HashMap::new(),
+            paper: PaperSnapshot::default(),
         });
         assert_eq!(app.connection, ConnectionStatus::Connected);
         assert_eq!(app.vendor_mode_label(), "fake");
@@ -2977,6 +3026,7 @@ mod tests {
             workspace: None,
             quotes: vec![],
             indicators: HashMap::new(),
+            paper: PaperSnapshot::default(),
         });
         assert_eq!(app.last_vendor_tick_ts, Some(1_719_790_800.0));
 
@@ -3423,6 +3473,7 @@ mod tests {
                 change_pct: Some(1.75 / 546.25),
             }],
             indicators: HashMap::new(),
+            paper: PaperSnapshot::default(),
         });
         // Still on Welcome with defaults until Enter.
         assert_eq!(app.screen, Screen::Welcome);
@@ -4388,5 +4439,161 @@ mod tests {
             watchlists: vec![],
             active_watchlist_id: String::new(),
         }
+    }
+
+    fn sample_paper_desk() -> PaperSnapshot {
+        PaperSnapshot {
+            active_account_id: "pa_1".into(),
+            accounts: vec![
+                PaperAccountSnapshot {
+                    id: "pa_1".into(),
+                    name: "Paper".into(),
+                    currency: "USD".into(),
+                    initial_balance: 100_000.0,
+                    balance: 100_000.0,
+                    commission_per_fill_usd: 1.0,
+                    leverage_enabled: false,
+                    leverage_multiple: 1.0,
+                    asset_class_restriction: None,
+                },
+                PaperAccountSnapshot {
+                    id: "pa_2".into(),
+                    name: "Scalps".into(),
+                    currency: "USD".into(),
+                    initial_balance: 25_000.0,
+                    balance: 25_000.0,
+                    commission_per_fill_usd: 2.0,
+                    leverage_enabled: true,
+                    leverage_multiple: 4.0,
+                    asset_class_restriction: None,
+                },
+            ],
+            defaults: PaperDefaults {
+                name: "Paper".into(),
+                currency: "USD".into(),
+                initial_balance: 100_000.0,
+                commission_per_fill_usd: 1.0,
+                leverage_enabled: false,
+                leverage_multiple: 1.0,
+            },
+            positions: vec![],
+            filled_order_history: vec![],
+            balance_history: vec![],
+        }
+    }
+
+    #[test]
+    fn snapshot_without_paper_is_empty_desk() {
+        let mut app = App::default();
+        app.apply_ipc(IpcEvent::Snapshot {
+            feed: FeedSnapshot {
+                status: "connected".into(),
+                vendor_mode: "fake".into(),
+                engine: "up".into(),
+                last_vendor_tick_ts: None,
+            },
+            workspace: None,
+            quotes: vec![],
+            indicators: HashMap::new(),
+            paper: PaperSnapshot::default(),
+        });
+        assert!(app.paper.accounts.is_empty());
+        assert!(app.active_paper_account().is_none());
+        assert!(app.paper.positions.is_empty());
+        assert!(app.paper.filled_order_history.is_empty());
+        assert!(app.paper.balance_history.is_empty());
+    }
+
+    #[test]
+    fn paper_update_event_replaces_desk() {
+        let mut app = App::default();
+        app.apply_ipc(IpcEvent::PaperUpdate(sample_paper_desk()));
+        assert_eq!(
+            app.active_paper_account().map(|a| a.name.as_str()),
+            Some("Paper")
+        );
+        assert_eq!(
+            app.active_paper_account().map(|a| a.balance),
+            Some(100_000.0)
+        );
+    }
+
+    #[test]
+    fn paper_panel_shows_active_account_settings_and_empty_tables() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_paper(sample_paper_desk());
+
+        let active = app.active_paper_account().expect("active paper account");
+        assert_eq!(active.name, "Paper");
+        assert_eq!(active.balance, 100_000.0);
+        assert_eq!(active.currency, "USD");
+        assert_eq!(active.initial_balance, 100_000.0);
+        assert_eq!(active.commission_per_fill_usd, 1.0);
+        assert!(!active.leverage_enabled);
+        assert_eq!(active.leverage_multiple, 1.0);
+        assert_eq!(app.paper.defaults.name, "Paper");
+        assert_eq!(app.paper.defaults.initial_balance, 100_000.0);
+        assert_eq!(app.paper.defaults.commission_per_fill_usd, 1.0);
+        assert_eq!(app.paper.defaults.leverage_multiple, 1.0);
+        assert!(app.paper.positions.is_empty());
+        assert!(app.paper.filled_order_history.is_empty());
+        assert!(app.paper.balance_history.is_empty());
+
+        app.apply_paper(PaperSnapshot {
+            active_account_id: "pa_2".into(),
+            ..sample_paper_desk()
+        });
+        let active = app.active_paper_account().expect("active paper account");
+        assert_eq!(active.name, "Scalps");
+        assert_eq!(active.balance, 25_000.0);
+
+        app.apply_paper(PaperSnapshot {
+            active_account_id: "missing".into(),
+            ..sample_paper_desk()
+        });
+        assert!(app.active_paper_account().is_none());
+    }
+
+    #[test]
+    fn paper_panel_toggle_owns_input_focus() {
+        let bars = sample_bars(5, 1_000, 60);
+        let mut app = app_with_available_bars(bars);
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
+            watchlists: vec![WatchlistSnapshot {
+                id: "wl1".into(),
+                name: "Core".into(),
+                symbols: vec!["SPY".into(), "QQQ".into(), "IWM".into()],
+            }],
+            active_watchlist_id: "wl1".into(),
+        });
+        app.watchlist_visible = true;
+        app.watchlist_selected = 0;
+
+        app.toggle_paper_panel();
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+
+        app.watchlist_select_delta(1);
+        assert_eq!(
+            app.watchlist_selected, 0,
+            "↑↓ must not move watchlist while paper panel owns focus"
+        );
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, None);
+        assert!(!app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "SPY");
+
+        app.toggle_paper_panel();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        app.watchlist_select_delta(1);
+        assert_eq!(app.watchlist_selected, 1);
     }
 }

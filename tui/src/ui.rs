@@ -206,11 +206,13 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_workspace(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let panel_open = matches!(app.input_mode, InputMode::IndicatorPanel);
+    let paper_open = matches!(app.input_mode, InputMode::PaperPanel);
     let prompt_h = match &app.input_mode {
         InputMode::InstrumentPrompt { .. }
         | InputMode::WatchlistAddPrompt { .. }
         | InputMode::WatchlistRenamePrompt { .. } => 3,
         InputMode::IndicatorPanel => 12,
+        InputMode::PaperPanel => 16,
         InputMode::FrvpPlacing | InputMode::AvpPlacing => 3,
         InputMode::Normal => 0,
     };
@@ -270,6 +272,9 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         }
         InputMode::IndicatorPanel => {
             draw_indicator_panel(frame, chunks[2], app);
+        }
+        InputMode::PaperPanel => {
+            draw_paper_panel(frame, chunks[2], app);
         }
         InputMode::FrvpPlacing => {
             let (phase_label, pin_label) = match app.frvp_place.as_ref().map(|p| p.phase) {
@@ -338,6 +343,13 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             "Anchored pin  ·  ←/→ bar  ·  [/] jump  ·  9 cash open  ·  Enter lock  ·  Esc cancel  ·  ? help",
         )
         .style(Style::default().fg(Color::Yellow))
+    } else if paper_open {
+        let name = app
+            .active_paper_account()
+            .map(|a| a.name.as_str())
+            .unwrap_or("—");
+        Paragraph::new(format!("Paper · {name}  ·  Esc close  ·  ? help"))
+            .style(Style::default().fg(Color::DarkGray))
     } else if panel_open {
         let side = match app.indicator_list_side {
             IndicatorListSide::Available => "Available",
@@ -360,6 +372,155 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
     };
     frame.render_widget(help, chunks[3]);
+}
+
+fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+            Constraint::Percentage(24),
+        ])
+        .split(area);
+
+    draw_paper_settings(frame, cols[0], app);
+    draw_paper_table(
+        frame,
+        cols[1],
+        " Position ",
+        "symbol  side  qty  avg  uPnL",
+        app.paper
+            .positions
+            .iter()
+            .map(|row| row.symbol.clone())
+            .collect(),
+    );
+    draw_paper_table(
+        frame,
+        cols[2],
+        " Filled order history ",
+        "symbol  side  type  qty  fill",
+        app.paper
+            .filled_order_history
+            .iter()
+            .map(|row| row.symbol.clone())
+            .collect(),
+    );
+    draw_paper_table(
+        frame,
+        cols[3],
+        " Balance history ",
+        "time  balance",
+        app.paper
+            .balance_history
+            .iter()
+            .map(|row| format!("{:.2}", row.balance))
+            .collect(),
+    );
+}
+
+fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let account = app.active_paper_account();
+    let defaults = &app.paper.defaults;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    match account {
+        Some(acc) => {
+            lines.push(Line::from(Span::styled(
+                format!("{}  ${:.2} {}", acc.name, acc.balance, acc.currency),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Settings",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!("name  {}", acc.name)));
+            lines.push(Line::from(format!(
+                "initial  ${:.2} {}",
+                acc.initial_balance, acc.currency
+            )));
+            lines.push(Line::from(format!(
+                "commission  ${:.2} / fill",
+                acc.commission_per_fill_usd
+            )));
+            let lev = if acc.leverage_enabled {
+                format!("{}×", acc.leverage_multiple)
+            } else {
+                format!("{}× (off)", acc.leverage_multiple)
+            };
+            lines.push(Line::from(format!("leverage  {lev}")));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "No paper account",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Settings (defaults)",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!("name  {}", defaults.name)));
+            lines.push(Line::from(format!(
+                "initial  ${:.2} {}",
+                defaults.initial_balance, defaults.currency
+            )));
+            lines.push(Line::from(format!(
+                "commission  ${:.2} / fill",
+                defaults.commission_per_fill_usd
+            )));
+            lines.push(Line::from(format!(
+                "leverage  {}× (off)",
+                defaults.leverage_multiple
+            )));
+        }
+    }
+
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Paper account "),
+    );
+    frame.render_widget(body, area);
+}
+
+fn draw_paper_table(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    header: &str,
+    rows: Vec<String>,
+) {
+    let mut lines = vec![Line::from(Span::styled(
+        header.to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for row in rows {
+            lines.push(Line::from(row));
+        }
+    }
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title.to_string()),
+    );
+    frame.render_widget(body, area);
 }
 
 fn draw_indicator_panel(frame: &mut Frame, area: Rect, app: &App) {

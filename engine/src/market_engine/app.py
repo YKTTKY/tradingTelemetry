@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from market_engine.chart import ChartService
 from market_engine.feed import FeedState, default_feed_state
 from market_engine.indicators import IndicatorService, parse_indicators_payload
+from market_engine.paper import PaperBook
 from market_engine.publish import ConflatingHub
 from market_engine.quotes import QuoteService
 from market_engine.vendor import (
@@ -64,6 +65,23 @@ class TypeStylesBody(BaseModel):
     type_styles: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
+class PaperAccountCreateBody(BaseModel):
+    """Create a local USD paper account. Omitted fields use visible desk defaults."""
+
+    name: str | None = None
+    initial_balance: float | None = None
+    commission_per_fill_usd: float | None = None
+    leverage_enabled: bool | None = None
+    leverage_multiple: float | None = None
+    asset_class_restriction: str | None = None
+
+
+class PaperActiveBody(BaseModel):
+    """Select which paper account is active (tests / settings; switching UX TBD)."""
+
+    account_id: str = Field(min_length=1)
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -88,11 +106,24 @@ def _vendor_options_chain(
     return OptionsChainResult(instrument=instrument, available=False)
 
 
+def _resolve_paper_path(
+    workspace_path: Path | None,
+    paper_path: Path | str | None,
+) -> Path | None:
+    """Paper SQLite sits next to the workspace file unless an explicit path is given."""
+    if paper_path is not None:
+        return Path(paper_path)
+    if workspace_path is not None:
+        return workspace_path.parent / "paper.db"
+    return None
+
+
 def create_app(
     feed: FeedState | None = None,
     vendor: MarketDataVendor | None = None,
     conflate_interval_s: float = 0.05,
     workspace_path: Path | str | None = None,
+    paper_path: Path | str | None = None,
 ) -> FastAPI:
     """Build the ASGI app. Defaults to fake vendor mode when no vendor selected."""
     state = feed if feed is not None else default_feed_state()
@@ -101,6 +132,7 @@ def create_app(
     path = Path(workspace_path) if workspace_path is not None else None
     include_vix = _vendor_resolves_vix(market_vendor)
     workspace = WorkspaceStore(path=path, include_vix=include_vix)
+    paper = PaperBook(path=_resolve_paper_path(path, paper_path))
     indicators = IndicatorService()
 
     # Restore persisted per-chart indicator configs into the hot service.
@@ -182,6 +214,7 @@ def create_app(
     app.state.vendor = market_vendor
     app.state.workspace = workspace
     app.state.indicators = indicators
+    app.state.paper = paper
 
     def public_workspace() -> dict[str, Any]:
         return workspace.state.to_public()
@@ -194,6 +227,17 @@ def create_app(
 
     def indicators_payload() -> dict[str, Any]:
         return indicators.public_all(workspace.state.active_chart_ids())
+
+    def publish_paper(reason: str) -> dict[str, Any]:
+        payload = paper.to_public()
+        hub.note_paper_event(
+            {
+                "type": "paper_update",
+                "reason": reason,
+                "paper": payload,
+            }
+        )
+        return payload
 
     def indicator_apply_response(chart_id: str) -> dict[str, Any]:
         bars = charts.bars_for(chart_id)
@@ -224,6 +268,7 @@ def create_app(
             "workspace": public_workspace(),
             "quotes": sync_watchlist_quotes(),
             "indicators": indicators_payload(),
+            "paper": paper.to_public(),
         }
 
     @app.post("/v1/workspace")
@@ -337,6 +382,29 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return watchlist_payload()
+
+    @app.post("/v1/paper/accounts")
+    def create_paper_account(body: PaperAccountCreateBody) -> dict[str, Any]:
+        try:
+            paper.create_account(
+                name=body.name,
+                initial_balance=body.initial_balance,
+                commission_per_fill_usd=body.commission_per_fill_usd,
+                leverage_enabled=body.leverage_enabled,
+                leverage_multiple=body.leverage_multiple,
+                asset_class_restriction=body.asset_class_restriction,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("account_created")
+
+    @app.post("/v1/paper/active")
+    def set_active_paper_account(body: PaperActiveBody) -> dict[str, Any]:
+        try:
+            paper.set_active(body.account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("active_changed")
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

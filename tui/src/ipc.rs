@@ -543,6 +543,100 @@ pub struct QuoteRow {
     pub change_pct: Option<f64>,
 }
 
+/// One local paper account as exposed on the snapshot / paper WS events.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct PaperAccountSnapshot {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_usd")]
+    pub currency: String,
+    #[serde(default)]
+    pub initial_balance: f64,
+    #[serde(default)]
+    pub balance: f64,
+    #[serde(default)]
+    pub commission_per_fill_usd: f64,
+    #[serde(default)]
+    pub leverage_enabled: bool,
+    #[serde(default = "default_leverage_multiple")]
+    pub leverage_multiple: f64,
+    #[serde(default)]
+    pub asset_class_restriction: Option<String>,
+}
+
+fn default_usd() -> String {
+    "USD".into()
+}
+
+fn default_leverage_multiple() -> f64 {
+    1.0
+}
+
+/// First-launch / create-account defaults (visible in paper account settings).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct PaperDefaults {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_usd")]
+    pub currency: String,
+    #[serde(default)]
+    pub initial_balance: f64,
+    #[serde(default)]
+    pub commission_per_fill_usd: f64,
+    #[serde(default)]
+    pub leverage_enabled: bool,
+    #[serde(default = "default_leverage_multiple")]
+    pub leverage_multiple: f64,
+}
+
+/// Open holding row in the Position table (empty in ticket 01).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct PaperPositionRow {
+    #[serde(default)]
+    pub symbol: String,
+}
+
+/// Append-only filled order history row (empty in ticket 01).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct FilledOrderRow {
+    #[serde(default)]
+    pub symbol: String,
+}
+
+/// Cash/equity history row for the active paper account (empty in ticket 01).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct BalanceHistoryRow {
+    #[serde(default)]
+    pub balance: f64,
+}
+
+/// Additive snapshot slice. Missing `paper` key deserializes to an empty desk.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct PaperSnapshot {
+    #[serde(default)]
+    pub active_account_id: String,
+    #[serde(default)]
+    pub accounts: Vec<PaperAccountSnapshot>,
+    #[serde(default)]
+    pub defaults: PaperDefaults,
+    #[serde(default)]
+    pub positions: Vec<PaperPositionRow>,
+    #[serde(default)]
+    pub filled_order_history: Vec<FilledOrderRow>,
+    #[serde(default)]
+    pub balance_history: Vec<BalanceHistoryRow>,
+}
+
+impl PaperSnapshot {
+    pub fn active_account(&self) -> Option<&PaperAccountSnapshot> {
+        self.accounts
+            .iter()
+            .find(|a| !self.active_account_id.is_empty() && a.id == self.active_account_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct SnapshotBody {
     feed: FeedSnapshot,
@@ -552,6 +646,8 @@ struct SnapshotBody {
     quotes: Vec<QuoteRow>,
     #[serde(default)]
     indicators: std::collections::HashMap<String, ChartIndicatorsPayload>,
+    #[serde(default)]
+    paper: PaperSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -665,6 +761,7 @@ pub enum IpcEvent {
         workspace: Option<WorkspaceSnapshot>,
         quotes: Vec<QuoteRow>,
         indicators: std::collections::HashMap<String, ChartIndicatorsPayload>,
+        paper: PaperSnapshot,
     },
     FeedStatus {
         status: String,
@@ -679,6 +776,7 @@ pub enum IpcEvent {
     BarUpdate(BarUpdateEvent),
     QuoteUpdate(QuoteUpdateEvent),
     IndicatorUpdate(IndicatorUpdateEvent),
+    PaperUpdate(PaperSnapshot),
     IndicatorsApplied(IndicatorsApplyResponse),
     Workspace(WorkspaceSnapshot),
     WatchlistState {
@@ -727,6 +825,7 @@ pub async fn fetch_snapshot(
         Option<WorkspaceSnapshot>,
         Vec<QuoteRow>,
         std::collections::HashMap<String, ChartIndicatorsPayload>,
+        PaperSnapshot,
     ),
     IpcError,
 > {
@@ -740,7 +839,13 @@ pub async fn fetch_snapshot(
         .error_for_status()?
         .json()
         .await?;
-    Ok((body.feed, body.workspace, body.quotes, body.indicators))
+    Ok((
+        body.feed,
+        body.workspace,
+        body.quotes,
+        body.indicators,
+        body.paper,
+    ))
 }
 
 pub async fn post_indicators(
@@ -767,8 +872,11 @@ pub async fn post_indicators(
         let detail = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| {
-                v.get("detail")
-                    .map(|d| d.as_str().map(|s| s.to_string()).unwrap_or_else(|| d.to_string()))
+                v.get("detail").map(|d| {
+                    d.as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| d.to_string())
+                })
             })
             .unwrap_or(text);
         return Err(IpcError::Status(format!("{status}: {detail}")));
@@ -954,15 +1062,15 @@ async fn connect_session(
     endpoint: &EngineEndpoint,
     tx: &mpsc::UnboundedSender<IpcEvent>,
 ) -> Result<(), String> {
-    let (feed, workspace, quotes, indicators) = fetch_snapshot(endpoint)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (feed, workspace, quotes, indicators, paper) =
+        fetch_snapshot(endpoint).await.map_err(|e| e.to_string())?;
     if tx
         .send(IpcEvent::Snapshot {
             feed,
             workspace,
             quotes,
             indicators,
+            paper,
         })
         .is_err()
     {
@@ -1053,6 +1161,17 @@ async fn connect_session(
                                 }
                             }
                         }
+                        Some("paper_update") => {
+                            let parsed = value
+                                .get("paper")
+                                .cloned()
+                                .and_then(|v| serde_json::from_value::<PaperSnapshot>(v).ok());
+                            if let Some(paper) = parsed {
+                                if tx.send(IpcEvent::PaperUpdate(paper)).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1083,11 +1202,71 @@ mod tests {
         .unwrap();
         assert_eq!(none_yet.last_vendor_tick_ts, None);
 
-        let omitted: FeedSnapshot = serde_json::from_str(
-            r#"{"status":"connected","vendor_mode":"fake","engine":"up"}"#,
+        let omitted: FeedSnapshot =
+            serde_json::from_str(r#"{"status":"connected","vendor_mode":"fake","engine":"up"}"#)
+                .unwrap();
+        assert_eq!(omitted.last_vendor_tick_ts, None);
+    }
+
+    #[test]
+    fn snapshot_deserializes_with_and_without_paper_key() {
+        let with_paper: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up","last_vendor_tick_ts":null},
+                "workspace": {"layout_mode":"single","charts":[]},
+                "quotes": [],
+                "indicators": {},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [{
+                        "id": "pa_1",
+                        "name": "Paper",
+                        "currency": "USD",
+                        "initial_balance": 100000.0,
+                        "balance": 100000.0,
+                        "commission_per_fill_usd": 1.0,
+                        "leverage_enabled": false,
+                        "leverage_multiple": 1.0
+                    }],
+                    "defaults": {
+                        "name": "Paper",
+                        "currency": "USD",
+                        "initial_balance": 100000.0,
+                        "commission_per_fill_usd": 1.0,
+                        "leverage_enabled": false,
+                        "leverage_multiple": 1.0
+                    },
+                    "positions": [],
+                    "filled_order_history": [],
+                    "balance_history": []
+                }
+            }"#,
         )
         .unwrap();
-        assert_eq!(omitted.last_vendor_tick_ts, None);
+        assert_eq!(with_paper.paper.active_account_id, "pa_1");
+        assert_eq!(with_paper.paper.accounts.len(), 1);
+        assert_eq!(with_paper.paper.accounts[0].name, "Paper");
+        assert_eq!(with_paper.paper.accounts[0].balance, 100_000.0);
+        assert_eq!(with_paper.paper.accounts[0].commission_per_fill_usd, 1.0);
+        assert!(!with_paper.paper.accounts[0].leverage_enabled);
+        assert_eq!(with_paper.paper.accounts[0].leverage_multiple, 1.0);
+        assert!(with_paper.paper.positions.is_empty());
+        assert!(with_paper.paper.filled_order_history.is_empty());
+        assert!(with_paper.paper.balance_history.is_empty());
+
+        let without: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "workspace": {"layout_mode":"single","charts":[]},
+                "quotes": [],
+                "indicators": {}
+            }"#,
+        )
+        .unwrap();
+        assert!(without.paper.accounts.is_empty());
+        assert!(without.paper.active_account_id.is_empty());
+        assert!(without.paper.positions.is_empty());
+        assert_eq!(without.feed.last_vendor_tick_ts, None);
     }
 
     #[test]

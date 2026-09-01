@@ -50,6 +50,7 @@ class ConflatingHub:
         self._pending: dict[tuple[str, str], PendingBarUpdate] = {}
         self._pending_quotes: dict[str, dict[str, Any]] = {}
         self._pending_indicators: dict[str, dict[str, Any]] = {}
+        self._pending_paper: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._clients: list[_Client] = []
         self._clients_lock = asyncio.Lock()
@@ -93,6 +94,13 @@ class ConflatingHub:
         payload["chart_id"] = chart_id
         with self._lock:
             self._pending_indicators[chart_id] = payload
+
+    def note_paper_event(self, event: dict[str, Any]) -> None:
+        """Queue a discrete paper event (not latest-wins — fills must not drop)."""
+        payload = dict(event)
+        payload["type"] = str(payload.get("type") or "paper_update")
+        with self._lock:
+            self._pending_paper.append(payload)
 
     async def add_client(self, websocket: WebSocket) -> None:
         async with self._clients_lock:
@@ -151,9 +159,12 @@ class ConflatingHub:
             self._pending_quotes.clear()
             indicator_batch = list(self._pending_indicators.values())
             self._pending_indicators.clear()
+            paper_batch = list(self._pending_paper)
+            self._pending_paper.clear()
         events: list[dict[str, Any]] = [item.to_event() for item in bar_batch]
         events.extend(quote_batch)
         events.extend(indicator_batch)
+        events.extend(paper_batch)
         if not events:
             return
         async with self._clients_lock:
