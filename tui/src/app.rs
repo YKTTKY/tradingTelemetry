@@ -300,6 +300,9 @@ pub enum PendingPaperOp {
     Cancel {
         order_id: String,
     },
+    Close {
+        instrument: String,
+    },
 }
 
 /// Buy or sell on the order side panel.
@@ -1367,6 +1370,23 @@ impl App {
             return;
         };
         self.pending_paper = Some(PendingPaperOp::Cancel { order_id });
+    }
+
+    /// Close the focused chart's open position (exit filled-history leg).
+    pub fn paper_close_focused(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        let instrument = self.order_side_instrument().to_string();
+        let has_pos = self
+            .paper
+            .positions
+            .iter()
+            .any(|p| p.symbol.eq_ignore_ascii_case(&instrument) && p.qty > 0.0);
+        if !has_pos {
+            return;
+        }
+        self.pending_paper = Some(PendingPaperOp::Close { instrument });
     }
 
     fn seed_order_side_prices(&mut self) {
@@ -2964,7 +2984,9 @@ fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{PaperDefaults, WorkspaceChartSnapshot};
+    use crate::ipc::{
+        BalanceHistoryRow, FilledOrderRow, PaperDefaults, PaperPositionRow, WorkspaceChartSnapshot,
+    };
     use crate::overlay::{DEFAULT_MA_STRENGTH, DEFAULT_VP_STRENGTH};
 
     #[test]
@@ -5130,5 +5152,78 @@ mod tests {
         app.paper_set_side(OrderSide::Sell);
         assert_eq!(app.order_side.kind, WorkingOrderKind::Limit);
         assert_eq!(app.order_side.side, OrderSide::Buy);
+    }
+
+    #[test]
+    fn paper_update_replaces_positions_fills_and_balance() {
+        let mut app = App::default();
+        let mut desk = sample_paper_desk();
+        desk.positions = vec![PaperPositionRow {
+            symbol: "SPY".into(),
+            side: "long".into(),
+            qty: 10.0,
+            avg_price: 111.0,
+            unrealized_pnl: 5.0,
+        }];
+        desk.filled_order_history = vec![FilledOrderRow {
+            id: "fo_1".into(),
+            account_id: "pa_1".into(),
+            symbol: "SPY".into(),
+            side: "buy".into(),
+            order_type: "market".into(),
+            qty: 10.0,
+            fill_price: 111.0,
+            commission: 1.0,
+            placed_ts: 1_719_792_000,
+            filled_ts: 1_719_792_065,
+            duration_s: 65,
+            ..FilledOrderRow::default()
+        }];
+        desk.balance_history = vec![BalanceHistoryRow {
+            ts: 1_719_792_065,
+            balance: 98_889.0,
+        }];
+        app.apply_ipc(IpcEvent::PaperUpdate(desk));
+        assert_eq!(app.paper.positions.len(), 1);
+        assert_eq!(app.paper.positions[0].symbol, "SPY");
+        assert_eq!(app.paper.positions[0].side, "long");
+        assert_eq!(app.paper.positions[0].qty, 10.0);
+        assert_eq!(app.paper.filled_order_history[0].fill_price, 111.0);
+        assert_eq!(app.paper.balance_history[0].balance, 98_889.0);
+    }
+
+    #[test]
+    fn paper_close_focused_emits_close_for_open_position() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.positions = vec![PaperPositionRow {
+            symbol: "SPY".into(),
+            side: "long".into(),
+            qty: 10.0,
+            avg_price: 111.0,
+            unrealized_pnl: 0.0,
+        }];
+        app.apply_paper(desk);
+        app.paper_close_focused();
+        assert!(app.pending_paper.is_none(), "panel closed: close idle");
+        app.toggle_paper_panel();
+        app.paper_close_focused();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Close {
+                instrument: "SPY".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn paper_close_focused_noops_without_matching_position() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.apply_paper(sample_paper_desk());
+        app.toggle_paper_panel();
+        app.paper_close_focused();
+        assert!(app.pending_paper.is_none());
     }
 }

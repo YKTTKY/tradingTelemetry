@@ -1,6 +1,6 @@
 //! New York wall clock and feed delay for Feed status.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use chrono_tz::{America::New_York, OffsetName};
 
 /// Current New York civil time for Feed status (`11:17:44 EDT`).
@@ -33,6 +33,31 @@ pub fn format_feed_clocks(now: DateTime<Utc>, last_vendor_tick_ts: Option<f64>) 
     match format_feed_delay(now.timestamp() as f64, last_vendor_tick_ts) {
         Some(delay) => format!("  {clock}  delay {delay}"),
         None => format!("  {clock}"),
+    }
+}
+
+/// Fill / place / close timestamp in New York time (`2026-08-14 11:17:44 EDT`).
+pub fn format_ny_timestamp(unix_ts: i64) -> String {
+    let utc = Utc
+        .timestamp_opt(unix_ts, 0)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let ny = utc.with_timezone(&New_York);
+    let abbrev = ny.offset().abbreviation().unwrap_or("ET");
+    format!("{} {abbrev}", ny.format("%Y-%m-%d %H:%M:%S"))
+}
+
+/// Elapsed fill duration for filled order history (`5s`, `1m 05s`, `1h 02m`).
+pub fn format_elapsed(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        format!("{hours}h {minutes:02}m")
     }
 }
 
@@ -112,5 +137,31 @@ mod tests {
             format_feed_clocks(utc, Some(utc.timestamp() as f64 - 4.0)),
             "  11:17:44 EDT"
         );
+    }
+
+    #[test]
+    fn ny_timestamp_uses_edt_in_summer() {
+        let utc = Utc.with_ymd_and_hms(2026, 8, 14, 15, 17, 44).unwrap();
+        assert_eq!(
+            format_ny_timestamp(utc.timestamp()),
+            "2026-08-14 11:17:44 EDT"
+        );
+    }
+
+    #[test]
+    fn ny_timestamp_uses_est_in_winter() {
+        let utc = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        assert_eq!(
+            format_ny_timestamp(utc.timestamp()),
+            "2026-01-15 07:00:00 EST"
+        );
+    }
+
+    #[test]
+    fn elapsed_duration_formats_seconds_minutes_hours() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(5), "5s");
+        assert_eq!(format_elapsed(65), "1m 05s");
+        assert_eq!(format_elapsed(3720), "1h 02m");
     }
 }

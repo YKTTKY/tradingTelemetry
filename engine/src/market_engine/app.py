@@ -108,6 +108,12 @@ class PaperOrderCancelBody(BaseModel):
     order_id: str = Field(min_length=1)
 
 
+class PaperPositionCloseBody(BaseModel):
+    """Flatten an open position on the active paper account (exit history leg)."""
+
+    instrument: str = Field(min_length=1)
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -207,7 +213,11 @@ def create_app(
     def on_live_tick(tick: Tick) -> None:
         state.note_vendor_tick(tick.ts)
 
+    def on_paper_1m_bar(instrument: str, bar: Bar) -> None:
+        paper.evaluate_bar(instrument, bar, on_fill=_on_paper_fill)
+
     charts.on_bar_update = on_bar_update
+    charts.on_paper_1m_bar = on_paper_1m_bar
     charts.on_live_tick = on_live_tick
     quotes = QuoteService(
         vendor=market_vendor,
@@ -254,8 +264,31 @@ def create_app(
     def indicators_payload() -> dict[str, Any]:
         return indicators.public_all(workspace.state.active_chart_ids())
 
+    def last_prices_for_paper() -> dict[str, float]:
+        prices: dict[str, float] = {}
+        for inst in paper.instruments_needing_1m():
+            close = charts.paper_1m_close(inst)
+            if close is not None:
+                prices[inst] = close
+        return prices
+
+    def last_price_for_instrument(instrument: str) -> float | None:
+        last = quotes.last_price(instrument)
+        if last is not None:
+            return last
+        result = market_vendor.fetch_history(instrument, "1D")
+        if result.available and result.bars:
+            return float(result.bars[-1].close)
+        return None
+
+    def public_paper() -> dict[str, Any]:
+        return paper.to_public(last_prices=last_prices_for_paper())
+
+    def sync_paper_interest() -> None:
+        charts.sync_paper_1m(paper.instruments_needing_1m())
+
     def publish_paper(reason: str) -> dict[str, Any]:
-        payload = paper.to_public()
+        payload = public_paper()
         hub.note_paper_event(
             {
                 "type": "paper_update",
@@ -264,6 +297,12 @@ def create_app(
             }
         )
         return payload
+
+    def _on_paper_fill(_filled: object) -> None:
+        sync_paper_interest()
+        publish_paper("order_filled")
+
+    sync_paper_interest()
 
     def indicator_apply_response(chart_id: str) -> dict[str, Any]:
         bars = charts.bars_for(chart_id)
@@ -294,7 +333,7 @@ def create_app(
             "workspace": public_workspace(),
             "quotes": sync_watchlist_quotes(),
             "indicators": indicators_payload(),
-            "paper": paper.to_public(),
+            "paper": public_paper(),
         }
 
     @app.post("/v1/workspace")
@@ -432,15 +471,6 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return publish_paper("active_changed")
 
-    def resolve_last_price(instrument: str) -> float | None:
-        last = quotes.last_price(instrument)
-        if last is not None:
-            return last
-        result = market_vendor.fetch_history(instrument, "1D")
-        if result.available and result.bars:
-            return float(result.bars[-1].close)
-        return None
-
     @app.post("/v1/paper/orders")
     def place_paper_order(body: PaperOrderPlaceBody) -> dict[str, Any]:
         try:
@@ -451,10 +481,11 @@ def create_app(
                 qty=body.qty,
                 limit=body.limit,
                 stop=body.stop,
-                last_price=resolve_last_price(body.instrument),
+                last_price=last_price_for_instrument(body.instrument),
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_paper_interest()
         return publish_paper("order_placed")
 
     @app.post("/v1/paper/orders/modify")
@@ -467,10 +498,11 @@ def create_app(
                 qty=body.qty,
                 limit=body.limit,
                 stop=body.stop,
-                last_price=resolve_last_price(instrument) if instrument else None,
+                last_price=last_price_for_instrument(instrument) if instrument else None,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_paper_interest()
         return publish_paper("order_modified")
 
     @app.post("/v1/paper/orders/cancel")
@@ -479,7 +511,23 @@ def create_app(
             paper.cancel_order(body.order_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_paper_interest()
         return publish_paper("order_cancelled")
+
+    @app.post("/v1/paper/positions/close")
+    def close_paper_position(body: PaperPositionCloseBody) -> dict[str, Any]:
+        price = charts.paper_1m_close(body.instrument)
+        if price is None:
+            raise HTTPException(
+                status_code=422,
+                detail="unavailable 1m: cannot close without a 1m last",
+            )
+        try:
+            paper.close_position(body.instrument, price)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_paper_interest()
+        return publish_paper("position_closed")
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

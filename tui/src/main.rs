@@ -22,7 +22,7 @@ use crossterm::terminal::{
 };
 use ipc::{
     EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_cancel,
-    post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
+    post_paper_close, post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
     post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
     run_ipc_loop,
 };
@@ -154,6 +154,9 @@ async fn run_loop(
                         stop,
                     } => post_paper_modify(&ep, &order_id, qty, limit, stop).await,
                     PendingPaperOp::Cancel { order_id } => post_paper_cancel(&ep, &order_id).await,
+                    PendingPaperOp::Close { instrument } => {
+                        post_paper_close(&ep, &instrument).await
+                    }
                 };
                 match result {
                     Ok(paper) => {
@@ -289,6 +292,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('l') | KeyCode::Char('L') => app.paper_set_kind(WorkingOrderKind::Limit),
             KeyCode::Char('t') | KeyCode::Char('T') => app.paper_set_kind(WorkingOrderKind::Stop),
             KeyCode::Char('x') | KeyCode::Char('X') => app.paper_cancel_selected(),
+            KeyCode::Char('f') | KeyCode::Char('F') => app.paper_close_focused(),
             KeyCode::Char('q') => app.quit(),
             _ => {}
         },

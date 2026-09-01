@@ -4,25 +4,25 @@
 
 **Blocked by:** 02 — Working orders
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Evaluation series is **1m**, engine-owned, independent of the focused chart timeframe
-- [ ] Engine keeps that **1m** series for any **instrument** with **working orders** or open **positions**, including uncharted symbols
-- [ ] Hook the existing bar-update path (last bar or roll). Do not add a second vendor tick pipe.
-- [ ] **Market:** full qty on the next evaluation at the evaluating bar’s close (last)
-- [ ] **Limit:** buy if bar low ≤ limit; sell if bar high ≥ limit; fill price = limit
-- [ ] **Stop:** buy if bar high ≥ stop; sell if bar low ≤ stop; fill price = stop
-- [ ] Re-check on every last-bar OHLC update, not only on close; a roll that trades through still fills; do not invent skipped minutes
-- [ ] **No partial fills.** Oversized qty was already rejected at place; fills are all-or-nothing
-- [ ] Unavailable **1m** (no vendor series) → **working order** stays working; no invented fill
-- [ ] Fill writes **filled order history**, updates **positions**, applies commission, appends **balance history**
-- [ ] **Position** panel is distinct from the **watchlist**; row shows at least symbol, side, qty, average price, unrealized P&L
-- [ ] **Filled order history** is append-only / filterable and is not a working-orders table; columns include symbol, side, type, qty, limit/stop/fill prices, commission, place time, fill/close time, duration, margin where relevant
-- [ ] Engine stores unix; TUI formatters show **New York time** (`America/New_York`)
-- [ ] Paper WS fill/position/balance events are discrete and must not drop across a burst of fills (no latest-wins)
-- [ ] Fake-vendor contract: `inject_tick` updates last bar or rolls 1m through the trigger → fill. Include an uncharted-symbol case.
-- [ ] Existing **aligned live bars** / feed delay tests still pass. Fake vendor only.
-- [ ] TUI tables update from snapshot + paper WS without polling.
+- [x] Evaluation series is **1m**, engine-owned, independent of the focused chart timeframe
+- [x] Engine keeps that **1m** series for any **instrument** with **working orders** or open **positions**, including uncharted symbols
+- [x] Hook the existing bar-update path (last bar or roll). Do not add a second vendor tick pipe.
+- [x] **Market:** full qty on the next evaluation at the evaluating bar’s close (last)
+- [x] **Limit:** buy if bar low ≤ limit; sell if bar high ≥ limit; fill price = limit
+- [x] **Stop:** buy if bar high ≥ stop; sell if bar low ≤ stop; fill price = stop
+- [x] Re-check on every last-bar OHLC update, not only on close; a roll that trades through still fills; do not invent skipped minutes
+- [x] **No partial fills.** Oversized qty was already rejected at place; fills are all-or-nothing
+- [x] Unavailable **1m** (no vendor series) → **working order** stays working; no invented fill
+- [x] Fill writes **filled order history**, updates **positions**, applies commission, appends **balance history**
+- [x] **Position** panel is distinct from the **watchlist**; row shows at least symbol, side, qty, average price, unrealized P&L
+- [x] **Filled order history** is append-only / filterable and is not a working-orders table; columns include symbol, side, type, qty, limit/stop/fill prices, commission, place time, fill/close time, duration, margin where relevant
+- [x] Engine stores unix; TUI formatters show **New York time** (`America/New_York`)
+- [x] Paper WS fill/position/balance events are discrete and must not drop across a burst of fills (no latest-wins)
+- [x] Fake-vendor contract: `inject_tick` updates last bar or rolls 1m through the trigger → fill. Include an uncharted-symbol case.
+- [x] Existing **aligned live bars** / feed delay tests still pass. Fake vendor only.
+- [x] TUI tables update from snapshot + paper WS without polling.
 
 ## Notes
 

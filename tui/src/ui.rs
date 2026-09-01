@@ -15,8 +15,8 @@ use crate::app::{
     AVAILABLE_INDICATOR_TYPES, App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase,
     IndicatorListSide, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
 };
-use crate::feed_clock::format_feed_clocks;
-use crate::ipc::{OhlcvBar, QuoteRow};
+use crate::feed_clock::{format_elapsed, format_feed_clocks, format_ny_timestamp};
+use crate::ipc::{BalanceHistoryRow, FilledOrderRow, OhlcvBar, PaperPositionRow, QuoteRow};
 use crate::overlay::{
     MAX_VP_HIST_PANE_FRACTION, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
     OverlayPin, paint_overlays, volume_bar_color,
@@ -368,7 +368,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             .map(|a| a.name.as_str())
             .unwrap_or("—");
         Paragraph::new(format!(
-            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  ↑↓ select  Enter  x cancel  ·  Esc close  ·  ? help"
+            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  ↑↓ select  Enter  x cancel  f flatten  ·  Esc close  ·  ? help"
         ))
             .style(Style::default().fg(Color::DarkGray))
     } else if panel_open {
@@ -417,18 +417,18 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
         app.paper
             .positions
             .iter()
-            .map(|row| row.symbol.clone())
+            .map(format_position_row)
             .collect(),
     );
     draw_paper_table(
         frame,
         cols[3],
         " Filled order history ",
-        "symbol  side  type  qty  fill",
+        "symbol  side  type  qty  limit  stop  fill  c  place  fill/close  dur",
         app.paper
             .filled_order_history
             .iter()
-            .map(|row| row.symbol.clone())
+            .map(format_filled_order_row)
             .collect(),
     );
     draw_paper_table(
@@ -439,9 +439,44 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
         app.paper
             .balance_history
             .iter()
-            .map(|row| format!("{:.2}", row.balance))
+            .map(format_balance_row)
             .collect(),
     );
+}
+
+pub(crate) fn format_position_row(row: &PaperPositionRow) -> String {
+    format!(
+        "{}  {}  {:.0}  {:.2}  {:+.2}",
+        row.symbol, row.side, row.qty, row.avg_price, row.unrealized_pnl
+    )
+}
+
+fn opt_price(value: Option<f64>) -> String {
+    value
+        .filter(|v| *v > 0.0)
+        .map(|v| format!("{v:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+pub(crate) fn format_filled_order_row(row: &FilledOrderRow) -> String {
+    format!(
+        "{}  {}  {}  {:.0}  {}  {}  {:.2}  c{:.2}  {}  {}  {}",
+        row.symbol,
+        row.side,
+        row.order_type,
+        row.qty,
+        opt_price(row.limit),
+        opt_price(row.stop),
+        row.fill_price,
+        row.commission,
+        format_ny_timestamp(row.placed_ts),
+        format_ny_timestamp(row.filled_ts),
+        format_elapsed(row.duration_s),
+    )
+}
+
+pub(crate) fn format_balance_row(row: &BalanceHistoryRow) -> String {
+    format!("{}  {:.2}", format_ny_timestamp(row.ts), row.balance)
 }
 
 fn draw_order_side_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -2193,4 +2228,61 @@ fn feed_line(app: &App) -> Line<'static> {
         Span::raw(format!("  vendor={vendor}{hb}{clocks}")),
         Span::styled(err, Style::default().fg(Color::Red)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::{BalanceHistoryRow, FilledOrderRow, PaperPositionRow};
+
+    #[test]
+    fn position_row_shows_symbol_side_qty_avg_and_upnl() {
+        let row = PaperPositionRow {
+            symbol: "SPY".into(),
+            side: "long".into(),
+            qty: 10.0,
+            avg_price: 111.0,
+            unrealized_pnl: 5.5,
+        };
+        assert_eq!(format_position_row(&row), "SPY  long  10  111.00  +5.50");
+    }
+
+    #[test]
+    fn filled_order_row_uses_new_york_time() {
+        let placed = Utc
+            .with_ymd_and_hms(2026, 8, 14, 15, 17, 44)
+            .unwrap()
+            .timestamp();
+        let row = FilledOrderRow {
+            symbol: "SPY".into(),
+            side: "buy".into(),
+            order_type: "market".into(),
+            qty: 10.0,
+            fill_price: 111.0,
+            commission: 1.0,
+            placed_ts: placed,
+            filled_ts: placed + 65,
+            duration_s: 65,
+            ..FilledOrderRow::default()
+        };
+        let line = format_filled_order_row(&row);
+        assert!(line.starts_with("SPY  buy  market  10  -  -  111.00  c1.00  "));
+        assert!(line.contains("2026-08-14 11:17:44 EDT"));
+        assert!(line.contains("1m 05s"));
+        assert!(!line.contains("UTC"));
+    }
+
+    #[test]
+    fn balance_row_uses_new_york_time() {
+        let ts = Utc
+            .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+        let row = BalanceHistoryRow {
+            ts,
+            balance: 98_889.0,
+        };
+        let line = format_balance_row(&row);
+        assert_eq!(line, "2026-01-15 07:00:00 EST  98889.00");
+    }
 }

@@ -516,3 +516,337 @@ def test_place_modify_cancel_emit_discrete_paper_ws_events(tmp_path: Path):
             assert len(events[0]["paper"]["working_orders"]) == 1
             assert events[1]["paper"]["working_orders"][0]["qty"] == 2
             assert events[2]["paper"]["working_orders"] == []
+
+
+# Seeded 1m series for bar-touch fill tests. Geometry matches FakeVendor
+# `_bars_from_closes`: last open=109, close=110, high=110.5, low=108.5.
+_SPY_1M_START_TS = 1_719_792_000
+_MINUTE = 60
+_SPY_1M_LAST_TS = _SPY_1M_START_TS + 10 * _MINUTE  # 1_719_792_600
+
+
+def _seed_1m(vendor: FakeVendor, instrument: str = "SPY", *, base: float = 100.0) -> None:
+    vendor.seed_history(
+        instrument,
+        "1m",
+        closes=tuple(base + i for i in range(11)),
+        start_ts=_SPY_1M_START_TS,
+        period_seconds=_MINUTE,
+        base_volume=1_000.0,
+    )
+
+
+def _paper_client(tmp_path: Path, *, instruments: tuple[str, ...] = ("SPY",)):
+    vendor = FakeVendor(auto_ticks=False)
+    for inst in instruments:
+        _seed_1m(vendor, inst, base=100.0 if inst == "SPY" else 200.0)
+    return _client(workspace_path=tmp_path / "workspace.json", vendor=vendor)
+
+
+def test_market_fills_full_qty_on_next_1m_last_bar_eval(tmp_path: Path):
+    """Market fills in full at the evaluating 1m bar's close (last), not at place."""
+    client, vendor = _paper_client(tmp_path)
+    placed = _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    assert placed.status_code == 200, placed.text
+    paper = placed.json()
+    assert len(paper["working_orders"]) == 1
+    assert paper["positions"] == []
+    assert paper["filled_order_history"] == []
+
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+
+    snap = client.get("/v1/snapshot").json()["paper"]
+    assert snap["working_orders"] == []
+    assert len(snap["positions"]) == 1
+    pos = snap["positions"][0]
+    assert pos["symbol"] == "SPY"
+    assert pos["side"] == "long"
+    assert pos["qty"] == 10
+    assert pos["avg_price"] == 111.25
+    assert "unrealized_pnl" in pos
+
+    assert len(snap["filled_order_history"]) == 1
+    fill = snap["filled_order_history"][0]
+    assert fill["symbol"] == "SPY"
+    assert fill["side"] == "buy"
+    assert fill["type"] == "market"
+    assert fill["qty"] == 10
+    assert fill["fill_price"] == 111.25
+    assert fill["commission"] == _DEFAULT_COMMISSION
+    assert fill["limit"] in (None, 0, 0.0)
+    assert fill["stop"] in (None, 0, 0.0)
+    assert isinstance(fill["placed_ts"], int) and fill["placed_ts"] > 0
+    assert isinstance(fill["filled_ts"], int) and fill["filled_ts"] >= fill["placed_ts"]
+    assert fill["duration_s"] == fill["filled_ts"] - fill["placed_ts"]
+    assert fill.get("margin") in (None, 0, 0.0)
+
+    # 10 * 111.25 + $1 commission
+    assert snap["accounts"][0]["balance"] == 98_886.5
+    assert len(snap["balance_history"]) == 1
+    assert snap["balance_history"][0]["balance"] == 98_886.5
+    assert isinstance(snap["balance_history"][0]["ts"], int)
+    assert snap["balance_history"][0]["ts"] > 0
+
+
+def test_limit_and_stop_fill_on_last_bar_touch_not_on_miss(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+
+    # Last 1m low=108.5 high=110.5. Buy limit 108 is not touching yet.
+    buy_limit = _place(
+        client, instrument="SPY", side="buy", type="limit", qty=4, limit=108.0
+    ).json()["working_orders"][0]["id"]
+    # Sell stop 108 is not touching yet.
+    sell_stop = _place(
+        client, instrument="SPY", side="sell", type="stop", qty=3, stop=108.0
+    ).json()
+    sell_stop_id = next(o["id"] for o in sell_stop["working_orders"] if o["type"] == "stop")
+
+    vendor.inject_tick("SPY", price=109.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 2))
+    time.sleep(_CONFLATE_S * 2.5)
+    miss = client.get("/v1/snapshot").json()["paper"]
+    assert {o["id"] for o in miss["working_orders"]} == {buy_limit, sell_stop_id}
+    assert miss["positions"] == []
+    assert miss["filled_order_history"] == []
+
+    vendor.inject_tick("SPY", price=107.25, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    hit = client.get("/v1/snapshot").json()["paper"]
+    assert hit["working_orders"] == []
+    by_type = {f["type"]: f for f in hit["filled_order_history"]}
+    assert by_type["limit"]["fill_price"] == 108.0
+    assert by_type["limit"]["side"] == "buy"
+    assert by_type["limit"]["qty"] == 4
+    assert by_type["stop"]["fill_price"] == 108.0
+    assert by_type["stop"]["side"] == "sell"
+    assert by_type["stop"]["qty"] == 3
+
+
+def test_sell_limit_and_buy_stop_fill_when_bar_range_crosses(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="sell", type="limit", qty=2, limit=111.0)
+    _place(client, instrument="SPY", side="buy", type="stop", qty=2, stop=111.0)
+
+    vendor.inject_tick("SPY", price=110.0, volume=5.0, ts=float(_SPY_1M_LAST_TS + 2))
+    time.sleep(_CONFLATE_S * 2.5)
+    assert len(client.get("/v1/snapshot").json()["paper"]["working_orders"]) == 2
+
+    vendor.inject_tick("SPY", price=111.75, volume=5.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    by_type = {f["type"]: f for f in paper["filled_order_history"]}
+    assert by_type["limit"]["fill_price"] == 111.0
+    assert by_type["limit"]["side"] == "sell"
+    assert by_type["stop"]["fill_price"] == 111.0
+    assert by_type["stop"]["side"] == "buy"
+
+
+def test_roll_that_trades_through_fills_without_inventing_minutes(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="limit", qty=5, limit=108.0)
+    # Current last low 108.5 does not touch 108. Roll a new minute at 107.
+    vendor.inject_tick(
+        "SPY",
+        price=107.0,
+        volume=20.0,
+        ts=float(_SPY_1M_LAST_TS + _MINUTE),
+    )
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    fill = paper["filled_order_history"][0]
+    assert fill["fill_price"] == 108.0
+    assert fill["qty"] == 5
+    assert paper["positions"][0]["qty"] == 5
+    assert paper["positions"][0]["avg_price"] == 108.0
+
+
+def test_fill_uses_engine_1m_even_when_chart_is_daily(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    interest = client.post(
+        "/v1/chart/interest",
+        json={"instrument": "SPY", "timeframe": "1D"},
+    )
+    assert interest.status_code == 200
+    assert interest.json()["status"] == "ok"
+    _place(client, instrument="SPY", side="buy", type="limit", qty=1, limit=108.0)
+    vendor.inject_tick("SPY", price=107.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 4))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["filled_order_history"][0]["fill_price"] == 108.0
+
+
+def test_fill_uses_engine_1m_when_chart_is_also_1m(tmp_path: Path):
+    """A 1m chart must not replace or double-fire the engine-owned eval series."""
+    client, vendor = _paper_client(tmp_path)
+    interest = client.post(
+        "/v1/chart/interest",
+        json={"instrument": "SPY", "timeframe": "1m"},
+    )
+    assert interest.status_code == 200
+    assert interest.json()["status"] == "ok"
+    _place(client, instrument="SPY", side="buy", type="limit", qty=1, limit=108.0)
+    vendor.inject_tick("SPY", price=107.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 4))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert len(paper["filled_order_history"]) == 1
+    assert paper["filled_order_history"][0]["fill_price"] == 108.0
+    assert paper["positions"][0]["qty"] == 1
+
+
+def test_uncharted_symbol_still_bar_touch_fills(tmp_path: Path):
+    """1m paper interest is armed for working orders even when the symbol is not charted."""
+    client, vendor = _paper_client(tmp_path, instruments=("SPY", "QQQ"))
+    client.post("/v1/chart/interest", json={"instrument": "SPY", "timeframe": "1D"})
+    placed = _place(
+        client, instrument="QQQ", side="buy", type="limit", qty=2, limit=208.0
+    )
+    assert placed.status_code == 200, placed.text
+    assert placed.json()["working_orders"][0]["instrument"] == "QQQ"
+
+    vendor.inject_tick("QQQ", price=207.0, volume=8.0, ts=float(_SPY_1M_LAST_TS + 4))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    fill = paper["filled_order_history"][0]
+    assert fill["symbol"] == "QQQ"
+    assert fill["fill_price"] == 208.0
+    assert paper["positions"][0]["symbol"] == "QQQ"
+    assert paper["positions"][0]["qty"] == 2
+
+
+def test_unavailable_1m_leaves_working_order_unfilled(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    client, vendor = _client(workspace_path=store)
+    placed = _place(client, instrument="SPY", side="buy", type="market", qty=1)
+    assert placed.status_code == 200
+    vendor.inject_tick("SPY", price=549.0, volume=10.0)
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert len(paper["working_orders"]) == 1
+    assert paper["working_orders"][0]["type"] == "market"
+    assert paper["positions"] == []
+    assert paper["filled_order_history"] == []
+    assert paper["accounts"][0]["balance"] == _DEFAULT_BALANCE
+
+
+def test_no_partial_fill_on_bar_touch(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=1.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"][0]["qty"] == 10
+    assert paper["filled_order_history"][0]["qty"] == 10
+
+
+def test_manual_flatten_writes_exit_filled_history_leg(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    opened = client.get("/v1/snapshot").json()["paper"]
+    assert opened["positions"][0]["side"] == "long"
+    assert opened["accounts"][0]["balance"] == 98_889.0
+
+    closed = client.post("/v1/paper/positions/close", json={"instrument": "SPY"})
+    assert closed.status_code == 200, closed.text
+    paper = closed.json()
+    assert paper["positions"] == []
+    assert paper["working_orders"] == []
+    assert len(paper["filled_order_history"]) == 2
+    entry, exit_leg = paper["filled_order_history"]
+    assert entry["side"] == "buy"
+    assert entry["type"] == "market"
+    assert exit_leg["side"] == "sell"
+    assert exit_leg["type"] == "close"
+    assert exit_leg["qty"] == 10
+    assert exit_leg["symbol"] == "SPY"
+    assert exit_leg["fill_price"] == 111.0
+    assert exit_leg["commission"] == _DEFAULT_COMMISSION
+    # Round-turn: two commissions, no price change → 100000 - 1 - 1
+    assert paper["accounts"][0]["balance"] == 99_998.0
+    assert paper["balance_history"][-1]["balance"] == 99_998.0
+
+    missing = client.post("/v1/paper/positions/close", json={"instrument": "SPY"})
+    assert missing.status_code == 422
+
+
+def test_fills_and_positions_persist_across_engine_restart(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    vendor1 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor1, "SPY")
+    client1, _ = _client(workspace_path=store, vendor=vendor1)
+    _place(client1, instrument="SPY", side="buy", type="market", qty=6)
+    vendor1.inject_tick("SPY", price=111.0, volume=5.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    before = client1.get("/v1/snapshot").json()["paper"]
+    fill_id = before["filled_order_history"][0]["id"]
+    assert before["positions"][0]["qty"] == 6
+    assert before["accounts"][0]["balance"] == 100_000.0 - 6 * 111.0 - 1.0
+
+    vendor2 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor2, "SPY")
+    client2, _ = _client(workspace_path=store, vendor=vendor2)
+    paper = client2.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"][0]["symbol"] == "SPY"
+    assert paper["positions"][0]["qty"] == 6
+    assert paper["positions"][0]["avg_price"] == 111.0
+    assert paper["filled_order_history"][0]["id"] == fill_id
+    assert paper["filled_order_history"][0]["fill_price"] == 111.0
+    assert paper["filled_order_history"][0]["qty"] == 6
+    assert paper["accounts"][0]["balance"] == 99_333.0
+    assert paper["balance_history"][0]["balance"] == 99_333.0
+
+
+def test_burst_of_fills_emits_discrete_paper_ws_events(tmp_path: Path):
+    """Fills must not ride latest-wins bar_update; a burst must not drop events."""
+    client, vendor = _paper_client(tmp_path)
+    with client:
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            _place(client, instrument="SPY", side="buy", type="market", qty=2)
+            _place(client, instrument="SPY", side="buy", type="limit", qty=3, limit=108.0)
+
+            vendor.inject_tick(
+                "SPY", price=107.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5)
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+
+            events: list[dict] = []
+            deadline = time.time() + 2.0
+            while time.time() < deadline and len(events) < 4:
+                msg = ws.receive_json()
+                if msg.get("type") == "paper_update":
+                    events.append(msg)
+
+            reasons = [ev.get("reason") for ev in events]
+            assert reasons[:2] == ["order_placed", "order_placed"]
+            fill_events = [ev for ev in events if ev.get("reason") == "order_filled"]
+            assert len(fill_events) == 2
+            assert fill_events[0]["type"] == "paper_update"
+            assert "paper" in fill_events[0]
+            # Progressive: first fill leaves one working or a position; second is fully filled.
+            assert fill_events[-1]["paper"]["working_orders"] == []
+            assert len(fill_events[-1]["paper"]["filled_order_history"]) == 2
+            assert len(fill_events[-1]["paper"]["positions"]) == 1
+            # Discrete queue — both fill snapshots arrived, not coalesced into one.
+            assert len(fill_events[0]["paper"]["filled_order_history"]) == 1
+
+
+def test_times_in_snapshot_are_unix_not_civil_labels(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=1)
+    vendor.inject_tick("SPY", price=111.0, volume=1.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    fill = client.get("/v1/snapshot").json()["paper"]["filled_order_history"][0]
+    assert isinstance(fill["placed_ts"], int)
+    assert isinstance(fill["filled_ts"], int)
+    assert "EDT" not in str(fill)
+    assert "EST" not in str(fill)
+    assert "America/New_York" not in str(fill)

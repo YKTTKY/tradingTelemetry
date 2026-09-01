@@ -94,6 +94,12 @@ impl EngineEndpoint {
             .expect("paper orders cancel path joins base")
     }
 
+    pub fn paper_positions_close_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/positions/close")
+            .expect("paper positions close path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -608,23 +614,59 @@ pub struct PaperDefaults {
     pub leverage_multiple: f64,
 }
 
-/// Open holding row in the Position table (empty in ticket 01).
+/// Open holding row in the Position table (distinct from the watchlist).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 pub struct PaperPositionRow {
     #[serde(default)]
     pub symbol: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default)]
+    pub qty: f64,
+    #[serde(default)]
+    pub avg_price: f64,
+    #[serde(default)]
+    pub unrealized_pnl: f64,
 }
 
-/// Append-only filled order history row (empty in ticket 01).
+/// Append-only filled order history row (one entry or exit leg).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 pub struct FilledOrderRow {
     #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
     pub symbol: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(rename = "type", default)]
+    pub order_type: String,
+    #[serde(default)]
+    pub qty: f64,
+    #[serde(default)]
+    pub limit: Option<f64>,
+    #[serde(default)]
+    pub stop: Option<f64>,
+    #[serde(default)]
+    pub fill_price: f64,
+    #[serde(default)]
+    pub commission: f64,
+    #[serde(default)]
+    pub placed_ts: i64,
+    #[serde(default)]
+    pub filled_ts: i64,
+    #[serde(default)]
+    pub duration_s: i64,
+    #[serde(default)]
+    pub margin: Option<f64>,
 }
 
-/// Cash/equity history row for the active paper account (empty in ticket 01).
+/// Cash/equity history row for the active paper account.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 pub struct BalanceHistoryRow {
+    #[serde(default)]
+    pub ts: i64,
     #[serde(default)]
     pub balance: f64,
 }
@@ -754,6 +796,11 @@ pub struct PaperOrderModifyRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PaperOrderCancelRequest {
     pub order_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperPositionCloseRequest {
+    pub instrument: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1201,6 +1248,19 @@ pub async fn post_paper_cancel(
     .await
 }
 
+pub async fn post_paper_close(
+    endpoint: &EngineEndpoint,
+    instrument: &str,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_positions_close_url(),
+        &PaperPositionCloseRequest {
+            instrument: instrument.to_string(),
+        },
+    )
+    .await
+}
+
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
 pub async fn run_ipc_loop(endpoint: EngineEndpoint, tx: mpsc::UnboundedSender<IpcEvent>) {
     loop {
@@ -1478,6 +1538,68 @@ mod tests {
         )
         .unwrap();
         assert!(omitted_orders.paper.working_orders.is_empty());
+    }
+
+    #[test]
+    fn snapshot_deserializes_positions_fills_and_balance_additively() {
+        let body: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [{"id":"pa_1","name":"Paper","currency":"USD","balance":98889.0}],
+                    "positions": [{
+                        "symbol": "SPY",
+                        "side": "long",
+                        "qty": 10,
+                        "avg_price": 111.0,
+                        "unrealized_pnl": 5.0
+                    }],
+                    "filled_order_history": [{
+                        "id": "fo_1",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "type": "market",
+                        "qty": 10,
+                        "fill_price": 111.0,
+                        "commission": 1.0,
+                        "placed_ts": 1719792000,
+                        "filled_ts": 1719792065,
+                        "duration_s": 65
+                    }],
+                    "balance_history": [{"ts": 1719792065, "balance": 98889.0}]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(body.paper.positions.len(), 1);
+        let pos = &body.paper.positions[0];
+        assert_eq!(pos.symbol, "SPY");
+        assert_eq!(pos.side, "long");
+        assert_eq!(pos.qty, 10.0);
+        assert_eq!(pos.avg_price, 111.0);
+        assert_eq!(pos.unrealized_pnl, 5.0);
+        let fill = &body.paper.filled_order_history[0];
+        assert_eq!(fill.symbol, "SPY");
+        assert_eq!(fill.order_type, "market");
+        assert_eq!(fill.fill_price, 111.0);
+        assert_eq!(fill.commission, 1.0);
+        assert_eq!(fill.placed_ts, 1_719_792_000);
+        assert_eq!(fill.filled_ts, 1_719_792_065);
+        assert_eq!(fill.duration_s, 65);
+        assert_eq!(body.paper.balance_history[0].balance, 98_889.0);
+        assert_eq!(body.paper.balance_history[0].ts, 1_719_792_065);
+
+        let omitted: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {"active_account_id": "pa_1", "accounts": []}
+            }"#,
+        )
+        .unwrap();
+        assert!(omitted.paper.positions.is_empty());
+        assert!(omitted.paper.filled_order_history.is_empty());
+        assert!(omitted.paper.balance_history.is_empty());
     }
 
     #[test]
