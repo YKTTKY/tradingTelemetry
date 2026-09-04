@@ -18,16 +18,16 @@ use app::{
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ipc::{
-    post_chart_interest, post_indicators, post_paper_attach_bracket, post_paper_cancel,
-    post_paper_close, post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
-    post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
-    run_ipc_loop, EngineEndpoint, IpcEvent,
+    EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_attach_bracket,
+    post_paper_cancel, post_paper_close, post_paper_modify, post_paper_place,
+    post_paper_trade_mark_visibility, post_type_styles, post_watchlist_active, post_watchlist_add,
+    post_watchlist_remove, post_watchlist_rename, post_workspace_layout, run_ipc_loop,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 const DEFAULT_ENGINE: &str = "http://127.0.0.1:8765";
@@ -174,6 +174,9 @@ async fn run_loop(
                         take_profit,
                         stop_loss,
                     } => post_paper_attach_bracket(&ep, &instrument, take_profit, stop_loss).await,
+                    PendingPaperOp::SetTradeMarkVisibility { fill_id, visible } => {
+                        post_paper_trade_mark_visibility(&ep, None, Some(&fill_id), visible).await
+                    }
                 };
                 match result {
                     Ok(paper) => {
@@ -315,6 +318,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(']') => app.paper_nudge_take_profit(1),
             KeyCode::Char(';') => app.paper_nudge_stop_loss(-1),
             KeyCode::Char('\'') => app.paper_nudge_stop_loss(1),
+            KeyCode::Char('j') | KeyCode::Char('J') => app.paper_select_fill_delta(1),
+            KeyCode::Char('k') | KeyCode::Char('K') => app.paper_select_fill_delta(-1),
+            KeyCode::Char('v') | KeyCode::Char('V') => app.paper_toggle_trade_mark_visibility(),
             KeyCode::Char('q') => app.quit(),
             _ => {}
         },

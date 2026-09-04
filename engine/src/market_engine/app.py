@@ -124,6 +124,14 @@ class PaperPositionBracketBody(BaseModel):
     stop_loss: float
 
 
+class PaperTradeMarkVisibilityBody(BaseModel):
+    """Hide or show a trade mark pair without deleting filled history."""
+
+    pair_id: str | None = None
+    fill_id: str | None = None
+    visible: bool
+
+
 def _vendor_resolves_vix(vendor: MarketDataVendor) -> bool:
     try:
         result = vendor.fetch_history("VIX", "1D")
@@ -553,6 +561,20 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         sync_paper_interest()
         return publish_paper("bracket_attached")
+
+    @app.post("/v1/paper/trade-marks/visibility")
+    def set_paper_trade_mark_visibility(
+        body: PaperTradeMarkVisibilityBody,
+    ) -> dict[str, Any]:
+        try:
+            paper.set_trade_mark_visibility(
+                pair_id=body.pair_id,
+                fill_id=body.fill_id,
+                visible=body.visible,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return publish_paper("trade_mark_visibility")
 
     @app.websocket("/v1/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:

@@ -89,6 +89,7 @@ def test_snapshot_includes_paper_desk_without_dropping_existing_keys(tmp_path: P
     assert paper["filled_order_history"] == []
     assert paper["balance_history"] == []
     assert paper["working_orders"] == []
+    assert paper["trade_marks"] == []
 
 
 def test_create_and_select_active_paper_account_via_ipc(tmp_path: Path):
@@ -1333,3 +1334,200 @@ def test_bracket_children_qty_tracks_full_position_qty(tmp_path: Path):
     assert paper["positions"] == []
     assert paper["filled_order_history"][-1]["qty"] == 15
     assert paper["filled_order_history"][-1]["type"] == "limit"
+
+
+def _marks_by_kind(marks: list[dict]) -> dict[str, dict]:
+    return {m["kind"]: m for m in marks}
+
+
+def test_entry_fill_emits_trade_mark_at_fill_price_and_time(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert len(paper["positions"]) == 1
+    fill = paper["filled_order_history"][0]
+    assert fill["fill_price"] == 111.25
+    assert len(paper["trade_marks"]) == 1
+    mark = paper["trade_marks"][0]
+    assert mark["kind"] == "entry"
+    assert mark["instrument"] == "SPY"
+    assert mark["price"] == fill["fill_price"]
+    assert mark["filled_ts"] == fill["filled_ts"]
+    assert mark["fill_id"] == fill["id"]
+    assert mark["visible"] is True
+    assert mark["pair_id"]
+    assert fill["trade_mark_pair_id"] == mark["pair_id"]
+    assert fill["trade_mark_kind"] == "entry"
+
+
+def test_exit_fill_emits_matching_exit_mark_and_marks_persist_when_flat(
+    tmp_path: Path,
+):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+
+    closed = client.post("/v1/paper/positions/close", json={"instrument": "SPY"})
+    assert closed.status_code == 200, closed.text
+    paper = closed.json()
+    assert paper["positions"] == []
+    assert len(paper["filled_order_history"]) == 2
+    entry, exit_leg = paper["filled_order_history"]
+    assert exit_leg["type"] == "close"
+
+    marks = paper["trade_marks"]
+    assert len(marks) == 2
+    by_kind = _marks_by_kind(marks)
+    assert set(by_kind) == {"entry", "exit"}
+    assert by_kind["entry"]["pair_id"] == by_kind["exit"]["pair_id"]
+    assert by_kind["entry"]["price"] == entry["fill_price"]
+    assert by_kind["entry"]["filled_ts"] == entry["filled_ts"]
+    assert by_kind["exit"]["price"] == exit_leg["fill_price"]
+    assert by_kind["exit"]["filled_ts"] == exit_leg["filled_ts"]
+    assert by_kind["exit"]["kind"] == "exit"
+    assert all(m["visible"] is True for m in marks)
+
+
+def test_tp_and_sl_exit_fills_emit_trade_marks(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick("SPY", price=112.5, volume=20.0, ts=float(_SPY_1M_LAST_TS + 6))
+    time.sleep(_CONFLATE_S * 2.5)
+
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["positions"] == []
+    by_kind = _marks_by_kind(paper["trade_marks"])
+    assert by_kind["entry"]["price"] == 111.25
+    assert by_kind["exit"]["price"] == 112.0
+    assert by_kind["exit"]["kind"] == "exit"
+    assert by_kind["entry"]["pair_id"] == by_kind["exit"]["pair_id"]
+
+    client2, vendor2 = _paper_client(tmp_path / "sl")
+    _place(
+        client2,
+        instrument="SPY",
+        side="buy",
+        type="market",
+        qty=10,
+        take_profit=112.0,
+        stop_loss=108.0,
+    )
+    vendor2.inject_tick("SPY", price=111.25, volume=50.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor2.inject_tick("SPY", price=107.25, volume=20.0, ts=float(_SPY_1M_LAST_TS + 6))
+    time.sleep(_CONFLATE_S * 2.5)
+    sl_paper = client2.get("/v1/snapshot").json()["paper"]
+    sl_marks = _marks_by_kind(sl_paper["trade_marks"])
+    assert sl_marks["exit"]["price"] == 108.0
+    assert sl_paper["filled_order_history"][1]["type"] == "stop"
+
+
+def test_hide_show_trade_mark_pair_does_not_delete_filled_history(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _place(client, instrument="SPY", side="buy", type="market", qty=10)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    client.post("/v1/paper/positions/close", json={"instrument": "SPY"})
+    before = client.get("/v1/snapshot").json()["paper"]
+    fill_ids = [f["id"] for f in before["filled_order_history"]]
+    pair_id = before["trade_marks"][0]["pair_id"]
+    assert len(fill_ids) == 2
+
+    hidden = client.post(
+        "/v1/paper/trade-marks/visibility",
+        json={"pair_id": pair_id, "visible": False},
+    )
+    assert hidden.status_code == 200, hidden.text
+    paper = hidden.json()
+    assert [f["id"] for f in paper["filled_order_history"]] == fill_ids
+    assert all(m["visible"] is False for m in paper["trade_marks"])
+    assert {m["pair_id"] for m in paper["trade_marks"]} == {pair_id}
+
+    shown = client.post(
+        "/v1/paper/trade-marks/visibility",
+        json={"fill_id": fill_ids[1], "visible": True},
+    )
+    assert shown.status_code == 200, shown.text
+    paper = shown.json()
+    assert [f["id"] for f in paper["filled_order_history"]] == fill_ids
+    assert all(m["visible"] is True for m in paper["trade_marks"])
+
+
+def test_trade_mark_visibility_persists_sqlite_and_discrete_paper_ws(tmp_path: Path):
+    store = tmp_path / "workspace.json"
+    vendor1 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor1, "SPY")
+    client1, _ = _client(workspace_path=store, vendor=vendor1)
+    _place(client1, instrument="SPY", side="buy", type="market", qty=6)
+    vendor1.inject_tick("SPY", price=111.0, volume=5.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    before = client1.get("/v1/snapshot").json()["paper"]
+    pair_id = before["trade_marks"][0]["pair_id"]
+    fill_id = before["filled_order_history"][0]["id"]
+
+    with client1:
+        with client1.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            hidden = client1.post(
+                "/v1/paper/trade-marks/visibility",
+                json={"pair_id": pair_id, "visible": False},
+            )
+            assert hidden.status_code == 200, hidden.text
+            assert hidden.json()["filled_order_history"][0]["id"] == fill_id
+            assert all(m["visible"] is False for m in hidden.json()["trade_marks"])
+            time.sleep(_CONFLATE_S * 2.5)
+            ev = None
+            for _ in range(40):
+                msg = ws.receive_json()
+                if (
+                    msg.get("type") == "paper_update"
+                    and msg.get("reason") == "trade_mark_visibility"
+                ):
+                    ev = msg
+                    break
+            assert ev is not None
+            assert ev["type"] == "paper_update"
+            marks = ev["paper"]["trade_marks"]
+            assert marks and all(m["visible"] is False for m in marks)
+            assert [f["id"] for f in ev["paper"]["filled_order_history"]] == [fill_id]
+
+    vendor2 = FakeVendor(auto_ticks=False)
+    _seed_1m(vendor2, "SPY")
+    client2, _ = _client(workspace_path=store, vendor=vendor2)
+    paper = client2.get("/v1/snapshot").json()["paper"]
+    assert [f["id"] for f in paper["filled_order_history"]] == [fill_id]
+    assert paper["filled_order_history"][0]["fill_price"] == 111.0
+    assert paper["positions"][0]["qty"] == 6
+    assert len(paper["trade_marks"]) == 1
+    assert paper["trade_marks"][0]["pair_id"] == pair_id
+    assert paper["trade_marks"][0]["visible"] is False
+    assert paper["trade_marks"][0]["price"] == 111.0
+
+
+def test_trade_marks_are_tagged_per_instrument(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path, instruments=("SPY", "QQQ"))
+    _place(client, instrument="SPY", side="buy", type="market", qty=2)
+    _place(client, instrument="QQQ", side="buy", type="market", qty=3)
+    vendor.inject_tick("SPY", price=111.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    vendor.inject_tick("QQQ", price=201.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 1))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    by_inst = {m["instrument"]: m for m in paper["trade_marks"]}
+    assert set(by_inst) == {"SPY", "QQQ"}
+    assert by_inst["SPY"]["price"] == 111.0
+    assert by_inst["QQQ"]["price"] == 201.0
+    assert by_inst["SPY"]["pair_id"] != by_inst["QQQ"]["pair_id"]

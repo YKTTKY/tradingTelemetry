@@ -44,6 +44,13 @@ pub const WORKING_SELL_COLOR: Color = Color::Rgb(196, 96, 255);
 /// Full-strength working lines (not a user type-style this ship).
 pub const DEFAULT_WORKING_ORDER_STRENGTH: f64 = 1.0;
 
+/// Trade mark glyph (dot at fill price/time — not a working TP/SL line).
+pub const TRADE_MARK_GLYPH: &str = "●";
+/// Entry fill pin (distinct from gold/purple working lines).
+pub const TRADE_MARK_ENTRY_COLOR: Color = Color::Rgb(64, 224, 208);
+/// Exit fill pin (TP, SL, manual close, later liquidation).
+pub const TRADE_MARK_EXIT_COLOR: Color = Color::Rgb(255, 140, 64);
+
 /// Product default overlay strength for an indicator type (type style).
 pub fn default_strength_for_type(indicator_type: &str) -> f64 {
     match indicator_type {
@@ -209,6 +216,48 @@ pub fn working_order_overlay_level(side: &str, price: f64, x0: f64, x1: f64) -> 
         },
         type_key: WORKING_ORDER_TYPE_KEY.into(),
     }
+}
+
+/// One fill leg as a trade mark pin spec (engine visibility already applied).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TradeMarkPinSpec {
+    pub instrument: String,
+    pub kind: String,
+    pub fill_price: f64,
+    pub filled_ts: i64,
+    pub visible: bool,
+}
+
+/// Trade mark **pins** only on charts whose **instrument** matches.
+///
+/// Hidden pairs (`visible == false`) emit no pins. `ts_to_x` maps fill time
+/// onto the chart's bar columns (caller owns ChartView).
+pub fn trade_mark_pins_for_instrument(
+    marks: &[TradeMarkPinSpec],
+    instrument: &str,
+    ts_to_x: impl Fn(i64) -> Option<f64>,
+) -> Vec<OverlayPin> {
+    marks
+        .iter()
+        .filter(|m| m.visible)
+        .filter(|m| m.instrument.eq_ignore_ascii_case(instrument))
+        .filter_map(|m| {
+            if !m.fill_price.is_finite() || m.fill_price <= 0.0 {
+                return None;
+            }
+            let x = ts_to_x(m.filled_ts)?;
+            Some(OverlayPin {
+                x,
+                price: m.fill_price,
+                glyph: TRADE_MARK_GLYPH.into(),
+                color: if m.kind.eq_ignore_ascii_case("exit") {
+                    TRADE_MARK_EXIT_COLOR
+                } else {
+                    TRADE_MARK_ENTRY_COLOR
+                },
+            })
+        })
+        .collect()
 }
 
 /// Working **lines** only on charts whose **instrument** matches. Market skipped.
@@ -1006,5 +1055,102 @@ mod tests {
 
         assert_eq!(buf[(x, y)].symbol(), "─");
         assert_eq!(buf[(x, y)].style().fg, Some(WORKING_BUY_COLOR));
+    }
+
+    fn sample_trade_marks() -> Vec<TradeMarkPinSpec> {
+        vec![
+            TradeMarkPinSpec {
+                instrument: "SPY".into(),
+                kind: "entry".into(),
+                fill_price: 111.0,
+                filled_ts: 1_719_792_000,
+                visible: true,
+            },
+            TradeMarkPinSpec {
+                instrument: "SPY".into(),
+                kind: "exit".into(),
+                fill_price: 112.0,
+                filled_ts: 1_719_792_065,
+                visible: true,
+            },
+            TradeMarkPinSpec {
+                instrument: "QQQ".into(),
+                kind: "entry".into(),
+                fill_price: 201.0,
+                filled_ts: 1_719_792_030,
+                visible: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn trade_mark_pins_at_fill_price_and_time_only_on_matching_instrument() {
+        let ts_to_x = |ts: i64| Some(ts as f64);
+        let spy = trade_mark_pins_for_instrument(&sample_trade_marks(), "SPY", ts_to_x);
+        assert_eq!(spy.len(), 2);
+        assert_eq!(spy[0].price, 111.0);
+        assert_eq!(spy[0].x, 1_719_792_000.0);
+        assert_eq!(spy[0].glyph, TRADE_MARK_GLYPH);
+        assert_eq!(spy[0].color, TRADE_MARK_ENTRY_COLOR);
+        assert_eq!(spy[1].price, 112.0);
+        assert_eq!(spy[1].x, 1_719_792_065.0);
+        assert_eq!(spy[1].glyph, TRADE_MARK_GLYPH);
+        assert_eq!(spy[1].color, TRADE_MARK_EXIT_COLOR);
+        let qqq = trade_mark_pins_for_instrument(&sample_trade_marks(), "QQQ", ts_to_x);
+        assert_eq!(qqq.len(), 1);
+        assert_eq!(qqq[0].price, 201.0);
+        assert!(trade_mark_pins_for_instrument(&sample_trade_marks(), "IWM", ts_to_x).is_empty());
+    }
+
+    #[test]
+    fn hidden_trade_mark_pair_emits_no_pins() {
+        let marks = vec![
+            TradeMarkPinSpec {
+                instrument: "SPY".into(),
+                kind: "entry".into(),
+                fill_price: 111.0,
+                filled_ts: 100,
+                visible: false,
+            },
+            TradeMarkPinSpec {
+                instrument: "SPY".into(),
+                kind: "exit".into(),
+                fill_price: 112.0,
+                filled_ts: 200,
+                visible: false,
+            },
+        ];
+        assert!(trade_mark_pins_for_instrument(&marks, "SPY", |ts| Some(ts as f64)).is_empty());
+    }
+
+    #[test]
+    fn trade_mark_pins_paint_last_over_working_lines() {
+        let view = sample_view();
+        let area = view.candle_area();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 50, 25));
+        let y = view.price_to_row(150.0).unwrap();
+        let x = area.x + 15;
+        buf[(x, y)].set_symbol(" ");
+
+        let mut layers = OverlayLayers::default();
+        layers
+            .working
+            .push(working_order_overlay_level("buy", 150.0, 15.0, 16.0));
+        layers.pins.push(OverlayPin {
+            x: 15.5,
+            price: 150.0,
+            glyph: TRADE_MARK_GLYPH.into(),
+            color: TRADE_MARK_ENTRY_COLOR,
+        });
+        let strengths = HashMap::new();
+        paint_overlays(&mut buf, &view, &layers, &strengths);
+
+        assert_eq!(buf[(x, y)].symbol(), TRADE_MARK_GLYPH);
+        assert_eq!(buf[(x, y)].style().fg, Some(TRADE_MARK_ENTRY_COLOR));
+        assert_ne!(
+            buf[(x, y)].symbol(),
+            "─",
+            "trade marks must not look like live TP/SL lines"
+        );
     }
 }

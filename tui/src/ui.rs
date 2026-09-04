@@ -3,23 +3,23 @@
 use chrono::{Offset, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap},
-    Frame,
 };
 use tui_candlestick_chart::{Candle, CandleStickChart, CandleStickChartState, ChartView};
 
 use crate::app::{
-    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, IndicatorListSide, InputMode,
-    LayoutMode, Screen, AVAILABLE_INDICATOR_TYPES, UNAVAILABLE_COPY,
+    AVAILABLE_INDICATOR_TYPES, App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase,
+    IndicatorListSide, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
 };
 use crate::feed_clock::{format_elapsed, format_feed_clocks, format_ny_timestamp};
 use crate::ipc::{BalanceHistoryRow, FilledOrderRow, OhlcvBar, PaperPositionRow, QuoteRow};
 use crate::overlay::{
-    paint_overlays, volume_bar_color, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
-    OverlayPin, MAX_VP_HIST_PANE_FRACTION,
+    MAX_VP_HIST_PANE_FRACTION, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
+    OverlayPin, paint_overlays, volume_bar_color,
 };
 use crate::timeframe::product_timeframe_to_interval;
 
@@ -209,6 +209,11 @@ fn draw_help_popup(frame: &mut Frame) {
         row("a", "Attach TP/SL on the open position"),
         row("x", "Cancel selected working order"),
         row("f", "Flatten focused-chart position"),
+        row("j / k", "Select a filled order history row"),
+        row(
+            "v",
+            "Hide/show trade mark pair for the selected fill (does not delete fills)",
+        ),
         section("Text prompts (modal; own keys)"),
         row("Enter", "Apply instrument, watchlist add, or rename"),
         row("Esc", "Cancel prompt"),
@@ -445,17 +450,7 @@ fn draw_paper_panel(frame: &mut Frame, area: Rect, app: &App) {
             .map(format_position_row)
             .collect(),
     );
-    draw_paper_table(
-        frame,
-        cols[3],
-        " Filled order history ",
-        "symbol  side  type  qty  limit  stop  fill  c  place  fill/close  dur",
-        app.paper
-            .filled_order_history
-            .iter()
-            .map(format_filled_order_row)
-            .collect(),
-    );
+    draw_filled_history_table(frame, cols[3], app);
     draw_paper_table(
         frame,
         cols[4],
@@ -498,7 +493,11 @@ fn opt_form_price(value: f64) -> String {
 }
 
 pub(crate) fn format_filled_order_row(row: &FilledOrderRow) -> String {
-    format!(
+    format_filled_order_row_vis(row, None)
+}
+
+fn format_filled_order_row_vis(row: &FilledOrderRow, visible: Option<bool>) -> String {
+    let mut line = format!(
         "{}  {}  {}  {:.0}  {}  {}  {:.2}  c{:.2}  {}  {}  {}",
         row.symbol,
         row.side,
@@ -511,7 +510,13 @@ pub(crate) fn format_filled_order_row(row: &FilledOrderRow) -> String {
         format_ny_timestamp(row.placed_ts),
         format_ny_timestamp(row.filled_ts),
         format_elapsed(row.duration_s),
-    )
+    );
+    match visible {
+        Some(true) => line.push_str("  shown"),
+        Some(false) => line.push_str("  hidden"),
+        None => {}
+    }
+    line
 }
 
 pub(crate) fn format_balance_row(row: &BalanceHistoryRow) -> String {
@@ -662,6 +667,57 @@ fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(" Paper account "),
+    );
+    frame.render_widget(body, area);
+}
+
+fn fill_trade_mark_visible(app: &App, row: &FilledOrderRow) -> Option<bool> {
+    if row.id.is_empty() && row.trade_mark_pair_id.is_empty() {
+        return None;
+    }
+    app.paper
+        .trade_marks
+        .iter()
+        .find(|m| {
+            (!row.trade_mark_pair_id.is_empty() && m.pair_id == row.trade_mark_pair_id)
+                || m.fill_id == row.id
+        })
+        .map(|m| m.visible)
+}
+
+fn draw_filled_history_table(frame: &mut Frame, area: Rect, app: &App) {
+    let header =
+        "symbol  side  type  qty  limit  stop  fill  c  place  fill/close  dur  trade mark";
+    let mut lines = vec![Line::from(Span::styled(
+        header.to_string(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    if app.paper.filled_order_history.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for row in &app.paper.filled_order_history {
+            let vis = fill_trade_mark_visible(app, row);
+            let text = format_filled_order_row_vis(row, vis);
+            let selected = app.selected_fill_id.as_deref() == Some(row.id.as_str());
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Filled order history "),
     );
     frame.render_widget(body, area);
 }
@@ -1545,6 +1601,9 @@ fn draw_candles(
         0.0,
         (n_cols - 1.0).max(0.0),
     ));
+    layers
+        .pins
+        .extend(app.trade_mark_overlay_pins(&chart.instrument, |ts| view_ts_to_x(&view, ts)));
 
     // Cell-based compose on the same buffer as candles (no Braille Canvas world).
     // Paint order inside paint_overlays: hist → levels → MA → working lines → pins.

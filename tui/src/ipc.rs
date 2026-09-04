@@ -106,6 +106,12 @@ impl EngineEndpoint {
             .expect("paper positions bracket path joins base")
     }
 
+    pub fn paper_trade_mark_visibility_url(&self) -> Url {
+        self.base
+            .join("/v1/paper/trade-marks/visibility")
+            .expect("paper trade mark visibility path joins base")
+    }
+
     pub fn ws_url(&self) -> Url {
         let mut ws = self.base.clone();
         let scheme = match ws.scheme() {
@@ -670,6 +676,31 @@ pub struct FilledOrderRow {
     pub duration_s: i64,
     #[serde(default)]
     pub margin: Option<f64>,
+    #[serde(default)]
+    pub trade_mark_pair_id: String,
+    #[serde(default)]
+    pub trade_mark_kind: String,
+}
+
+/// One fill-leg pin on the price pane (engine visibility flags).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+pub struct TradeMarkPin {
+    #[serde(default)]
+    pub pair_id: String,
+    #[serde(default)]
+    pub fill_id: String,
+    #[serde(default)]
+    pub instrument: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub filled_ts: i64,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default = "default_true")]
+    pub visible: bool,
 }
 
 /// Cash/equity history row for the active paper account.
@@ -725,6 +756,8 @@ pub struct PaperSnapshot {
     pub filled_order_history: Vec<FilledOrderRow>,
     #[serde(default)]
     pub balance_history: Vec<BalanceHistoryRow>,
+    #[serde(default)]
+    pub trade_marks: Vec<TradeMarkPin>,
 }
 
 impl PaperSnapshot {
@@ -826,6 +859,15 @@ pub struct PaperPositionBracketRequest {
     pub instrument: String,
     pub take_profit: f64,
     pub stop_loss: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PaperTradeMarkVisibilityRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_id: Option<String>,
+    pub visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1307,6 +1349,23 @@ pub async fn post_paper_attach_bracket(
     .await
 }
 
+pub async fn post_paper_trade_mark_visibility(
+    endpoint: &EngineEndpoint,
+    pair_id: Option<&str>,
+    fill_id: Option<&str>,
+    visible: bool,
+) -> Result<PaperSnapshot, IpcError> {
+    post_paper_json(
+        endpoint.paper_trade_mark_visibility_url(),
+        &PaperTradeMarkVisibilityRequest {
+            pair_id: pair_id.map(str::to_string),
+            fill_id: fill_id.map(str::to_string),
+            visible,
+        },
+    )
+    .await
+}
+
 /// Background IPC: snapshot + WS with reconnect so the TUI recovers when the engine returns.
 pub async fn run_ipc_loop(endpoint: EngineEndpoint, tx: mpsc::UnboundedSender<IpcEvent>) {
     loop {
@@ -1646,8 +1705,67 @@ mod tests {
         assert!(omitted.paper.positions.is_empty());
         assert!(omitted.paper.filled_order_history.is_empty());
         assert!(omitted.paper.balance_history.is_empty());
+        assert!(omitted.paper.trade_marks.is_empty());
         assert_eq!(pos.take_profit, None);
         assert_eq!(pos.stop_loss, None);
+    }
+
+    #[test]
+    fn snapshot_deserializes_trade_marks_additively() {
+        let body: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {
+                    "active_account_id": "pa_1",
+                    "accounts": [{"id":"pa_1","name":"Paper","currency":"USD","balance":98889.0}],
+                    "filled_order_history": [{
+                        "id": "fo_1",
+                        "symbol": "SPY",
+                        "side": "buy",
+                        "type": "market",
+                        "qty": 10,
+                        "fill_price": 111.0,
+                        "filled_ts": 1719792065,
+                        "trade_mark_pair_id": "tm_1",
+                        "trade_mark_kind": "entry"
+                    }],
+                    "trade_marks": [{
+                        "pair_id": "tm_1",
+                        "fill_id": "fo_1",
+                        "instrument": "SPY",
+                        "kind": "entry",
+                        "price": 111.0,
+                        "filled_ts": 1719792065,
+                        "side": "buy",
+                        "visible": true
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(body.paper.trade_marks.len(), 1);
+        let mark = &body.paper.trade_marks[0];
+        assert_eq!(mark.pair_id, "tm_1");
+        assert_eq!(mark.fill_id, "fo_1");
+        assert_eq!(mark.instrument, "SPY");
+        assert_eq!(mark.kind, "entry");
+        assert_eq!(mark.price, 111.0);
+        assert_eq!(mark.filled_ts, 1_719_792_065);
+        assert!(mark.visible);
+        assert_eq!(
+            body.paper.filled_order_history[0].trade_mark_pair_id,
+            "tm_1"
+        );
+        assert_eq!(body.paper.filled_order_history[0].trade_mark_kind, "entry");
+
+        let omitted: SnapshotBody = serde_json::from_str(
+            r#"{
+                "feed": {"status":"connected","vendor_mode":"fake","engine":"up"},
+                "paper": {"active_account_id": "pa_1", "accounts": []}
+            }"#,
+        )
+        .unwrap();
+        assert!(omitted.paper.trade_marks.is_empty());
     }
 
     #[test]
@@ -1701,9 +1819,15 @@ mod tests {
         assert_eq!(body.paper.positions[0].stop_loss, Some(108.0));
         assert_eq!(body.paper.working_orders.len(), 2);
         assert_eq!(body.paper.working_orders[0].role, "tp");
-        assert_eq!(body.paper.working_orders[0].bracket_id.as_deref(), Some("br_1"));
+        assert_eq!(
+            body.paper.working_orders[0].bracket_id.as_deref(),
+            Some("br_1")
+        );
         assert_eq!(body.paper.working_orders[1].role, "sl");
-        assert_eq!(body.paper.working_orders[1].bracket_id.as_deref(), Some("br_1"));
+        assert_eq!(
+            body.paper.working_orders[1].bracket_id.as_deref(),
+            Some("br_1")
+        );
 
         let omitted: SnapshotBody = serde_json::from_str(
             r#"{

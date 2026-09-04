@@ -9,8 +9,9 @@ use crate::ipc::{
     WatchlistSnapshot, WorkingOrderSnapshot, WorkspaceSnapshot,
 };
 use crate::overlay::{
-    clamp_strength, default_strength_for_type, working_levels_for_instrument, working_line_price,
-    OverlayLevel, WorkingOrderLineSpec,
+    OverlayLevel, OverlayPin, TradeMarkPinSpec, WorkingOrderLineSpec, clamp_strength,
+    default_strength_for_type, trade_mark_pins_for_instrument, working_levels_for_instrument,
+    working_line_price,
 };
 use crate::timeframe::{format_bar_countdown, forming_bar_remaining_secs};
 
@@ -310,6 +311,10 @@ pub enum PendingPaperOp {
         take_profit: f64,
         stop_loss: f64,
     },
+    SetTradeMarkVisibility {
+        fill_id: String,
+        visible: bool,
+    },
 }
 
 /// Buy or sell on the order side panel.
@@ -406,11 +411,7 @@ fn nudge_price_from(current: f64, steps: i32, last: Option<f64>) -> f64 {
         last.filter(|v| *v > 0.0).unwrap_or(0.0)
     };
     let next = base + f64::from(steps) * ORDER_PRICE_STEP;
-    if next <= 0.0 {
-        0.0
-    } else {
-        next
-    }
+    if next <= 0.0 { 0.0 } else { next }
 }
 
 pub const MAX_MA_LINES: usize = 3;
@@ -718,6 +719,8 @@ pub struct App {
     pub pending_paper: Option<PendingPaperOp>,
     /// Last engine rejection from place/modify/cancel (shown on the order side panel).
     pub last_paper_error: Option<String>,
+    /// Selected filled order history row (hide/show trade mark pair).
+    pub selected_fill_id: Option<String>,
     pub should_quit: bool,
 }
 
@@ -758,6 +761,7 @@ impl Default for App {
             working_line_draft: None,
             pending_paper: None,
             last_paper_error: None,
+            selected_fill_id: None,
             should_quit: false,
         }
     }
@@ -1203,6 +1207,7 @@ impl App {
                 self.order_side = OrderSidePanel::default();
                 self.working_line_draft = None;
                 self.seed_order_side_prices();
+                self.seed_selected_fill();
             }
             InputMode::PaperPanel => {
                 self.working_line_draft = None;
@@ -1246,6 +1251,7 @@ impl App {
         self.paper = paper;
         self.last_paper_error = None;
         self.prune_working_line_draft();
+        self.prune_selected_fill();
         if self.working_line_draft.is_none() {
             self.sync_order_side_selection();
         }
@@ -1303,6 +1309,110 @@ impl App {
             })
             .collect();
         working_levels_for_instrument(&specs, instrument, x0, x1)
+    }
+
+    /// Trade mark pins for one chart instrument. Hidden pairs emit nothing.
+    pub fn trade_mark_overlay_pins(
+        &self,
+        instrument: &str,
+        ts_to_x: impl Fn(i64) -> Option<f64>,
+    ) -> Vec<OverlayPin> {
+        let specs: Vec<TradeMarkPinSpec> = self
+            .paper
+            .trade_marks
+            .iter()
+            .map(|m| TradeMarkPinSpec {
+                instrument: m.instrument.clone(),
+                kind: m.kind.clone(),
+                fill_price: m.price,
+                filled_ts: m.filled_ts,
+                visible: m.visible,
+            })
+            .collect();
+        trade_mark_pins_for_instrument(&specs, instrument, ts_to_x)
+    }
+
+    fn prune_selected_fill(&mut self) {
+        let Some(id) = self.selected_fill_id.as_ref() else {
+            return;
+        };
+        let still = self.paper.filled_order_history.iter().any(|f| f.id == *id);
+        if !still {
+            self.selected_fill_id = None;
+        }
+    }
+
+    fn seed_selected_fill(&mut self) {
+        if self.selected_fill_id.is_some() {
+            self.prune_selected_fill();
+            if self.selected_fill_id.is_some() {
+                return;
+            }
+        }
+        self.selected_fill_id = self.paper.filled_order_history.last().map(|f| f.id.clone());
+    }
+
+    /// Cycle filled order history rows (for hide/show of a trade mark pair).
+    pub fn paper_select_fill_delta(&mut self, delta: i32) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if delta == 0 {
+            return;
+        }
+        let ids: Vec<String> = self
+            .paper
+            .filled_order_history
+            .iter()
+            .map(|f| f.id.clone())
+            .collect();
+        if ids.is_empty() {
+            self.selected_fill_id = None;
+            return;
+        }
+        let cur = self
+            .selected_fill_id
+            .as_ref()
+            .and_then(|id| ids.iter().position(|x| x == id))
+            .unwrap_or(ids.len() - 1) as i32;
+        let next = (cur + delta).rem_euclid(ids.len() as i32) as usize;
+        self.selected_fill_id = Some(ids[next].clone());
+    }
+
+    /// Hide/show the selected filled-history row's trade mark pair (engine flags).
+    pub fn paper_toggle_trade_mark_visibility(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        let Some(fill_id) = self.selected_fill_id.clone() else {
+            return;
+        };
+        let fill = self
+            .paper
+            .filled_order_history
+            .iter()
+            .find(|f| f.id == fill_id);
+        let Some(fill) = fill else {
+            return;
+        };
+        let pair_id = fill.trade_mark_pair_id.as_str();
+        let currently_visible = self
+            .paper
+            .trade_marks
+            .iter()
+            .find(|m| {
+                if !pair_id.is_empty() {
+                    m.pair_id == pair_id
+                } else {
+                    m.fill_id == fill_id
+                }
+            })
+            .map(|m| m.visible)
+            .unwrap_or(true);
+        self.pending_paper = Some(PendingPaperOp::SetTradeMarkVisibility {
+            fill_id,
+            visible: !currently_visible,
+        });
     }
 
     fn working_line_display_prices(
@@ -3232,7 +3342,8 @@ fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
 mod tests {
     use super::*;
     use crate::ipc::{
-        BalanceHistoryRow, FilledOrderRow, PaperDefaults, PaperPositionRow, WorkspaceChartSnapshot,
+        BalanceHistoryRow, FilledOrderRow, PaperDefaults, PaperPositionRow, TradeMarkPin,
+        WorkspaceChartSnapshot,
     };
     use crate::overlay::{DEFAULT_MA_STRENGTH, DEFAULT_VP_STRENGTH};
 
@@ -4787,11 +4898,12 @@ mod tests {
         app.frvp_place_confirm(); // start
         app.frvp_place_move(3);
         app.frvp_place_confirm(); // end
-        assert!(app
-            .focused_chart()
-            .indicators
-            .iter()
-            .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled));
+        assert!(
+            app.focused_chart()
+                .indicators
+                .iter()
+                .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
+        );
 
         // Stale interest: engine still only knows volume (POST not completed).
         app.apply_chart_series(ChartInterestResponse {
@@ -4983,11 +5095,12 @@ mod tests {
         app.indicator_list_side = IndicatorListSide::Available;
         app.indicator_available_selected = 2; // session_vp
         app.indicator_activate_selected();
-        assert!(app
-            .focused_chart()
-            .indicators
-            .iter()
-            .any(|i| i.indicator_type == "session_vp"));
+        assert!(
+            app.focused_chart()
+                .indicators
+                .iter()
+                .any(|i| i.indicator_type == "session_vp")
+        );
     }
 
     #[test]
@@ -5099,6 +5212,7 @@ mod tests {
             positions: vec![],
             filled_order_history: vec![],
             balance_history: vec![],
+            trade_marks: vec![],
         }
     }
 
@@ -5907,5 +6021,146 @@ mod tests {
         app.toggle_paper_panel();
         app.paper_escape();
         assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    fn sample_fill(
+        id: &str,
+        symbol: &str,
+        kind: &str,
+        price: f64,
+        filled_ts: i64,
+        pair_id: &str,
+        mark_kind: &str,
+    ) -> FilledOrderRow {
+        FilledOrderRow {
+            id: id.into(),
+            account_id: "pa_1".into(),
+            symbol: symbol.into(),
+            side: if mark_kind == "exit" {
+                "sell".into()
+            } else {
+                "buy".into()
+            },
+            order_type: kind.into(),
+            qty: 10.0,
+            fill_price: price,
+            commission: 1.0,
+            placed_ts: filled_ts - 5,
+            filled_ts,
+            duration_s: 5,
+            trade_mark_pair_id: pair_id.into(),
+            trade_mark_kind: mark_kind.into(),
+            ..FilledOrderRow::default()
+        }
+    }
+
+    fn sample_mark(
+        pair_id: &str,
+        fill_id: &str,
+        instrument: &str,
+        kind: &str,
+        price: f64,
+        filled_ts: i64,
+        visible: bool,
+    ) -> TradeMarkPin {
+        TradeMarkPin {
+            pair_id: pair_id.into(),
+            fill_id: fill_id.into(),
+            instrument: instrument.into(),
+            kind: kind.into(),
+            price,
+            filled_ts,
+            side: if kind == "exit" {
+                "sell".into()
+            } else {
+                "buy".into()
+            },
+            visible,
+        }
+    }
+
+    #[test]
+    fn trade_mark_pins_at_price_and_time_follow_engine_visibility() {
+        let mut app = App::default();
+        let mut desk = sample_paper_desk();
+        desk.filled_order_history = vec![
+            sample_fill(
+                "fo_e",
+                "SPY",
+                "market",
+                111.0,
+                1_719_792_000,
+                "tm_1",
+                "entry",
+            ),
+            sample_fill("fo_x", "SPY", "close", 112.0, 1_719_792_065, "tm_1", "exit"),
+            sample_fill(
+                "fo_q",
+                "QQQ",
+                "market",
+                201.0,
+                1_719_792_030,
+                "tm_2",
+                "entry",
+            ),
+        ];
+        desk.trade_marks = vec![
+            sample_mark("tm_1", "fo_e", "SPY", "entry", 111.0, 1_719_792_000, true),
+            sample_mark("tm_1", "fo_x", "SPY", "exit", 112.0, 1_719_792_065, true),
+            sample_mark("tm_2", "fo_q", "QQQ", "entry", 201.0, 1_719_792_030, true),
+        ];
+        app.apply_paper(desk.clone());
+
+        let ts_to_x = |ts: i64| Some(ts as f64);
+        let spy = app.trade_mark_overlay_pins("SPY", ts_to_x);
+        assert_eq!(spy.len(), 2);
+        assert_eq!(spy[0].price, 111.0);
+        assert_eq!(spy[0].x, 1_719_792_000.0);
+        assert_eq!(spy[1].price, 112.0);
+        assert_eq!(spy[1].x, 1_719_792_065.0);
+        let qqq = app.trade_mark_overlay_pins("QQQ", ts_to_x);
+        assert_eq!(qqq.len(), 1);
+        assert_eq!(qqq[0].price, 201.0);
+        assert!(app.trade_mark_overlay_pins("IWM", ts_to_x).is_empty());
+
+        desk.trade_marks
+            .iter_mut()
+            .filter(|m| m.pair_id == "tm_1")
+            .for_each(|m| m.visible = false);
+        app.apply_paper(desk);
+        assert_eq!(app.paper.filled_order_history.len(), 3);
+        assert_eq!(app.paper.filled_order_history[0].id, "fo_e");
+        assert_eq!(app.paper.filled_order_history[1].id, "fo_x");
+        assert!(app.trade_mark_overlay_pins("SPY", ts_to_x).is_empty());
+        assert_eq!(app.trade_mark_overlay_pins("QQQ", ts_to_x).len(), 1);
+    }
+
+    #[test]
+    fn hide_trade_mark_pair_from_filled_history_emits_visibility_op() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.filled_order_history = vec![
+            sample_fill("fo_e", "SPY", "market", 111.0, 100, "tm_1", "entry"),
+            sample_fill("fo_x", "SPY", "close", 112.0, 200, "tm_1", "exit"),
+        ];
+        desk.trade_marks = vec![
+            sample_mark("tm_1", "fo_e", "SPY", "entry", 111.0, 100, true),
+            sample_mark("tm_1", "fo_x", "SPY", "exit", 112.0, 200, true),
+        ];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        assert_eq!(app.selected_fill_id.as_deref(), Some("fo_x"));
+        app.paper_select_fill_delta(-1);
+        assert_eq!(app.selected_fill_id.as_deref(), Some("fo_e"));
+        app.paper_toggle_trade_mark_visibility();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::SetTradeMarkVisibility {
+                fill_id: "fo_e".into(),
+                visible: false,
+            })
+        );
+        assert_eq!(app.paper.filled_order_history.len(), 2);
     }
 }

@@ -80,13 +80,21 @@ CREATE TABLE IF NOT EXISTS paper_filled_orders (
     placed_ts INTEGER NOT NULL,
     filled_ts INTEGER NOT NULL,
     duration_s INTEGER NOT NULL,
-    margin REAL
+    margin REAL,
+    trade_mark_pair_id TEXT,
+    trade_mark_kind TEXT
 );
 CREATE TABLE IF NOT EXISTS paper_balance_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id TEXT NOT NULL,
     ts INTEGER NOT NULL,
     balance REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS paper_trade_mark_pairs (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    visible INTEGER NOT NULL
 );
 """
 
@@ -96,6 +104,8 @@ ROLE_ENTRY = "entry"
 ROLE_TP = "tp"
 ROLE_SL = "sl"
 CHILD_ROLES = frozenset({ROLE_TP, ROLE_SL})
+TRADE_MARK_ENTRY = "entry"
+TRADE_MARK_EXIT = "exit"
 
 
 @dataclass
@@ -141,6 +151,10 @@ def _new_bracket_id() -> str:
 
 def _new_filled_order_id() -> str:
     return "fo_" + uuid.uuid4().hex[:12]
+
+
+def _new_trade_mark_pair_id() -> str:
+    return "tm_" + uuid.uuid4().hex[:12]
 
 
 @dataclass
@@ -230,6 +244,8 @@ class FilledOrder:
     filled_ts: int
     duration_s: int
     margin: float | None = None
+    trade_mark_pair_id: str | None = None
+    trade_mark_kind: str = TRADE_MARK_ENTRY
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -247,7 +263,19 @@ class FilledOrder:
             "filled_ts": self.filled_ts,
             "duration_s": self.duration_s,
             "margin": self.margin,
+            "trade_mark_pair_id": self.trade_mark_pair_id,
+            "trade_mark_kind": self.trade_mark_kind,
         }
+
+
+@dataclass
+class TradeMarkPair:
+    """Hideable entry+exit trade mark pair (does not own filled-history rows)."""
+
+    id: str
+    account_id: str
+    instrument: str
+    visible: bool = True
 
 
 @dataclass
@@ -273,6 +301,8 @@ class PaperBook:
         self.positions: dict[tuple[str, str], Position] = {}
         self.filled_orders: list[FilledOrder] = []
         self.balance_history: list[BalanceRecord] = []
+        self.trade_mark_pairs: dict[str, TradeMarkPair] = {}
+        self._open_trade_pairs: dict[tuple[str, str], str] = {}
         self._load_or_seed()
 
     def to_public(self, last_prices: dict[str, float] | None = None) -> dict[str, Any]:
@@ -308,6 +338,7 @@ class PaperBook:
             "positions": positions,
             "filled_order_history": filled,
             "balance_history": balances,
+            "trade_marks": self._trade_marks_public(aid),
         }
 
     def instruments_needing_1m(self) -> list[str]:
@@ -638,6 +669,31 @@ class PaperBook:
         self._save()
         return filled
 
+    def set_trade_mark_visibility(
+        self,
+        *,
+        pair_id: str | None = None,
+        fill_id: str | None = None,
+        visible: bool,
+    ) -> TradeMarkPair:
+        """Hide or show a trade mark pair without deleting filled history."""
+        account = self._require_active()
+        pid = (pair_id or "").strip()
+        fid = (fill_id or "").strip()
+        if not pid and fid:
+            fill = next((f for f in self.filled_orders if f.id == fid), None)
+            if fill is None or fill.account_id != account.id:
+                raise ValueError(f"unknown filled order id: {fid}")
+            pid = fill.trade_mark_pair_id or ""
+        if not pid:
+            raise ValueError("pair_id or fill_id is required")
+        pair = self.trade_mark_pairs.get(pid)
+        if pair is None or pair.account_id != account.id:
+            raise ValueError(f"unknown trade mark pair id: {pid}")
+        pair.visible = bool(visible)
+        self._save()
+        return pair
+
     def _fill_working_order(
         self, order: WorkingOrder, fill_price: float, filled_ts: int
     ) -> FilledOrder:
@@ -681,8 +737,10 @@ class PaperBook:
             account.balance -= qty * fill_price + commission
         else:
             account.balance += qty * fill_price - commission
+        kind, pair_id = self._assign_trade_mark(account.id, instrument, side)
         signed = qty if side == "buy" else -qty
         self._apply_position(account.id, instrument, signed, fill_price)
+        self._sync_open_trade_pair(account.id, instrument)
         duration = max(0, int(filled_ts) - int(placed_ts))
         filled = FilledOrder(
             id=_new_filled_order_id(),
@@ -699,6 +757,8 @@ class PaperBook:
             filled_ts=int(filled_ts),
             duration_s=duration,
             margin=None,
+            trade_mark_pair_id=pair_id,
+            trade_mark_kind=kind,
         )
         self.filled_orders.append(filled)
         self.balance_history.append(
@@ -742,6 +802,146 @@ class PaperBook:
             qty=new_qty,
             avg_price=fill_price,
         )
+
+    def _trade_marks_public(self, account_id: str) -> list[dict[str, Any]]:
+        vis = {
+            p.id: p.visible
+            for p in self.trade_mark_pairs.values()
+            if p.account_id == account_id
+        }
+        marks: list[dict[str, Any]] = []
+        for filled in self.filled_orders:
+            if filled.account_id != account_id or not filled.trade_mark_pair_id:
+                continue
+            marks.append(
+                {
+                    "pair_id": filled.trade_mark_pair_id,
+                    "fill_id": filled.id,
+                    "instrument": filled.instrument,
+                    "kind": filled.trade_mark_kind,
+                    "price": filled.fill_price,
+                    "filled_ts": filled.filled_ts,
+                    "side": filled.side,
+                    "visible": vis.get(filled.trade_mark_pair_id, True),
+                }
+            )
+        return marks
+
+    def _new_trade_mark_pair(self, account_id: str, instrument: str) -> TradeMarkPair:
+        pair = TradeMarkPair(
+            id=_new_trade_mark_pair_id(),
+            account_id=account_id,
+            instrument=instrument,
+            visible=True,
+        )
+        self.trade_mark_pairs[pair.id] = pair
+        return pair
+
+    def _assign_trade_mark(
+        self, account_id: str, instrument: str, side: str
+    ) -> tuple[str, str]:
+        key = (account_id, instrument)
+        pos = self.positions.get(key)
+        signed = 1.0 if side == "buy" else -1.0
+        is_exit = (
+            pos is not None and abs(pos.qty) > 1e-12 and pos.qty * signed < 0
+        )
+        if is_exit:
+            pair_id = self._open_trade_pairs.get(key)
+            if pair_id is None:
+                pair_id = self._new_trade_mark_pair(account_id, instrument).id
+                self._open_trade_pairs[key] = pair_id
+            return TRADE_MARK_EXIT, pair_id
+        if pos is None or abs(pos.qty) < 1e-12:
+            pair_id = self._new_trade_mark_pair(account_id, instrument).id
+            self._open_trade_pairs[key] = pair_id
+            return TRADE_MARK_ENTRY, pair_id
+        pair_id = self._open_trade_pairs.get(key)
+        if pair_id is None:
+            pair_id = self._new_trade_mark_pair(account_id, instrument).id
+            self._open_trade_pairs[key] = pair_id
+        return TRADE_MARK_ENTRY, pair_id
+
+    def _sync_open_trade_pair(self, account_id: str, instrument: str) -> None:
+        key = (account_id, instrument)
+        pos = self.positions.get(key)
+        if pos is None or abs(pos.qty) < 1e-12:
+            self._open_trade_pairs.pop(key, None)
+
+    def _load_trade_mark_pairs(self) -> None:
+        if self.path is None:
+            return
+        with self._connect() as conn:
+            conn.executescript(_SCHEMA)
+            _migrate_trade_marks(conn)
+            rows = conn.execute(
+                "SELECT * FROM paper_trade_mark_pairs ORDER BY id"
+            ).fetchall()
+        for row in rows:
+            account_id = str(row["account_id"])
+            if account_id not in self.accounts:
+                continue
+            pair = TradeMarkPair(
+                id=str(row["id"]),
+                account_id=account_id,
+                instrument=str(row["instrument"]),
+                visible=bool(row["visible"]),
+            )
+            self.trade_mark_pairs[pair.id] = pair
+
+    def _reconstruct_trade_marks(self) -> None:
+        """Pair fills that predate the trade-mark columns (FIFO per instrument)."""
+        running: dict[tuple[str, str], float] = {}
+        open_pair: dict[tuple[str, str], str] = {}
+        dirty = False
+        for fill in self.filled_orders:
+            key = (fill.account_id, fill.instrument)
+            signed = fill.qty if fill.side == "buy" else -fill.qty
+            prev = running.get(key, 0.0)
+            is_exit = abs(prev) > 1e-12 and prev * signed < 0
+            kind = TRADE_MARK_EXIT if is_exit else TRADE_MARK_ENTRY
+            if fill.trade_mark_pair_id:
+                pair_id = fill.trade_mark_pair_id
+                if pair_id not in self.trade_mark_pairs:
+                    self.trade_mark_pairs[pair_id] = TradeMarkPair(
+                        id=pair_id,
+                        account_id=fill.account_id,
+                        instrument=fill.instrument,
+                        visible=True,
+                    )
+                    dirty = True
+                if not fill.trade_mark_kind:
+                    fill.trade_mark_kind = kind
+                    dirty = True
+            else:
+                if is_exit:
+                    pair_id = open_pair.get(key)
+                    if pair_id is None:
+                        pair_id = self._new_trade_mark_pair(
+                            fill.account_id, fill.instrument
+                        ).id
+                elif abs(prev) < 1e-12 or key not in open_pair:
+                    pair_id = self._new_trade_mark_pair(
+                        fill.account_id, fill.instrument
+                    ).id
+                else:
+                    pair_id = open_pair[key]
+                fill.trade_mark_pair_id = pair_id
+                fill.trade_mark_kind = kind
+                dirty = True
+            new_qty = prev + signed
+            running[key] = 0.0 if abs(new_qty) < 1e-12 else new_qty
+            if abs(running[key]) < 1e-12:
+                open_pair.pop(key, None)
+            else:
+                open_pair[key] = fill.trade_mark_pair_id or ""
+        self._open_trade_pairs = {
+            k: pid
+            for k, pid in open_pair.items()
+            if k in self.positions and abs(self.positions[k].qty) > 1e-12
+        }
+        if dirty:
+            self._save()
 
     def _require_active(self) -> PaperAccount:
         account = self.accounts.get(self.active_account_id)
@@ -949,6 +1149,7 @@ class PaperBook:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             _migrate_working_orders(conn)
+            _migrate_trade_marks(conn)
             rows = conn.execute(
                 "SELECT * FROM paper_accounts ORDER BY created_ts, id"
             ).fetchall()
@@ -983,6 +1184,8 @@ class PaperBook:
         self._load_positions()
         self._load_filled_orders()
         self._load_balance_history()
+        self._load_trade_mark_pairs()
+        self._reconstruct_trade_marks()
 
     def _load_working_orders(self) -> None:
         if self.path is None:
@@ -1047,6 +1250,7 @@ class PaperBook:
             return
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            _migrate_trade_marks(conn)
             rows = conn.execute(
                 "SELECT * FROM paper_filled_orders ORDER BY filled_ts, id"
             ).fetchall()
@@ -1057,6 +1261,12 @@ class PaperBook:
             limit_raw = row["limit_price"]
             stop_raw = row["stop_price"]
             margin_raw = row["margin"]
+            keys = row.keys()
+            pair_raw = (
+                row["trade_mark_pair_id"] if "trade_mark_pair_id" in keys else None
+            )
+            kind_raw = row["trade_mark_kind"] if "trade_mark_kind" in keys else None
+            kind = str(kind_raw or TRADE_MARK_ENTRY).strip().lower() or TRADE_MARK_ENTRY
             filled = FilledOrder(
                 id=str(row["id"]),
                 account_id=account_id,
@@ -1072,6 +1282,8 @@ class PaperBook:
                 filled_ts=int(row["filled_ts"]),
                 duration_s=int(row["duration_s"]),
                 margin=None if margin_raw is None else float(margin_raw),
+                trade_mark_pair_id=None if not pair_raw else str(pair_raw),
+                trade_mark_kind=kind,
             )
             self.filled_orders.append(filled)
 
@@ -1101,6 +1313,7 @@ class PaperBook:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
             _migrate_working_orders(conn)
+            _migrate_trade_marks(conn)
             conn.execute("DELETE FROM paper_accounts")
             conn.execute("DELETE FROM paper_meta")
             for account in self.accounts.values():
@@ -1173,8 +1386,9 @@ class PaperBook:
                     INSERT INTO paper_filled_orders (
                         id, account_id, instrument, side, order_type, qty,
                         limit_price, stop_price, fill_price, commission,
-                        placed_ts, filled_ts, duration_s, margin
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        placed_ts, filled_ts, duration_s, margin,
+                        trade_mark_pair_id, trade_mark_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         filled.id,
@@ -1191,6 +1405,23 @@ class PaperBook:
                         filled.filled_ts,
                         filled.duration_s,
                         filled.margin,
+                        filled.trade_mark_pair_id,
+                        filled.trade_mark_kind,
+                    ),
+                )
+            conn.execute("DELETE FROM paper_trade_mark_pairs")
+            for pair in self.trade_mark_pairs.values():
+                conn.execute(
+                    """
+                    INSERT INTO paper_trade_mark_pairs (
+                        id, account_id, instrument, visible
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        pair.id,
+                        pair.account_id,
+                        pair.instrument,
+                        1 if pair.visible else 0,
                     ),
                 )
             conn.execute("DELETE FROM paper_balance_history")
@@ -1226,6 +1457,24 @@ def _migrate_working_orders(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE paper_working_orders ADD COLUMN role TEXT NOT NULL DEFAULT 'entry'"
         )
+
+
+def _migrate_trade_marks(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS paper_trade_mark_pairs (
+            id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            instrument TEXT NOT NULL,
+            visible INTEGER NOT NULL
+        )
+        """
+    )
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(paper_filled_orders)")}
+    if "trade_mark_pair_id" not in cols:
+        conn.execute("ALTER TABLE paper_filled_orders ADD COLUMN trade_mark_pair_id TEXT")
+    if "trade_mark_kind" not in cols:
+        conn.execute("ALTER TABLE paper_filled_orders ADD COLUMN trade_mark_kind TEXT")
 
 
 def bar_touch_fill_price(order: WorkingOrder, bar: Bar) -> float | None:
