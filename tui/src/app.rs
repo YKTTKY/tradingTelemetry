@@ -5207,6 +5207,7 @@ mod tests {
                 commission_per_fill_usd: 1.0,
                 leverage_enabled: false,
                 leverage_multiple: 1.0,
+                maintenance_margin_ratio: 0.5,
             },
             working_orders: vec![],
             positions: vec![],
@@ -5291,10 +5292,12 @@ mod tests {
         assert_eq!(active.commission_per_fill_usd, 1.0);
         assert!(!active.leverage_enabled);
         assert_eq!(active.leverage_multiple, 1.0);
+        assert!(active.asset_class_restriction.is_none());
         assert_eq!(app.paper.defaults.name, "Paper");
         assert_eq!(app.paper.defaults.initial_balance, 100_000.0);
         assert_eq!(app.paper.defaults.commission_per_fill_usd, 1.0);
         assert_eq!(app.paper.defaults.leverage_multiple, 1.0);
+        assert_eq!(app.paper.defaults.maintenance_margin_ratio, 0.5);
         assert!(app.paper.positions.is_empty());
         assert!(app.paper.filled_order_history.is_empty());
         assert!(app.paper.balance_history.is_empty());

@@ -316,9 +316,14 @@ def create_app(
         )
         return payload
 
-    def _on_paper_fill(_filled: object) -> None:
+    def _on_paper_fill(filled: object) -> None:
         sync_paper_interest()
-        publish_paper("order_filled")
+        reason = (
+            "liquidation"
+            if getattr(filled, "type", "") == "liquidation"
+            else "order_filled"
+        )
+        publish_paper(reason)
 
     sync_paper_interest()
 

@@ -19,6 +19,7 @@ _DEFAULT_NAME = "Paper"
 _DEFAULT_BALANCE = 100_000.0
 _DEFAULT_COMMISSION = 1.0
 _DEFAULT_LEVERAGE_MULTIPLE = 1.0
+_DEFAULT_MAINTENANCE_MARGIN_RATIO = 0.5
 
 
 def _client(
@@ -84,6 +85,7 @@ def test_snapshot_includes_paper_desk_without_dropping_existing_keys(tmp_path: P
     assert defaults["commission_per_fill_usd"] == _DEFAULT_COMMISSION
     assert defaults["leverage_enabled"] is False
     assert defaults["leverage_multiple"] == _DEFAULT_LEVERAGE_MULTIPLE
+    assert defaults["maintenance_margin_ratio"] == _DEFAULT_MAINTENANCE_MARGIN_RATIO
 
     assert paper["positions"] == []
     assert paper["filled_order_history"] == []
@@ -1531,3 +1533,334 @@ def test_trade_marks_are_tagged_per_instrument(tmp_path: Path):
     assert by_inst["SPY"]["price"] == 111.0
     assert by_inst["QQQ"]["price"] == 201.0
     assert by_inst["SPY"]["pair_id"] != by_inst["QQQ"]["pair_id"]
+
+
+def _create_active_account(client, **kwargs) -> dict:
+    """Create a paper account and select it as active (no switching UX)."""
+    created = client.post("/v1/paper/accounts", json=kwargs)
+    assert created.status_code == 200, created.text
+    paper = created.json()
+    acc = next(a for a in paper["accounts"] if a["name"] == kwargs["name"])
+    selected = client.post("/v1/paper/active", json={"account_id": acc["id"]})
+    assert selected.status_code == 200, selected.text
+    return acc
+
+
+def test_equities_only_account_rejects_futures_instrument(tmp_path: Path):
+    """Equities-only allow-list cannot take a futures instrument (ES/NQ)."""
+    client, _ = _paper_client(tmp_path, instruments=("SPY", "ES"))
+    acc = _create_active_account(
+        client, name="Equities", asset_class_restriction="equities"
+    )
+    assert acc["asset_class_restriction"] == "equities"
+
+    rejected = _place(client, instrument="ES", side="buy", type="market", qty=1)
+    assert rejected.status_code == 422
+    snap = client.get("/v1/snapshot").json()["paper"]
+    assert snap["working_orders"] == []
+    assert snap["positions"] == []
+    assert snap["filled_order_history"] == []
+
+    nq = _place(client, instrument="NQ", side="buy", type="limit", qty=1, limit=18000.0)
+    assert nq.status_code == 422
+    assert client.get("/v1/snapshot").json()["paper"]["working_orders"] == []
+
+    ok = _place(client, instrument="SPY", side="buy", type="limit", qty=1, limit=100.0)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["working_orders"][0]["instrument"] == "SPY"
+
+
+def test_futures_only_account_rejects_equities_instrument(tmp_path: Path):
+    """Futures-only allow-list cannot take an equities instrument (SPY)."""
+    client, _ = _paper_client(tmp_path, instruments=("SPY", "ES"))
+    acc = _create_active_account(
+        client, name="Futures", asset_class_restriction="futures"
+    )
+    assert acc["asset_class_restriction"] == "futures"
+
+    rejected = _place(client, instrument="SPY", side="buy", type="market", qty=1)
+    assert rejected.status_code == 422
+    snap = client.get("/v1/snapshot").json()["paper"]
+    assert snap["working_orders"] == []
+    assert snap["positions"] == []
+
+    ok = _place(client, instrument="ES", side="buy", type="limit", qty=1, limit=5000.0)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["working_orders"][0]["instrument"] == "ES"
+
+
+def test_invalid_asset_class_restriction_rejected(tmp_path: Path):
+    client, _ = _client(workspace_path=tmp_path / "workspace.json")
+    bad = client.post(
+        "/v1/paper/accounts",
+        json={"name": "Nope", "asset_class_restriction": "crypto"},
+    )
+    assert bad.status_code == 422
+    names = {a["name"] for a in client.get("/v1/snapshot").json()["paper"]["accounts"]}
+    assert "Nope" not in names
+
+
+def test_leveraged_account_accepts_qty_cash_book_would_reject(tmp_path: Path):
+    """4× leverage reserves initial margin, so a cash-oversized buy can rest."""
+    store = tmp_path / "workspace.json"
+    client, _ = _client(workspace_path=store)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=100_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+    )
+
+    # Cash book rejects 200 SPY * ~548 + $1 commission (ticket 03).
+    placed = _place(client, instrument="SPY", side="buy", type="market", qty=200)
+    assert placed.status_code == 200, placed.text
+    assert len(placed.json()["working_orders"]) == 1
+    assert placed.json()["working_orders"][0]["qty"] == 200
+
+
+def test_leverage_reserves_margin_on_entry_not_full_notional(tmp_path: Path):
+    """Enabled leverage posts initial margin on fill; cash is not debited notional."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+        commission_per_fill_usd=1.0,
+    )
+    placed = _place(
+        client, instrument="SPY", side="buy", type="limit", qty=360, limit=100.0
+    )
+    assert placed.status_code == 200, placed.text
+
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["working_orders"] == []
+    assert paper["positions"][0]["qty"] == 360
+    assert paper["positions"][0]["avg_price"] == 100.0
+    fill = paper["filled_order_history"][0]
+    # Initial margin = 360 * 100 / 4 = 9000; commission $1.
+    assert fill["margin"] == 9000.0
+    assert fill["commission"] == 1.0
+    active = next(a for a in paper["accounts"] if a["id"] == paper["active_account_id"])
+    assert active["balance"] == 999.0
+    assert paper["balance_history"][0]["balance"] == 999.0
+
+
+def test_leverage_1x_reserves_full_notional_as_margin(tmp_path: Path):
+    """1× (enabled) is not 'off': full notional is reserved as margin on entry."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="OneX",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=1.0,
+        commission_per_fill_usd=1.0,
+    )
+    placed = _place(
+        client, instrument="SPY", side="buy", type="limit", qty=90, limit=100.0
+    )
+    assert placed.status_code == 200, placed.text
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    fill = paper["filled_order_history"][0]
+    assert fill["margin"] == 9000.0
+    active = next(a for a in paper["accounts"] if a["id"] == paper["active_account_id"])
+    assert active["balance"] == 999.0
+
+
+def _active_account(paper: dict) -> dict:
+    return next(a for a in paper["accounts"] if a["id"] == paper["active_account_id"])
+
+
+def test_adverse_1m_series_liquidates_leveraged_position(tmp_path: Path):
+    """Maintenance fail on a constructed 1m series writes a liquidation exit leg."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+        commission_per_fill_usd=1.0,
+    )
+    _place(client, instrument="SPY", side="buy", type="limit", qty=360, limit=100.0)
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    opened = client.get("/v1/snapshot").json()["paper"]
+    assert opened["positions"][0]["qty"] == 360
+    assert _active_account(opened)["balance"] == 999.0
+
+    # Close=86: unrealized 360*(-14)=-5040; equity 4959 > MM 4500 — still open.
+    vendor.inject_tick("SPY", price=86.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 4))
+    time.sleep(_CONFLATE_S * 2.5)
+    mid = client.get("/v1/snapshot").json()["paper"]
+    assert len(mid["positions"]) == 1
+    assert len(mid["filled_order_history"]) == 1
+
+    # Close=84: unrealized 360*(-16)=-5760; equity 4239 < MM 4500 — liquidate.
+    vendor.inject_tick("SPY", price=84.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["positions"] == []
+    assert paper["working_orders"] == []
+    assert len(paper["filled_order_history"]) == 2
+    entry, exit_leg = paper["filled_order_history"]
+    assert entry["side"] == "buy"
+    assert entry["margin"] == 9000.0
+    assert exit_leg["type"] == "liquidation"
+    assert exit_leg["side"] == "sell"
+    assert exit_leg["qty"] == 360
+    assert exit_leg["symbol"] == "SPY"
+    assert exit_leg["fill_price"] == 84.0
+    assert exit_leg["commission"] == 1.0
+    # 10000 - 360*(100-84) - 2 commissions = 4238
+    assert _active_account(paper)["balance"] == 4238.0
+    assert paper["balance_history"][-1]["balance"] == 4238.0
+
+    by_kind = _marks_by_kind(paper["trade_marks"])
+    assert set(by_kind) == {"entry", "exit"}
+    assert by_kind["exit"]["price"] == 84.0
+    assert by_kind["entry"]["pair_id"] == by_kind["exit"]["pair_id"]
+    assert exit_leg["trade_mark_kind"] == "exit"
+
+
+def test_liquidation_cancels_leftover_bracket_children(tmp_path: Path):
+    """No orphan TP/SL after a margin call / liquidation."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+        commission_per_fill_usd=1.0,
+    )
+    _place(
+        client,
+        instrument="SPY",
+        side="buy",
+        type="limit",
+        qty=360,
+        limit=100.0,
+        take_profit=130.0,
+        stop_loss=70.0,
+    )
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    opened = client.get("/v1/snapshot").json()["paper"]
+    assert opened["positions"][0]["qty"] == 360
+    by_role = _by_role(opened["working_orders"])
+    assert set(by_role) == {"tp", "sl"}
+    assert by_role["sl"]["stop"] == 70.0
+
+    vendor.inject_tick("SPY", price=84.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert paper["positions"] == []
+    assert paper["working_orders"] == []
+    assert paper["filled_order_history"][-1]["type"] == "liquidation"
+    assert paper["filled_order_history"][-1]["fill_price"] == 84.0
+
+
+def test_liquidation_emits_discrete_paper_ws_not_bar_update(tmp_path: Path):
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+        commission_per_fill_usd=1.0,
+    )
+    with client:
+        with client.websocket_connect("/v1/ws") as ws:
+            _receive_of_type(ws, "feed_status")
+            _place(
+                client, instrument="SPY", side="buy", type="limit", qty=360, limit=100.0
+            )
+            vendor.inject_tick(
+                "SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3)
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+            vendor.inject_tick(
+                "SPY", price=84.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5)
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+
+            events: list[dict] = []
+            deadline = time.time() + 2.0
+            while time.time() < deadline and len(events) < 8:
+                msg = ws.receive_json()
+                if msg.get("type") == "paper_update":
+                    events.append(msg)
+
+            reasons = [ev.get("reason") for ev in events]
+            assert "order_placed" in reasons
+            assert "order_filled" in reasons
+            assert "liquidation" in reasons
+            liq = next(ev for ev in events if ev.get("reason") == "liquidation")
+            assert liq["type"] == "paper_update"
+            assert liq["paper"]["positions"] == []
+            assert liq["paper"]["filled_order_history"][-1]["type"] == "liquidation"
+
+
+def test_leveraged_offsetting_sell_does_not_require_new_margin(tmp_path: Path):
+    """A working sell that closes a leveraged long is an exit, not a new short."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Lev",
+        initial_balance=10_000.0,
+        leverage_enabled=True,
+        leverage_multiple=4.0,
+        commission_per_fill_usd=1.0,
+    )
+    _place(client, instrument="SPY", side="buy", type="limit", qty=360, limit=100.0)
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    opened = client.get("/v1/snapshot").json()["paper"]
+    assert opened["positions"][0]["qty"] == 360
+    assert _active_account(opened)["balance"] == 999.0
+
+    exit_place = _place(
+        client, instrument="SPY", side="sell", type="limit", qty=360, limit=110.0
+    )
+    assert exit_place.status_code == 200, exit_place.text
+    assert any(
+        o["side"] == "sell" and o["qty"] == 360
+        for o in exit_place.json()["working_orders"]
+    )
+
+    flip = _place(
+        client, instrument="SPY", side="sell", type="limit", qty=400, limit=110.0
+    )
+    assert flip.status_code == 422
+
+
+def test_leverage_off_does_not_liquidate_on_adverse_1m(tmp_path: Path):
+    """Cash book (leverage off) has no margin call even on a deep 1m print."""
+    client, vendor = _paper_client(tmp_path)
+    _create_active_account(
+        client,
+        name="Cash",
+        initial_balance=10_000.0,
+        leverage_enabled=False,
+        leverage_multiple=1.0,
+        commission_per_fill_usd=1.0,
+    )
+    _place(client, instrument="SPY", side="buy", type="limit", qty=90, limit=100.0)
+    vendor.inject_tick("SPY", price=99.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 3))
+    time.sleep(_CONFLATE_S * 2.5)
+    vendor.inject_tick("SPY", price=84.0, volume=10.0, ts=float(_SPY_1M_LAST_TS + 5))
+    time.sleep(_CONFLATE_S * 2.5)
+    paper = client.get("/v1/snapshot").json()["paper"]
+    assert len(paper["positions"]) == 1
+    assert paper["positions"][0]["qty"] == 90
+    assert len(paper["filled_order_history"]) == 1
+    assert paper["filled_order_history"][0]["type"] == "limit"

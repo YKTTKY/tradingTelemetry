@@ -16,7 +16,10 @@ use crate::app::{
     IndicatorListSide, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
 };
 use crate::feed_clock::{format_elapsed, format_feed_clocks, format_ny_timestamp};
-use crate::ipc::{BalanceHistoryRow, FilledOrderRow, OhlcvBar, PaperPositionRow, QuoteRow};
+use crate::ipc::{
+    BalanceHistoryRow, FilledOrderRow, OhlcvBar, PaperAccountSnapshot, PaperDefaults,
+    PaperPositionRow, QuoteRow,
+};
 use crate::overlay::{
     MAX_VP_HIST_PANE_FRACTION, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
     OverlayPin, paint_overlays, volume_bar_color,
@@ -511,6 +514,9 @@ fn format_filled_order_row_vis(row: &FilledOrderRow, visible: Option<bool>) -> S
         format_ny_timestamp(row.filled_ts),
         format_elapsed(row.duration_s),
     );
+    if let Some(margin) = row.margin.filter(|m| *m > 0.0) {
+        line.push_str(&format!("  m{margin:.2}"));
+    }
     match visible {
         Some(true) => line.push_str("  shown"),
         Some(false) => line.push_str("  hidden"),
@@ -521,6 +527,72 @@ fn format_filled_order_row_vis(row: &FilledOrderRow, visible: Option<bool>) -> S
 
 pub(crate) fn format_balance_row(row: &BalanceHistoryRow) -> String {
     format!("{}  {:.2}", format_ny_timestamp(row.ts), row.balance)
+}
+
+pub(crate) fn format_leverage_rule(enabled: bool, multiple: f64) -> String {
+    if enabled {
+        format!("{multiple}×")
+    } else {
+        format!("{multiple}× (off)")
+    }
+}
+
+pub(crate) fn format_asset_class_restriction(restriction: Option<&str>) -> String {
+    match restriction.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => "(none)".into(),
+    }
+}
+
+pub(crate) fn format_maintenance_margin_ratio(ratio: f64) -> String {
+    let pct = if ratio > 0.0 { ratio } else { 0.5 } * 100.0;
+    format!("{pct:.0}% of initial margin")
+}
+
+pub(crate) fn paper_account_setting_lines(
+    acc: &PaperAccountSnapshot,
+    defaults: &PaperDefaults,
+) -> Vec<String> {
+    vec![
+        format!("name  {}", acc.name),
+        format!("initial  ${:.2} {}", acc.initial_balance, acc.currency),
+        format!("commission  ${:.2} / fill", acc.commission_per_fill_usd),
+        format!(
+            "leverage  {}",
+            format_leverage_rule(acc.leverage_enabled, acc.leverage_multiple)
+        ),
+        format!(
+            "restriction  {}",
+            format_asset_class_restriction(acc.asset_class_restriction.as_deref())
+        ),
+        format!(
+            "maintenance  {}",
+            format_maintenance_margin_ratio(defaults.maintenance_margin_ratio)
+        ),
+    ]
+}
+
+pub(crate) fn paper_default_setting_lines(defaults: &PaperDefaults) -> Vec<String> {
+    vec![
+        format!("name  {}", defaults.name),
+        format!(
+            "initial  ${:.2} {}",
+            defaults.initial_balance, defaults.currency
+        ),
+        format!(
+            "commission  ${:.2} / fill",
+            defaults.commission_per_fill_usd
+        ),
+        format!(
+            "leverage  {}",
+            format_leverage_rule(defaults.leverage_enabled, defaults.leverage_multiple)
+        ),
+        format!("restriction  {}", format_asset_class_restriction(None)),
+        format!(
+            "maintenance  {}",
+            format_maintenance_margin_ratio(defaults.maintenance_margin_ratio)
+        ),
+    ]
 }
 
 fn draw_order_side_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -619,21 +691,9 @@ fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(format!("name  {}", acc.name)));
-            lines.push(Line::from(format!(
-                "initial  ${:.2} {}",
-                acc.initial_balance, acc.currency
-            )));
-            lines.push(Line::from(format!(
-                "commission  ${:.2} / fill",
-                acc.commission_per_fill_usd
-            )));
-            let lev = if acc.leverage_enabled {
-                format!("{}×", acc.leverage_multiple)
-            } else {
-                format!("{}× (off)", acc.leverage_multiple)
-            };
-            lines.push(Line::from(format!("leverage  {lev}")));
+            for line in paper_account_setting_lines(acc, defaults) {
+                lines.push(Line::from(line));
+            }
         }
         None => {
             lines.push(Line::from(Span::styled(
@@ -647,19 +707,9 @@ fn draw_paper_settings(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(format!("name  {}", defaults.name)));
-            lines.push(Line::from(format!(
-                "initial  ${:.2} {}",
-                defaults.initial_balance, defaults.currency
-            )));
-            lines.push(Line::from(format!(
-                "commission  ${:.2} / fill",
-                defaults.commission_per_fill_usd
-            )));
-            lines.push(Line::from(format!(
-                "leverage  {}× (off)",
-                defaults.leverage_multiple
-            )));
+            for line in paper_default_setting_lines(defaults) {
+                lines.push(Line::from(line));
+            }
         }
     }
 
@@ -687,7 +737,7 @@ fn fill_trade_mark_visible(app: &App, row: &FilledOrderRow) -> Option<bool> {
 
 fn draw_filled_history_table(frame: &mut Frame, area: Rect, app: &App) {
     let header =
-        "symbol  side  type  qty  limit  stop  fill  c  place  fill/close  dur  trade mark";
+        "symbol  side  type  qty  limit  stop  fill  c  m  place  fill/close  dur  trade mark";
     let mut lines = vec![Line::from(Span::styled(
         header.to_string(),
         Style::default()
@@ -2342,7 +2392,9 @@ fn feed_line(app: &App) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{BalanceHistoryRow, FilledOrderRow, PaperPositionRow};
+    use crate::ipc::{
+        BalanceHistoryRow, FilledOrderRow, PaperAccountSnapshot, PaperDefaults, PaperPositionRow,
+    };
 
     #[test]
     fn position_row_shows_symbol_side_qty_avg_and_upnl() {
@@ -2397,6 +2449,72 @@ mod tests {
         assert!(line.contains("2026-08-14 11:17:44 EDT"));
         assert!(line.contains("1m 05s"));
         assert!(!line.contains("UTC"));
+    }
+
+    #[test]
+    fn filled_order_row_shows_margin_when_reserved() {
+        let row = FilledOrderRow {
+            symbol: "SPY".into(),
+            side: "buy".into(),
+            order_type: "market".into(),
+            qty: 360.0,
+            fill_price: 100.0,
+            commission: 1.0,
+            margin: Some(9000.0),
+            ..FilledOrderRow::default()
+        };
+        let line = format_filled_order_row(&row);
+        assert!(line.contains("m9000.00"));
+    }
+
+    #[test]
+    fn paper_settings_show_commission_leverage_restriction_and_maintenance() {
+        let acc = PaperAccountSnapshot {
+            name: "Scalps".into(),
+            currency: "USD".into(),
+            initial_balance: 25_000.0,
+            commission_per_fill_usd: 2.0,
+            leverage_enabled: true,
+            leverage_multiple: 4.0,
+            asset_class_restriction: Some("equities".into()),
+            ..PaperAccountSnapshot::default()
+        };
+        let defaults = PaperDefaults {
+            maintenance_margin_ratio: 0.5,
+            ..PaperDefaults::default()
+        };
+        let lines = paper_account_setting_lines(&acc, &defaults);
+        assert!(lines.iter().any(|l| l == "commission  $2.00 / fill"));
+        assert!(lines.iter().any(|l| l == "leverage  4×"));
+        assert!(lines.iter().any(|l| l == "restriction  equities"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "maintenance  50% of initial margin")
+        );
+
+        let off = format_leverage_rule(false, 1.0);
+        assert_eq!(off, "1× (off)");
+        let onex = format_leverage_rule(true, 1.0);
+        assert_eq!(onex, "1×");
+        assert_eq!(format_asset_class_restriction(None), "(none)");
+        let default_lines = paper_default_setting_lines(&PaperDefaults {
+            name: "Paper".into(),
+            currency: "USD".into(),
+            initial_balance: 100_000.0,
+            commission_per_fill_usd: 1.0,
+            leverage_enabled: false,
+            leverage_multiple: 1.0,
+            maintenance_margin_ratio: 0.5,
+        });
+        assert!(default_lines.iter().any(|l| l.contains("commission")));
+        assert!(default_lines.iter().any(|l| l.contains("1× (off)")));
+        assert!(default_lines.iter().any(|l| l.contains("restriction  (none)")));
+        assert!(
+            default_lines
+                .iter()
+                .any(|l| l.contains("50% of initial margin"))
+        );
     }
 
     #[test]

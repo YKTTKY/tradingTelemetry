@@ -609,8 +609,12 @@ fn default_leverage_multiple() -> f64 {
     1.0
 }
 
+fn default_maintenance_margin_ratio() -> f64 {
+    0.5
+}
+
 /// First-launch / create-account defaults (visible in paper account settings).
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PaperDefaults {
     #[serde(default)]
     pub name: String,
@@ -624,6 +628,22 @@ pub struct PaperDefaults {
     pub leverage_enabled: bool,
     #[serde(default = "default_leverage_multiple")]
     pub leverage_multiple: f64,
+    #[serde(default = "default_maintenance_margin_ratio")]
+    pub maintenance_margin_ratio: f64,
+}
+
+impl Default for PaperDefaults {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            currency: default_usd(),
+            initial_balance: 0.0,
+            commission_per_fill_usd: 0.0,
+            leverage_enabled: false,
+            leverage_multiple: default_leverage_multiple(),
+            maintenance_margin_ratio: default_maintenance_margin_ratio(),
+        }
+    }
 }
 
 /// Open holding row in the Position table (distinct from the watchlist).
@@ -1577,6 +1597,8 @@ mod tests {
         assert_eq!(with_paper.paper.accounts[0].commission_per_fill_usd, 1.0);
         assert!(!with_paper.paper.accounts[0].leverage_enabled);
         assert_eq!(with_paper.paper.accounts[0].leverage_multiple, 1.0);
+        assert!(with_paper.paper.accounts[0].asset_class_restriction.is_none());
+        assert_eq!(with_paper.paper.defaults.maintenance_margin_ratio, 0.5);
         assert!(with_paper.paper.positions.is_empty());
         assert!(with_paper.paper.filled_order_history.is_empty());
         assert!(with_paper.paper.balance_history.is_empty());

@@ -18,6 +18,13 @@ DEFAULT_INITIAL_BALANCE = 100_000.0
 DEFAULT_COMMISSION_PER_FILL_USD = 1.0
 DEFAULT_LEVERAGE_ENABLED = False
 DEFAULT_LEVERAGE_MULTIPLE = 1.0
+DEFAULT_MAINTENANCE_MARGIN_RATIO = 0.5
+
+ASSET_EQUITIES = "equities"
+ASSET_FUTURES = "futures"
+VALID_ASSET_CLASSES = frozenset({ASSET_EQUITIES, ASSET_FUTURES})
+# Domain futures roots (CME equity-index). ES/NQ map to LSE *.F in the vendor.
+_FUTURES_ROOTS = frozenset({"ES", "NQ", "MES", "MNQ"})
 
 PAPER_DEFAULTS: dict[str, Any] = {
     "name": DEFAULT_ACCOUNT_NAME,
@@ -26,6 +33,7 @@ PAPER_DEFAULTS: dict[str, Any] = {
     "commission_per_fill_usd": DEFAULT_COMMISSION_PER_FILL_USD,
     "leverage_enabled": DEFAULT_LEVERAGE_ENABLED,
     "leverage_multiple": DEFAULT_LEVERAGE_MULTIPLE,
+    "maintenance_margin_ratio": DEFAULT_MAINTENANCE_MARGIN_RATIO,
 }
 
 _SCHEMA = """
@@ -386,10 +394,7 @@ class PaperBook:
         )
         if lev_mult < 1.0:
             raise ValueError("leverage_multiple must be >= 1")
-        restriction = None
-        if asset_class_restriction is not None:
-            cleaned = str(asset_class_restriction).strip()
-            restriction = cleaned or None
+        restriction = _parse_asset_class_restriction(asset_class_restriction)
         account = PaperAccount(
             id=_new_account_id(),
             name=cleaned_name,
@@ -434,6 +439,7 @@ class PaperBook:
         cleaned_instrument = instrument.strip().upper()
         if not cleaned_instrument:
             raise ValueError("instrument is required")
+        self._assert_asset_class_allowed(account, cleaned_instrument)
         cleaned_side = side.strip().lower()
         if cleaned_side not in VALID_SIDES:
             raise ValueError("side must be buy or sell")
@@ -462,7 +468,9 @@ class PaperBook:
         tp_val, sl_val = self._optional_bracket_prices(
             cleaned_side, take_profit, stop_loss
         )
-        self._assert_qty_supported(account, cleaned_side, qty_val, ref_price)
+        self._assert_qty_supported(
+            account, cleaned_side, qty_val, ref_price, instrument=cleaned_instrument
+        )
         order = WorkingOrder(
             id=_new_working_order_id(),
             account_id=account.id,
@@ -535,7 +543,12 @@ class PaperBook:
             new_qty = order.qty
         else:
             self._assert_qty_supported(
-                account, order.side, new_qty, ref_price, except_id=order.id
+                account,
+                order.side,
+                new_qty,
+                ref_price,
+                except_id=order.id,
+                instrument=order.instrument,
             )
         order.qty = new_qty
         order.limit = new_limit
@@ -635,6 +648,9 @@ class PaperBook:
                 fills.append(filled)
                 if on_fill is not None:
                     on_fill(filled)
+        fills.extend(
+            self._margin_call_if_needed(inst, float(bar.close), filled_ts, on_fill)
+        )
         return fills
 
     def close_position(
@@ -651,23 +667,97 @@ class PaperBook:
             raise ValueError(f"no open position for {inst}")
         price = _require_positive(fill_price, "fill_price")
         filled_ts = int(now_ts if now_ts is not None else time.time())
+        return self._flatten_position(
+            account, inst, price, filled_ts, order_type="close"
+        )
+
+    def _flatten_position(
+        self,
+        account: PaperAccount,
+        instrument: str,
+        fill_price: float,
+        filled_ts: int,
+        *,
+        order_type: str,
+    ) -> FilledOrder:
+        pos = self.positions.get((account.id, instrument))
+        if pos is None or abs(pos.qty) < 1e-12:
+            raise ValueError(f"no open position for {instrument}")
         side = "sell" if pos.qty > 0 else "buy"
         qty = abs(pos.qty)
         filled = self._record_fill(
             account=account,
-            instrument=inst,
+            instrument=instrument,
             side=side,
-            order_type="close",
+            order_type=order_type,
             qty=qty,
             limit=None,
             stop=None,
-            fill_price=price,
+            fill_price=fill_price,
             placed_ts=filled_ts,
             filled_ts=filled_ts,
         )
-        self._drop_position_children(account.id, inst)
+        self._drop_position_children(account.id, instrument)
         self._save()
         return filled
+
+    def _margin_call_if_needed(
+        self,
+        instrument: str,
+        last: float,
+        filled_ts: int,
+        on_fill: Callable[[FilledOrder], None] | None,
+    ) -> list[FilledOrder]:
+        """Close leveraged positions on this instrument when maintenance fails."""
+        fills: list[FilledOrder] = []
+        for account in list(self.accounts.values()):
+            if not account.leverage_enabled:
+                continue
+            pos = self.positions.get((account.id, instrument))
+            if pos is None or abs(pos.qty) <= 1e-12:
+                continue
+            if self._maintenance_ok(account, {instrument: last}):
+                continue
+            filled = self._flatten_position(
+                account,
+                instrument,
+                last,
+                filled_ts,
+                order_type="liquidation",
+            )
+            fills.append(filled)
+            if on_fill is not None:
+                on_fill(filled)
+        return fills
+
+    def _maintenance_ok(
+        self, account: PaperAccount, last_prices: dict[str, float]
+    ) -> bool:
+        equity = self._account_equity(account, last_prices)
+        return equity + 1e-9 >= self._account_maintenance(account)
+
+    def _account_equity(
+        self, account: PaperAccount, last_prices: dict[str, float]
+    ) -> float:
+        equity = account.balance
+        for pos in self.positions.values():
+            if pos.account_id != account.id or abs(pos.qty) <= 1e-12:
+                continue
+            last = last_prices.get(pos.instrument, pos.avg_price)
+            equity += self._position_initial_margin(account, pos)
+            equity += _unrealized_pnl(pos, last)
+        return equity
+
+    def _account_maintenance(self, account: PaperAccount) -> float:
+        total = 0.0
+        for pos in self.positions.values():
+            if pos.account_id != account.id:
+                continue
+            total += (
+                self._position_initial_margin(account, pos)
+                * DEFAULT_MAINTENANCE_MARGIN_RATIO
+            )
+        return total
 
     def set_trade_mark_visibility(
         self,
@@ -733,14 +823,27 @@ class PaperBook:
         filled_ts: int,
     ) -> FilledOrder:
         commission = float(account.commission_per_fill_usd)
-        if side == "buy":
+        signed = qty if side == "buy" else -qty
+        key = (account.id, instrument)
+        pos_before = self.positions.get(key)
+        old_im = self._position_initial_margin(account, pos_before)
+        realized = 0.0
+        if account.leverage_enabled:
+            realized = _realized_pnl(pos_before, signed, fill_price)
+        elif side == "buy":
             account.balance -= qty * fill_price + commission
         else:
             account.balance += qty * fill_price - commission
         kind, pair_id = self._assign_trade_mark(account.id, instrument, side)
-        signed = qty if side == "buy" else -qty
         self._apply_position(account.id, instrument, signed, fill_price)
         self._sync_open_trade_pair(account.id, instrument)
+        pos_after = self.positions.get(key)
+        new_im = self._position_initial_margin(account, pos_after)
+        margin: float | None = None
+        if account.leverage_enabled:
+            account.balance += (old_im - new_im) + realized - commission
+            posted = abs(new_im - old_im)
+            margin = posted if posted > 1e-12 else None
         duration = max(0, int(filled_ts) - int(placed_ts))
         filled = FilledOrder(
             id=_new_filled_order_id(),
@@ -756,7 +859,7 @@ class PaperBook:
             placed_ts=int(placed_ts),
             filled_ts=int(filled_ts),
             duration_s=duration,
-            margin=None,
+            margin=margin,
             trade_mark_pair_id=pair_id,
             trade_mark_kind=kind,
         )
@@ -1089,18 +1192,51 @@ class PaperBook:
         pos = self.positions.get((order.account_id, order.instrument))
         return pos is not None and abs(pos.qty) > 1e-12
 
+    def _position_initial_margin(
+        self, account: PaperAccount, pos: Position | None
+    ) -> float:
+        if pos is None or abs(pos.qty) <= 1e-12:
+            return 0.0
+        if not account.leverage_enabled:
+            return 0.0
+        lev = max(float(account.leverage_multiple), 1.0)
+        return abs(pos.qty) * pos.avg_price / lev
+
+    def _opening_qty(
+        self, account_id: str, instrument: str | None, side: str, qty: float
+    ) -> float:
+        """Qty that would open or add, after netting an opposite open position."""
+        if not instrument:
+            return qty
+        pos = self.positions.get((account_id, instrument))
+        if pos is None or abs(pos.qty) <= 1e-12:
+            return qty
+        pos_side = "buy" if pos.qty > 0 else "sell"
+        if side == pos_side:
+            return qty
+        return max(0.0, qty - abs(pos.qty))
+
     def _required_cash(
-        self, account: PaperAccount, side: str, qty: float, price: float
+        self,
+        account: PaperAccount,
+        side: str,
+        qty: float,
+        price: float,
+        instrument: str | None = None,
     ) -> float:
         commission = account.commission_per_fill_usd
-        # Sells do not spend cash at place (no position book yet). Reserve
-        # commission only so a later fill can still debit the rule.
-        if side == "sell":
+        opening = self._opening_qty(account.id, instrument, side, qty)
+        if not account.leverage_enabled:
+            # Sells do not spend cash at place (no position book yet). Reserve
+            # commission only so a later fill can still debit the rule.
+            if side == "sell" or opening <= 1e-12:
+                return commission
+            return opening * price + commission
+        # off / 1× / leveraged: when enabled, reserve initial margin on entry.
+        if opening <= 1e-12 or price <= 0 or not _finite(price):
             return commission
-        notional = qty * price
-        if account.leverage_enabled and account.leverage_multiple > 1.0:
-            return notional / account.leverage_multiple + commission
-        return notional + commission
+        lev = max(float(account.leverage_multiple), 1.0)
+        return opening * price / lev + commission
 
     def _reserved_cash(self, account_id: str, except_id: str | None = None) -> float:
         account = self.accounts[account_id]
@@ -1113,7 +1249,11 @@ class PaperBook:
             if order.is_child():
                 continue
             total += self._required_cash(
-                account, order.side, order.qty, order.ref_price
+                account,
+                order.side,
+                order.qty,
+                order.ref_price,
+                instrument=order.instrument,
             )
         return total
 
@@ -1124,11 +1264,26 @@ class PaperBook:
         qty: float,
         price: float,
         except_id: str | None = None,
+        instrument: str | None = None,
     ) -> None:
-        required = self._required_cash(account, side, qty, price)
+        required = self._required_cash(
+            account, side, qty, price, instrument=instrument
+        )
         available = account.balance - self._reserved_cash(account.id, except_id)
         if required > available + 1e-9:
             raise ValueError("qty exceeds buying power")
+
+    def _assert_asset_class_allowed(
+        self, account: PaperAccount, instrument: str
+    ) -> None:
+        restriction = account.asset_class_restriction
+        if not restriction:
+            return
+        actual = instrument_asset_class(instrument)
+        if actual != restriction:
+            raise ValueError(
+                "instrument is outside the paper account asset-class allow-list"
+            )
 
     def _seed_default(self) -> None:
         self.create_account()
@@ -1435,6 +1590,46 @@ class PaperBook:
                     (rec.account_id, rec.ts, rec.balance),
                 )
             conn.commit()
+
+
+def instrument_asset_class(instrument: str) -> str:
+    """Map a domain instrument to equities or futures."""
+    root = instrument.strip().upper().split(".", 1)[0]
+    if root in _FUTURES_ROOTS:
+        return ASSET_FUTURES
+    return ASSET_EQUITIES
+
+
+def _parse_asset_class_restriction(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower()
+    if not cleaned:
+        return None
+    if cleaned not in VALID_ASSET_CLASSES:
+        raise ValueError("asset_class_restriction must be equities or futures")
+    return cleaned
+
+
+def _unrealized_pnl(pos: Position, last: float) -> float:
+    abs_qty = abs(pos.qty)
+    if pos.qty >= 0:
+        return (last - pos.avg_price) * abs_qty
+    return (pos.avg_price - last) * abs_qty
+
+
+def _realized_pnl(
+    pos: Position | None, signed_qty: float, fill_price: float
+) -> float:
+    """PnL on the closing portion of a fill (0 when opening or adding)."""
+    if pos is None or abs(pos.qty) <= 1e-12:
+        return 0.0
+    if pos.qty * signed_qty > 0:
+        return 0.0
+    closed = min(abs(signed_qty), abs(pos.qty))
+    if pos.qty > 0:
+        return (fill_price - pos.avg_price) * closed
+    return (pos.avg_price - fill_price) * closed
 
 
 def _exit_side(entry_side: str) -> str:
