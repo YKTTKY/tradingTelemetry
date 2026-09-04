@@ -3,23 +3,23 @@
 use chrono::{Offset, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use ratatui::{
-    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap},
+    Frame,
 };
 use tui_candlestick_chart::{Candle, CandleStickChart, CandleStickChartState, ChartView};
 
 use crate::app::{
-    AVAILABLE_INDICATOR_TYPES, App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase,
-    IndicatorListSide, InputMode, LayoutMode, Screen, UNAVAILABLE_COPY,
+    App, Chart, ChartSeriesState, ConnectionStatus, FrvpPinPhase, IndicatorListSide, InputMode,
+    LayoutMode, Screen, AVAILABLE_INDICATOR_TYPES, UNAVAILABLE_COPY,
 };
 use crate::feed_clock::{format_elapsed, format_feed_clocks, format_ny_timestamp};
 use crate::ipc::{BalanceHistoryRow, FilledOrderRow, OhlcvBar, PaperPositionRow, QuoteRow};
 use crate::overlay::{
-    MAX_VP_HIST_PANE_FRACTION, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
-    OverlayPin, paint_overlays, volume_bar_color,
+    paint_overlays, volume_bar_color, OverlayHistBar, OverlayLayers, OverlayLevel, OverlayLine,
+    OverlayPin, MAX_VP_HIST_PANE_FRACTION,
 };
 use crate::timeframe::product_timeframe_to_interval;
 
@@ -184,6 +184,31 @@ fn draw_help_popup(frame: &mut Frame) {
         row("9", "Snap to cash open 09:30 America/New_York"),
         row("Enter", "Lock anchor (profile builds to now)"),
         row("Esc", "Cancel placement (drops new AVP)"),
+        section("Paper panel (owns keys; watchlist and chart pan idle)"),
+        row(
+            "↑ / ↓",
+            "Select a working line on the focused chart (limit, stop, TP/SL)",
+        ),
+        row(
+            "← / →",
+            "Tick selected line as a draft (engine price unchanged until confirm); else place-form price",
+        ),
+        row(
+            "Enter",
+            "Confirm selected draft (modify); else place. Line then follows the engine",
+        ),
+        row(
+            "Esc",
+            "Drop unconfirmed draft (previous working price remains); else close",
+        ),
+        row("b / s", "Buy / sell (place form)"),
+        row("m / l / t", "Market / limit / stop (place form)"),
+        row("+ / -", "Qty"),
+        row("[ / ]", "Nudge take-profit field"),
+        row("; / '", "Nudge stop-loss field"),
+        row("a", "Attach TP/SL on the open position"),
+        row("x", "Cancel selected working order"),
+        row("f", "Flatten focused-chart position"),
         section("Text prompts (modal; own keys)"),
         row("Enter", "Apply instrument, watchlist add, or rename"),
         row("Esc", "Cancel prompt"),
@@ -368,7 +393,7 @@ fn draw_workspace(frame: &mut Frame, app: &App) {
             .map(|a| a.name.as_str())
             .unwrap_or("—");
         Paragraph::new(format!(
-            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ px  [/] tp  ;/' sl  a attach  ↑↓ select  Enter  x cancel  f flatten  ·  Esc close  ·  ? help"
+            "Paper · {name}  ·  order side  b/s  m/l/t  +/- qty  ←→ tick  [/] tp  ;/' sl  a attach  ↑↓ select  Enter confirm  x cancel  f flatten  ·  Esc drop draft / close  ·  ? help"
         ))
             .style(Style::default().fg(Color::DarkGray))
     } else if panel_open {
@@ -497,7 +522,9 @@ fn draw_order_side_panel(frame: &mut Frame, area: Rect, app: &App) {
     use crate::app::{OrderSide, WorkingOrderKind};
 
     let selected = app.order_side.selected_order_id.as_deref();
-    let title = if selected.is_some() {
+    let title = if app.working_line_draft.is_some() {
+        " Order side · nudge draft "
+    } else if selected.is_some() {
         " Order side · modify "
     } else {
         " Order side · place "

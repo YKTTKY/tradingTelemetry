@@ -18,17 +18,16 @@ use app::{
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ipc::{
-    EngineEndpoint, IpcEvent, post_chart_interest, post_indicators, post_paper_attach_bracket,
-    post_paper_cancel, post_paper_close, post_paper_modify, post_paper_place, post_type_styles,
-    post_watchlist_active,
+    post_chart_interest, post_indicators, post_paper_attach_bracket, post_paper_cancel,
+    post_paper_close, post_paper_modify, post_paper_place, post_type_styles, post_watchlist_active,
     post_watchlist_add, post_watchlist_remove, post_watchlist_rename, post_workspace_layout,
-    run_ipc_loop,
+    run_ipc_loop, EngineEndpoint, IpcEvent,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 const DEFAULT_ENGINE: &str = "http://127.0.0.1:8765";
@@ -296,7 +295,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         },
         InputMode::PaperPanel => match code {
             KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
-            KeyCode::Esc => app.close_paper_panel(),
+            KeyCode::Esc => app.paper_escape(),
             KeyCode::Enter => app.paper_submit(),
             KeyCode::Up => app.paper_select_working_delta(-1),
             KeyCode::Down | KeyCode::Tab => app.paper_select_working_delta(1),

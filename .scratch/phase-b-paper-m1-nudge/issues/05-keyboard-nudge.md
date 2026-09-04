@@ -4,16 +4,16 @@
 
 **Blocked by:** 02 — Working orders
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Select a working level on the focused chart (limit, stop, and later TP/SL lines from 04)
-- [ ] Tick up/down changes a **draft** price only; engine price is unchanged until confirm
-- [ ] Confirm emits modify (nudged price); the line then follows the engine
-- [ ] Escape/cancel drops the draft; previous working price remains
-- [ ] Unconfirmed nudge must not move SQLite / snapshot working price
-- [ ] No mouse drag / projection of working levels in this ticket
-- [ ] TUI unit tests: draft changes on tick keys; confirm emits modify; cancel leaves the previous price
-- [ ] Input still belongs to the paper chrome while this flow is active (no watchlist/chart-pan steal)
+- [x] Select a working level on the focused chart (limit, stop, and later TP/SL lines from 04)
+- [x] Tick up/down changes a **draft** price only; engine price is unchanged until confirm
+- [x] Confirm emits modify (nudged price); the line then follows the engine
+- [x] Escape/cancel drops the draft; previous working price remains
+- [x] Unconfirmed nudge must not move SQLite / snapshot working price
+- [x] No mouse drag / projection of working levels in this ticket
+- [x] TUI unit tests: draft changes on tick keys; confirm emits modify; cancel leaves the previous price
+- [x] Input still belongs to the paper chrome while this flow is active (no watchlist/chart-pan steal)
 
 ## Notes
 

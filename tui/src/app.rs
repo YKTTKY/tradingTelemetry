@@ -9,8 +9,8 @@ use crate::ipc::{
     WatchlistSnapshot, WorkingOrderSnapshot, WorkspaceSnapshot,
 };
 use crate::overlay::{
-    OverlayLevel, WorkingOrderLineSpec, clamp_strength, default_strength_for_type,
-    working_levels_for_instrument,
+    clamp_strength, default_strength_for_type, working_levels_for_instrument, working_line_price,
+    OverlayLevel, WorkingOrderLineSpec,
 };
 use crate::timeframe::{format_bar_countdown, forming_bar_remaining_secs};
 
@@ -359,6 +359,17 @@ pub struct OrderSidePanel {
     pub selected_order_id: Option<String>,
 }
 
+/// Unconfirmed keyboard nudge of a selected working line (limit, stop, TP/SL).
+///
+/// Tick keys change `draft_price` only. Engine / snapshot working price stays
+/// `previous_price` until confirm emits modify.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkingLineDraft {
+    pub order_id: String,
+    pub previous_price: f64,
+    pub draft_price: f64,
+}
+
 impl Default for OrderSidePanel {
     fn default() -> Self {
         Self {
@@ -376,6 +387,14 @@ impl Default for OrderSidePanel {
 
 pub const ORDER_QTY_STEP: f64 = 1.0;
 pub const ORDER_PRICE_STEP: f64 = 0.01;
+
+fn clamp_order_price(price: f64) -> f64 {
+    if price < ORDER_PRICE_STEP {
+        ORDER_PRICE_STEP
+    } else {
+        price
+    }
+}
 
 fn nudge_price_from(current: f64, steps: i32, last: Option<f64>) -> f64 {
     if steps == 0 {
@@ -693,6 +712,8 @@ pub struct App {
     pub paper: PaperSnapshot,
     /// Place/modify/cancel form; visible with the paper panel.
     pub order_side: OrderSidePanel,
+    /// Local draft while a working line is being keyboard-nudged (not the engine book).
+    pub working_line_draft: Option<WorkingLineDraft>,
     /// When Some, main loop POSTs place/modify/cancel to the engine.
     pub pending_paper: Option<PendingPaperOp>,
     /// Last engine rejection from place/modify/cancel (shown on the order side panel).
@@ -734,6 +755,7 @@ impl Default for App {
             help_open: false,
             paper: PaperSnapshot::default(),
             order_side: OrderSidePanel::default(),
+            working_line_draft: None,
             pending_paper: None,
             last_paper_error: None,
             should_quit: false,
@@ -1179,9 +1201,11 @@ impl App {
             InputMode::Normal => {
                 self.input_mode = InputMode::PaperPanel;
                 self.order_side = OrderSidePanel::default();
+                self.working_line_draft = None;
                 self.seed_order_side_prices();
             }
             InputMode::PaperPanel => {
+                self.working_line_draft = None;
                 self.input_mode = InputMode::Normal;
             }
             _ => {}
@@ -1190,14 +1214,55 @@ impl App {
 
     pub fn close_paper_panel(&mut self) {
         if matches!(self.input_mode, InputMode::PaperPanel) {
+            self.working_line_draft = None;
             self.input_mode = InputMode::Normal;
         }
+    }
+
+    /// Esc: drop an unconfirmed line draft; otherwise close the paper panel.
+    pub fn paper_escape(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.working_line_draft.is_some() {
+            self.paper_cancel_nudge();
+            return;
+        }
+        self.close_paper_panel();
+    }
+
+    /// Drop the draft; overlay and form return to the previous working price.
+    pub fn paper_cancel_nudge(&mut self) {
+        if !matches!(self.input_mode, InputMode::PaperPanel) {
+            return;
+        }
+        if self.working_line_draft.take().is_none() {
+            return;
+        }
+        self.sync_order_side_selection();
     }
 
     pub fn apply_paper(&mut self, paper: PaperSnapshot) {
         self.paper = paper;
         self.last_paper_error = None;
-        self.sync_order_side_selection();
+        self.prune_working_line_draft();
+        if self.working_line_draft.is_none() {
+            self.sync_order_side_selection();
+        }
+    }
+
+    fn prune_working_line_draft(&mut self) {
+        let Some(draft) = self.working_line_draft.as_ref() else {
+            return;
+        };
+        let still_working = self
+            .paper
+            .working_orders
+            .iter()
+            .any(|o| o.id == draft.order_id);
+        if !still_working {
+            self.working_line_draft = None;
+        }
     }
 
     pub fn active_paper_account(&self) -> Option<&PaperAccountSnapshot> {
@@ -1218,20 +1283,42 @@ impl App {
     }
 
     /// Working **lines** for one chart instrument (market orders have no price line).
+    ///
+    /// An unconfirmed keyboard nudge substitutes the draft price for that order
+    /// so the line moves locally; the engine snapshot is unchanged until confirm.
     pub fn working_overlay_levels(&self, instrument: &str, x0: f64, x1: f64) -> Vec<OverlayLevel> {
         let specs: Vec<WorkingOrderLineSpec> = self
             .paper
             .working_orders
             .iter()
-            .map(|o| WorkingOrderLineSpec {
-                instrument: o.instrument.clone(),
-                side: o.side.clone(),
-                order_type: o.order_type.clone(),
-                limit: o.limit,
-                stop: o.stop,
+            .map(|o| {
+                let (limit, stop) = self.working_line_display_prices(o);
+                WorkingOrderLineSpec {
+                    instrument: o.instrument.clone(),
+                    side: o.side.clone(),
+                    order_type: o.order_type.clone(),
+                    limit,
+                    stop,
+                }
             })
             .collect();
         working_levels_for_instrument(&specs, instrument, x0, x1)
+    }
+
+    fn working_line_display_prices(
+        &self,
+        order: &WorkingOrderSnapshot,
+    ) -> (Option<f64>, Option<f64>) {
+        let Some(draft) = self.working_line_draft.as_ref() else {
+            return (order.limit, order.stop);
+        };
+        if draft.order_id != order.id {
+            return (order.limit, order.stop);
+        }
+        match order.order_type.as_str() {
+            "stop" => (order.limit, Some(draft.draft_price)),
+            _ => (Some(draft.draft_price), order.stop),
+        }
     }
 
     pub fn paper_request_started(&mut self) {
@@ -1293,24 +1380,51 @@ impl App {
         if steps == 0 {
             return;
         }
+        if let Some(order_id) = self.order_side.selected_order_id.clone() {
+            self.nudge_working_line_draft(&order_id, steps);
+            return;
+        }
         match self.order_side.kind {
             WorkingOrderKind::Limit => {
-                let next = self.order_side.limit + f64::from(steps) * ORDER_PRICE_STEP;
-                self.order_side.limit = if next < ORDER_PRICE_STEP {
-                    ORDER_PRICE_STEP
-                } else {
-                    next
-                };
+                self.order_side.limit =
+                    clamp_order_price(self.order_side.limit + f64::from(steps) * ORDER_PRICE_STEP);
             }
             WorkingOrderKind::Stop => {
-                let next = self.order_side.stop + f64::from(steps) * ORDER_PRICE_STEP;
-                self.order_side.stop = if next < ORDER_PRICE_STEP {
-                    ORDER_PRICE_STEP
-                } else {
-                    next
-                };
+                self.order_side.stop =
+                    clamp_order_price(self.order_side.stop + f64::from(steps) * ORDER_PRICE_STEP);
             }
             WorkingOrderKind::Market => {}
+        }
+    }
+
+    /// Tick a selected working line as a local draft. Snapshot / SQLite unchanged.
+    fn nudge_working_line_draft(&mut self, order_id: &str, steps: i32) {
+        let Some(wo) = self.paper.working_orders.iter().find(|o| o.id == order_id) else {
+            return;
+        };
+        let Some(engine_price) = working_line_price(&wo.order_type, wo.limit, wo.stop) else {
+            return;
+        };
+        let kind = wo.order_type.clone();
+        let role = wo.role.clone();
+        let (previous, base) = match self.working_line_draft.as_ref() {
+            Some(draft) if draft.order_id == order_id => (draft.previous_price, draft.draft_price),
+            _ => (engine_price, engine_price),
+        };
+        let next = clamp_order_price(base + f64::from(steps) * ORDER_PRICE_STEP);
+        self.working_line_draft = Some(WorkingLineDraft {
+            order_id: order_id.to_string(),
+            previous_price: previous,
+            draft_price: next,
+        });
+        match kind.as_str() {
+            "stop" => self.order_side.stop = next,
+            _ => self.order_side.limit = next,
+        }
+        if role == "tp" {
+            self.order_side.take_profit = next;
+        } else if role == "sl" {
+            self.order_side.stop_loss = next;
         }
     }
 
@@ -1322,6 +1436,7 @@ impl App {
         if delta == 0 {
             return;
         }
+        self.working_line_draft = None;
         let inst = self.order_side_instrument().to_string();
         let mut ids: Vec<Option<String>> = vec![None];
         ids.extend(
@@ -1378,6 +1493,7 @@ impl App {
                 limit,
                 stop,
             });
+            self.working_line_draft = None;
             return;
         }
         let (take_profit, stop_loss) = match self.bracket_prices() {
@@ -1473,6 +1589,7 @@ impl App {
         let Some(order_id) = self.order_side.selected_order_id.clone() else {
             return;
         };
+        self.working_line_draft = None;
         self.pending_paper = Some(PendingPaperOp::Cancel { order_id });
     }
 
@@ -4670,12 +4787,11 @@ mod tests {
         app.frvp_place_confirm(); // start
         app.frvp_place_move(3);
         app.frvp_place_confirm(); // end
-        assert!(
-            app.focused_chart()
-                .indicators
-                .iter()
-                .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled)
-        );
+        assert!(app
+            .focused_chart()
+            .indicators
+            .iter()
+            .any(|i| i.indicator_type == "fixed_range_vp" && i.enabled));
 
         // Stale interest: engine still only knows volume (POST not completed).
         app.apply_chart_series(ChartInterestResponse {
@@ -4867,12 +4983,11 @@ mod tests {
         app.indicator_list_side = IndicatorListSide::Available;
         app.indicator_available_selected = 2; // session_vp
         app.indicator_activate_selected();
-        assert!(
-            app.focused_chart()
-                .indicators
-                .iter()
-                .any(|i| i.indicator_type == "session_vp")
-        );
+        assert!(app
+            .focused_chart()
+            .indicators
+            .iter()
+            .any(|i| i.indicator_type == "session_vp"));
     }
 
     #[test]
@@ -5486,5 +5601,311 @@ mod tests {
         assert!(spy.iter().all(|l| l.type_key == "working_order"));
         assert_eq!(spy[0].price, 112.0);
         assert_eq!(spy[1].price, 108.0);
+    }
+
+    #[test]
+    fn working_line_draft_changes_on_tick_keys() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        assert_eq!(app.order_side.selected_order_id.as_deref(), Some("wo_1"));
+
+        app.paper_nudge_price(50);
+
+        let draft = app
+            .working_line_draft
+            .as_ref()
+            .expect("tick keys start a draft");
+        assert_eq!(draft.order_id, "wo_1");
+        assert_eq!(draft.previous_price, 540.0);
+        assert!((draft.draft_price - 540.5).abs() < 1e-9);
+
+        let wo = app
+            .paper
+            .working_orders
+            .iter()
+            .find(|o| o.id == "wo_1")
+            .expect("working order remains");
+        assert_eq!(
+            wo.limit,
+            Some(540.0),
+            "engine snapshot working price unchanged until confirm"
+        );
+
+        let levels = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert_eq!(levels.len(), 1);
+        assert!(
+            (levels[0].price - 540.5).abs() < 1e-9,
+            "chart line follows the draft"
+        );
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+    }
+
+    #[test]
+    fn working_line_nudge_confirm_emits_modify() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        app.paper_nudge_price(50);
+        app.paper_submit();
+
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Modify {
+                order_id: "wo_1".into(),
+                qty: Some(10.0),
+                limit: Some(540.5),
+                stop: None,
+            })
+        );
+        assert!(
+            app.working_line_draft.is_none(),
+            "confirm drops the draft; line then follows the engine"
+        );
+        let wo = app
+            .paper
+            .working_orders
+            .iter()
+            .find(|o| o.id == "wo_1")
+            .expect("working order remains");
+        assert_eq!(
+            wo.limit,
+            Some(540.0),
+            "local snapshot is unchanged until the engine modify returns"
+        );
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+    }
+
+    #[test]
+    fn working_line_nudge_cancel_leaves_previous_price() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        app.paper_nudge_price(50);
+        assert!(app.working_line_draft.is_some());
+
+        app.paper_escape();
+
+        assert!(app.working_line_draft.is_none());
+        assert!(app.pending_paper.is_none());
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+        assert!((app.order_side.limit - 540.0).abs() < 1e-9);
+        let wo = app
+            .paper
+            .working_orders
+            .iter()
+            .find(|o| o.id == "wo_1")
+            .expect("working order remains");
+        assert_eq!(wo.limit, Some(540.0));
+        let levels = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert_eq!(levels.len(), 1);
+        assert!(
+            (levels[0].price - 540.0).abs() < 1e-9,
+            "cancel drops the draft; line stays at the previous working price"
+        );
+    }
+
+    #[test]
+    fn tp_sl_child_lines_are_nudge_targets() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        let mut tp = sample_working_order("wo_tp", "SPY", "sell", "limit", 10.0, Some(112.0), None);
+        tp.role = "tp".into();
+        tp.bracket_id = Some("br_1".into());
+        let mut sl = sample_working_order("wo_sl", "SPY", "sell", "stop", 10.0, None, Some(108.0));
+        sl.role = "sl".into();
+        sl.bracket_id = Some("br_1".into());
+        desk.working_orders = vec![tp, sl];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+
+        app.paper_select_working_delta(1);
+        assert_eq!(app.order_side.selected_order_id.as_deref(), Some("wo_tp"));
+        app.paper_nudge_price(-20);
+        let draft = app.working_line_draft.as_ref().expect("tp draft");
+        assert!((draft.previous_price - 112.0).abs() < 1e-9);
+        assert!((draft.draft_price - 111.8).abs() < 1e-9);
+        assert_eq!(
+            app.paper
+                .working_orders
+                .iter()
+                .find(|o| o.id == "wo_tp")
+                .and_then(|o| o.limit),
+            Some(112.0)
+        );
+        let levels = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert!(
+            levels.iter().any(|l| (l.price - 111.8).abs() < 1e-9),
+            "tp line follows draft"
+        );
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Modify {
+                order_id: "wo_tp".into(),
+                qty: Some(10.0),
+                limit: Some(111.8),
+                stop: None,
+            })
+        );
+
+        app.pending_paper = None;
+        app.paper_select_working_delta(1);
+        assert_eq!(app.order_side.selected_order_id.as_deref(), Some("wo_sl"));
+        app.paper_nudge_price(10);
+        let sl_draft = app.working_line_draft.as_ref().expect("sl draft");
+        assert!((sl_draft.previous_price - 108.0).abs() < 1e-9);
+        assert!((sl_draft.draft_price - 108.1).abs() < 1e-9);
+        assert_eq!(
+            app.paper
+                .working_orders
+                .iter()
+                .find(|o| o.id == "wo_sl")
+                .and_then(|o| o.stop),
+            Some(108.0)
+        );
+        app.paper_submit();
+        assert_eq!(
+            app.pending_paper,
+            Some(PendingPaperOp::Modify {
+                order_id: "wo_sl".into(),
+                qty: Some(10.0),
+                limit: None,
+                stop: Some(108.1),
+            })
+        );
+    }
+
+    #[test]
+    fn working_line_nudge_keeps_paper_chrome_focus() {
+        let bars = sample_bars(5, 1_000, 60);
+        let mut app = app_with_available_bars(bars);
+        app.apply_workspace(WorkspaceSnapshot {
+            layout_mode: "single".into(),
+            charts: vec![WorkspaceChartSnapshot {
+                id: "primary".into(),
+                instrument: "SPY".into(),
+                timeframe: "1D".into(),
+                indicators: vec![],
+                type_styles: HashMap::new(),
+            }],
+            watchlists: vec![WatchlistSnapshot {
+                id: "wl1".into(),
+                name: "Core".into(),
+                symbols: vec!["SPY".into(), "QQQ".into(), "IWM".into()],
+            }],
+            active_watchlist_id: "wl1".into(),
+        });
+        app.watchlist_visible = true;
+        app.watchlist_selected = 0;
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "stop",
+            1.0,
+            None,
+            Some(530.0),
+        )];
+        app.apply_paper(desk);
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        app.paper_nudge_price(-25);
+
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+        assert!(app.working_line_draft.is_some());
+        app.watchlist_select_delta(1);
+        assert_eq!(app.watchlist_selected, 0);
+        app.pan_focused_chart(-1);
+        assert_eq!(app.chart().pan_cursor_ts, None);
+        assert!(!app.load_selected_watchlist_symbol());
+        assert_eq!(app.focused_chart().instrument, "SPY");
+        assert_eq!(
+            app.paper.working_orders[0].stop,
+            Some(530.0),
+            "unconfirmed stop nudge does not move snapshot"
+        );
+        let levels = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert_eq!(levels.len(), 1);
+        assert!((levels[0].price - 529.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn apply_paper_does_not_clobber_unconfirmed_nudge() {
+        let mut app = App::default();
+        app.enter_workspace();
+        let mut desk = sample_paper_desk();
+        desk.working_orders = vec![sample_working_order(
+            "wo_1",
+            "SPY",
+            "buy",
+            "limit",
+            10.0,
+            Some(540.0),
+            None,
+        )];
+        app.apply_paper(desk.clone());
+        app.toggle_paper_panel();
+        app.paper_select_working_delta(1);
+        app.paper_nudge_price(50);
+
+        app.apply_paper(desk);
+        let draft = app
+            .working_line_draft
+            .as_ref()
+            .expect("draft survives engine snapshot");
+        assert!((draft.draft_price - 540.5).abs() < 1e-9);
+        assert!((app.order_side.limit - 540.5).abs() < 1e-9);
+        assert_eq!(app.paper.working_orders[0].limit, Some(540.0));
+        assert!(app.pending_paper.is_none());
+        let levels = app.working_overlay_levels("SPY", 0.0, 10.0);
+        assert!((levels[0].price - 540.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paper_escape_without_draft_closes_panel() {
+        let mut app = App::default();
+        app.enter_workspace();
+        app.toggle_paper_panel();
+        app.paper_escape();
+        assert_eq!(app.input_mode, InputMode::Normal);
     }
 }
