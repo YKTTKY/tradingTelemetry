@@ -262,6 +262,10 @@ fn handle_key(app: &mut App, code: KeyCode) {
             | KeyCode::Char('H') => {
                 app.close_help();
             }
+            KeyCode::Up | KeyCode::Char('k') => app.help_scroll_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.help_scroll_by(1),
+            KeyCode::PageUp => app.help_scroll_by(-10),
+            KeyCode::PageDown => app.help_scroll_by(10),
             KeyCode::Char('q') | KeyCode::Char('Q') => app.quit(),
             _ => {}
         }

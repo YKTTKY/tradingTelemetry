@@ -32,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Workspace => draw_workspace(frame, app),
     }
     if app.help_open {
-        draw_help_popup(frame);
+        draw_help_popup(frame, app);
     }
     if app.type_style_edit.is_some() && !app.help_open {
         draw_type_style_popup(frame, app);
@@ -73,23 +73,17 @@ fn draw_welcome(frame: &mut Frame, app: &App) {
     frame.render_widget(title, chunks[1]);
 }
 
-/// Centered floating panel listing keyboard shortcuts.
-fn draw_help_popup(frame: &mut Frame) {
-    let area = frame.area();
-    // Tall enough for the full menu; shrink on small terminals (content clips).
-    let popup_h = area.height.saturating_sub(2).clamp(18, 44);
-    let popup = centered_rect(area, 74, popup_h);
-    frame.render_widget(Clear, popup);
-
-    let section = |title: &str| {
+/// Shared help-popup body lines (also drives scroll soft-clamp / line count).
+pub fn help_shortcut_lines() -> Vec<Line<'static>> {
+    let section = |title: &'static str| {
         Line::from(Span::styled(
-            title.to_string(),
+            title,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ))
     };
-    let row = |keys: &str, desc: &str| {
+    let row = |keys: &'static str, desc: &'static str| {
         Line::from(vec![
             Span::styled(
                 format!("  {keys:<14}"),
@@ -97,15 +91,20 @@ fn draw_help_popup(frame: &mut Frame) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(desc.to_string()),
+            Span::raw(desc),
         ])
     };
 
-    let lines = vec![
+    vec![
         section("Global"),
         row("? / h", "Open or close this help"),
         row("q", "Quit the app"),
         row("Esc", "Close help, prompt, or panel (Welcome: quit)"),
+        row(
+            "↑ / ↓",
+            "Scroll this help when it is taller than the popup",
+        ),
+        row("PgUp / PgDn", "Scroll this help by a page"),
         section("Welcome"),
         row(
             "Enter",
@@ -221,10 +220,30 @@ fn draw_help_popup(frame: &mut Frame) {
         row("Enter", "Apply instrument, watchlist add, or rename"),
         row("Esc", "Cancel prompt"),
         Line::from(Span::styled(
-            "  Close help with Esc, ?, h, or Enter",
+            "  Close: Esc / ? / h / Enter  ·  Scroll: ↑↓ · PgUp/PgDn · j/k",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
+    ]
+}
+
+/// Number of lines in the help popup body (for scroll soft-clamp).
+pub fn help_shortcut_line_count() -> u16 {
+    help_shortcut_lines().len() as u16
+}
+
+/// Centered floating panel listing keyboard shortcuts.
+fn draw_help_popup(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // Tall enough for the full menu; shrink on small terminals (content scrolls).
+    let popup_h = area.height.saturating_sub(2).clamp(18, 44);
+    let popup = centered_rect(area, 74, popup_h);
+    frame.render_widget(Clear, popup);
+
+    let lines = help_shortcut_lines();
+    let content_len = lines.len() as u16;
+    let visible = popup.height.saturating_sub(2);
+    let max_scroll = content_len.saturating_sub(visible);
+    let scroll = app.help_scroll.min(max_scroll);
 
     let body = Paragraph::new(lines)
         .block(
@@ -232,12 +251,13 @@ fn draw_help_popup(frame: &mut Frame) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(Span::styled(
-                    " Keyboard shortcuts ",
+                    " Keyboard shortcuts · ↑↓ scroll ",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )),
         )
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(body, popup);
 }

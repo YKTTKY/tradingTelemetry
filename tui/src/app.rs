@@ -709,6 +709,8 @@ pub struct App {
     pub last_indicator_error: Option<String>,
     /// Floating keyboard-shortcut help overlay (does not replace input_mode).
     pub help_open: bool,
+    /// Vertical scroll offset inside the help popup (lines).
+    pub help_scroll: u16,
     /// Engine paper desk (accounts + empty Position / history tables).
     pub paper: PaperSnapshot,
     /// Place/modify/cancel form; visible with the paper panel.
@@ -756,6 +758,7 @@ impl Default for App {
             avp_place: None,
             last_indicator_error: None,
             help_open: false,
+            help_scroll: 0,
             paper: PaperSnapshot::default(),
             order_side: OrderSidePanel::default(),
             working_line_draft: None,
@@ -1153,10 +1156,31 @@ impl App {
     /// Toggle the floating keyboard-shortcut help without replacing input_mode.
     pub fn toggle_help(&mut self) {
         self.help_open = !self.help_open;
+        if self.help_open {
+            self.help_scroll = 0;
+        }
     }
 
     pub fn close_help(&mut self) {
         self.help_open = false;
+        self.help_scroll = 0;
+    }
+
+    /// Scroll the help popup by `delta` lines (only while help is open).
+    /// Soft-clamps to the help content line count; draw further clamps to the visible area.
+    pub fn help_scroll_by(&mut self, delta: i32) {
+        if !self.help_open {
+            return;
+        }
+        let content_len = crate::ui::help_shortcut_line_count();
+        if delta >= 0 {
+            self.help_scroll = self
+                .help_scroll
+                .saturating_add(delta as u16)
+                .min(content_len);
+        } else {
+            self.help_scroll = self.help_scroll.saturating_sub((-delta) as u16);
+        }
     }
 
     pub fn toggle_indicator_panel(&mut self) {
@@ -3713,6 +3737,31 @@ mod tests {
         app.close_help();
         assert!(!app.help_open);
         assert_eq!(app.input_mode, InputMode::IndicatorPanel);
+    }
+
+    #[test]
+    fn help_scroll_resets_and_clamps() {
+        let mut app = App::default();
+        assert_eq!(app.help_scroll, 0);
+        // Closed: scroll_by is a no-op.
+        app.help_scroll_by(5);
+        assert_eq!(app.help_scroll, 0);
+
+        app.toggle_help();
+        assert!(app.help_open);
+        assert_eq!(app.help_scroll, 0);
+
+        app.help_scroll_by(5);
+        assert_eq!(app.help_scroll, 5);
+
+        app.help_scroll_by(-100);
+        assert_eq!(app.help_scroll, 0);
+
+        app.help_scroll_by(3);
+        assert_eq!(app.help_scroll, 3);
+        app.close_help();
+        assert!(!app.help_open);
+        assert_eq!(app.help_scroll, 0);
     }
 
     #[test]
