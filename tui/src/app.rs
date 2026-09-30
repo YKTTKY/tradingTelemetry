@@ -1214,7 +1214,7 @@ impl App {
         }
     }
 
-    /// Toggle the paper panel (local UI control; keyboard shortcut TBD).
+    /// Toggle the paper panel (keyboard: backtick ` in Normal / PaperPanel).
     ///
     /// Open → owns input focus like the indicator panel. Watchlist arrows and
     /// chart pan stay idle until it closes.
@@ -5364,6 +5364,17 @@ mod tests {
             ..sample_paper_desk()
         });
         assert!(app.active_paper_account().is_none());
+    }
+
+    #[test]
+    fn toggle_paper_panel_opens_from_normal_and_closes() {
+        let mut app = App::default();
+        app.enter_workspace();
+        assert_eq!(app.input_mode, InputMode::Normal);
+        app.toggle_paper_panel();
+        assert_eq!(app.input_mode, InputMode::PaperPanel);
+        app.toggle_paper_panel();
+        assert_eq!(app.input_mode, InputMode::Normal);
     }
 
     #[test]

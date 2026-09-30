@@ -118,6 +118,7 @@ pub fn help_shortcut_lines() -> Vec<Line<'static>> {
         row("[ / ]", "Previous / next timeframe"),
         row("i", "Change instrument (focused chart)"),
         row("o", "Open / close indicator panel"),
+        row("`", "Open / close paper panel"),
         Line::from(Span::styled(
             "  Chart chrome: forming-bar countdown per chart (dual = two independent)",
             Style::default().fg(Color::DarkGray),
@@ -199,6 +200,7 @@ pub fn help_shortcut_lines() -> Vec<Line<'static>> {
             "Enter",
             "Confirm selected draft (modify); else place. Line then follows the engine",
         ),
+        row("`", "Close paper panel (also drops unconfirmed draft)"),
         row(
             "Esc",
             "Drop unconfirmed draft (previous working price remains); else close",

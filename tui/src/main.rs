@@ -302,6 +302,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         },
         InputMode::PaperPanel => match code {
             KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => app.toggle_help(),
+            KeyCode::Char('`') => app.toggle_paper_panel(),
             KeyCode::Esc => app.paper_escape(),
             KeyCode::Enter => app.paper_submit(),
             KeyCode::Up => app.paper_select_working_delta(-1),
@@ -514,6 +515,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Char('o') | KeyCode::Char('O') if app.screen == Screen::Workspace => {
                 app.toggle_indicator_panel();
+            }
+            KeyCode::Char('`') if app.screen == Screen::Workspace => {
+                app.toggle_paper_panel();
             }
             KeyCode::Char('l') | KeyCode::Char('L') if app.screen == Screen::Workspace => {
                 app.toggle_layout();
