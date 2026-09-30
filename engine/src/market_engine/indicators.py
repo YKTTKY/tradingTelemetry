@@ -37,6 +37,11 @@ GEX_CONTRACT_MULTIPLIER = 100.0
 DEFAULT_SESSION_VP_ROWS = 500
 DEFAULT_FIXED_RANGE_VP_ROWS = 200
 DEFAULT_ANCHORED_VP_ROWS = 500
+# Cap bins on the wire after POC/VAH/VAL are computed at full ``rows``.
+# 500 sessions × 500 bins ≈ 17–24 MiB JSON and blows the TUI tungstenite
+# default max_frame_size (16 MiB), causing reconnect loops. Terminal draw
+# already downsamples further (~80 steps), so 96 wire bins is plenty.
+MAX_VP_WIRE_BINS = 96
 DEFAULT_VALUE_AREA_VOLUME = 70.0
 DEFAULT_BOX_WIDTH = 30.0
 DEFAULT_PLACEMENT: Placement = "right"
@@ -632,6 +637,59 @@ def _bucket_index(price: float, price_low: float, row_height: float, rows: int) 
     return idx
 
 
+def downsample_vp_bins(
+    bins: list[dict[str, float]],
+    *,
+    max_bins: int = MAX_VP_WIRE_BINS,
+) -> list[dict[str, float]]:
+    """Merge adjacent bins so IPC payloads stay under WS frame limits.
+
+    POC / VAH / VAL are computed on the full-resolution volumes before this
+    runs; the histogram is only for TUI draw (which downsamples again).
+    """
+    n = len(bins)
+    if n <= max_bins or max_bins < 1:
+        return bins
+    out: list[dict[str, float]] = []
+    for i in range(max_bins):
+        start = (i * n) // max_bins
+        end = ((i + 1) * n) // max_bins
+        chunk = bins[start:end]
+        if not chunk:
+            continue
+        out.append(
+            {
+                "price_low": float(chunk[0]["price_low"]),
+                "price_high": float(chunk[-1]["price_high"]),
+                "volume": float(sum(float(b["volume"]) for b in chunk)),
+            }
+        )
+    return out
+
+
+def slim_series_for_live_ws(
+    series: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Shrink live ``indicator_update`` payloads.
+
+    Session VP historical day profiles do not change on a live tip update;
+    only the newest session accumulates volume. Sending every day × every
+    bin on each conflated tick is what hit the 16 MiB WS frame limit.
+    The TUI merges the slim profile into the series loaded via HTTP interest.
+    """
+    slim: dict[str, dict[str, Any]] = {}
+    for iid, payload in series.items():
+        if payload.get("type") == "session_vp":
+            profiles = list(payload.get("profiles") or [])
+            slim[iid] = {
+                **payload,
+                "profiles": profiles[-1:] if profiles else [],
+            }
+        else:
+            slim[iid] = payload
+    return slim
+
+
 def build_volume_profile(
     bars: list[Bar] | tuple[Bar, ...],
     *,
@@ -719,7 +777,7 @@ def build_volume_profile(
         "val": val_low,
         "vah": vah_high,
         "total_volume": total,
-        "bins": bins,
+        "bins": downsample_vp_bins(bins),
     }
 
 

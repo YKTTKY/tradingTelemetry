@@ -6,7 +6,7 @@ use crate::ipc::{
     BarUpdateEvent, ChartIndicatorsPayload, ChartInterestResponse, FeedSnapshot, IndicatorConfig,
     IndicatorSeriesData, IndicatorTypeStyle, IndicatorUpdateEvent, IndicatorsApplyResponse,
     IpcEvent, OhlcvBar, PaperAccountSnapshot, PaperSnapshot, QuoteRow, QuoteUpdateEvent,
-    WatchlistSnapshot, WorkingOrderSnapshot, WorkspaceSnapshot,
+    VpProfile, WatchlistSnapshot, WorkingOrderSnapshot, WorkspaceSnapshot,
 };
 use crate::overlay::{
     OverlayLevel, OverlayPin, TradeMarkPinSpec, WorkingOrderLineSpec, clamp_strength,
@@ -2960,7 +2960,11 @@ impl App {
         }
         // Engine always includes the full config list for this chart (may be empty).
         chart.indicators = update.indicators;
-        chart.indicator_series = update.series;
+        // Live WS session_vp frames may carry only the newest day profile (engine
+        // slim) so they stay under tungstenite's 16 MiB max_frame_size. Merge by
+        // session_start into the series loaded via HTTP interest / apply.
+        chart.indicator_series =
+            merge_live_indicator_series(&chart.indicator_series, update.series);
     }
 
     /// Cycle focused chart timeframe by `delta` steps within [`V1_TIMEFRAMES`] only.
@@ -3362,6 +3366,54 @@ fn merge_bar(bars: &mut Vec<OhlcvBar>, bar: OhlcvBar) {
     }
 }
 
+
+/// Merge a live ``indicator_update`` series map into the chart's hot series.
+///
+/// Non-session_vp entries replace wholesale. Session VP profiles upsert by
+/// ``session_start`` so a slim "latest day only" WS payload does not wipe the
+/// historical profiles that arrived on chart interest.
+fn merge_live_indicator_series(
+    existing: &HashMap<String, IndicatorSeriesData>,
+    incoming: HashMap<String, IndicatorSeriesData>,
+) -> HashMap<String, IndicatorSeriesData> {
+    let mut out = HashMap::with_capacity(incoming.len());
+    for (id, series) in incoming {
+        if series.series_type == "session_vp" {
+            if let Some(prev) = existing.get(&id) {
+                out.insert(id, merge_session_vp_series(prev, series));
+                continue;
+            }
+        }
+        out.insert(id, series);
+    }
+    out
+}
+
+fn merge_session_vp_series(
+    existing: &IndicatorSeriesData,
+    mut incoming: IndicatorSeriesData,
+) -> IndicatorSeriesData {
+    let mut profiles = existing.profiles.clone();
+    for profile in incoming.profiles.drain(..) {
+        match profile.session_start {
+            Some(start) => {
+                if let Some(slot) = profiles
+                    .iter_mut()
+                    .find(|p| p.session_start == Some(start))
+                {
+                    *slot = profile;
+                } else {
+                    profiles.push(profile);
+                }
+            }
+            None => profiles.push(profile),
+        }
+    }
+    profiles.sort_by_key(|p| p.session_start.unwrap_or(0));
+    incoming.profiles = profiles;
+    incoming
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3370,6 +3422,59 @@ mod tests {
         WorkspaceChartSnapshot,
     };
     use crate::overlay::{DEFAULT_MA_STRENGTH, DEFAULT_VP_STRENGTH};
+
+    fn vp_profile(session_start: i64, volume: f64) -> VpProfile {
+        VpProfile {
+            session_start: Some(session_start),
+            session_end: Some(session_start + 86_400),
+            range_start: None,
+            range_end: None,
+            anchor_end: None,
+            anchor: None,
+            levels_end: None,
+            extend_to_right: None,
+            high: 110.0,
+            low: 100.0,
+            poc: 105.0,
+            vah: 108.0,
+            val: 102.0,
+            total_volume: volume,
+            bins: vec![],
+        }
+    }
+
+    fn svp_series(profiles: Vec<VpProfile>) -> IndicatorSeriesData {
+        IndicatorSeriesData {
+            series_type: "session_vp".into(),
+            status: None,
+            reason: None,
+            values: vec![],
+            ma_type: None,
+            length: None,
+            profiles,
+            net_gex: None,
+            spot: None,
+            levels: vec![],
+        }
+    }
+
+    #[test]
+    fn live_session_vp_update_merges_latest_profile() {
+        let mut existing = HashMap::new();
+        existing.insert(
+            "svp".into(),
+            svp_series(vec![vp_profile(100, 1.0), vp_profile(200, 2.0)]),
+        );
+        let mut incoming = HashMap::new();
+        incoming.insert("svp".into(), svp_series(vec![vp_profile(200, 99.0)]));
+        let merged = merge_live_indicator_series(&existing, incoming);
+        let profiles = &merged.get("svp").unwrap().profiles;
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].session_start, Some(100));
+        assert_eq!(profiles[0].total_volume, 1.0);
+        assert_eq!(profiles[1].session_start, Some(200));
+        assert_eq!(profiles[1].total_volume, 99.0);
+    }
 
     #[test]
     fn chart_overlay_strength_defaults_by_type() {

@@ -115,11 +115,20 @@ class ConflatingHub:
         client = await self._find_client(websocket)
         if client is None:
             if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json(payload)
+                try:
+                    await websocket.send_json(payload)
+                except Exception:
+                    # Client may have closed between the state check and send
+                    # (e.g. frame-too-large close) — never raise into heartbeat.
+                    return
             return
         async with client.lock:
-            if client.ws.client_state == WebSocketState.CONNECTED:
+            if client.ws.client_state != WebSocketState.CONNECTED:
+                return
+            try:
                 await client.ws.send_json(payload)
+            except Exception:
+                await self.remove_client(websocket)
 
     async def _find_client(self, websocket: WebSocket) -> _Client | None:
         async with self._clients_lock:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -375,3 +377,105 @@ def test_session_vp_disabled_omits_series(tmp_path: Path):
     ).json()
     assert body["indicators"][0]["enabled"] is False
     assert "svp" not in body["series"]
+
+
+def test_downsample_vp_bins_and_slim_series_helpers():
+    from market_engine.indicators import (
+        MAX_VP_WIRE_BINS,
+        downsample_vp_bins,
+        slim_series_for_live_ws,
+    )
+
+    bins = [
+        {"price_low": float(i), "price_high": float(i + 1), "volume": float(i + 1)}
+        for i in range(500)
+    ]
+    wire = downsample_vp_bins(bins)
+    assert len(wire) == MAX_VP_WIRE_BINS
+    assert wire[0]["price_low"] == 0.0
+    assert wire[-1]["price_high"] == 500.0
+    assert sum(b["volume"] for b in wire) == pytest.approx(sum(b["volume"] for b in bins))
+
+    series = {
+        "svp": {
+            "type": "session_vp",
+            "profiles": [{"session_start": i, "bins": wire} for i in range(40)],
+        },
+        "ma1": {"type": "ma", "values": [1.0, 2.0]},
+    }
+    slim = slim_series_for_live_ws(series)
+    assert len(slim["svp"]["profiles"]) == 1
+    assert slim["svp"]["profiles"][0]["session_start"] == 39
+    assert slim["ma1"] == series["ma1"]
+
+
+def test_session_vp_wire_bins_capped_and_live_ws_slim(tmp_path: Path):
+    """Many daily profiles at rows=500 must stay under the 16 MiB WS frame.
+
+    HTTP interest/apply still returns all day profiles (bins capped for wire).
+    Live indicator_update carries only the newest session profile.
+    """
+    from market_engine.indicators import MAX_VP_WIRE_BINS
+
+    day = 86_400
+    base_ts = _EQ_SESS_A_START + 3_600  # inside first equity session
+    bars = [
+        Bar(
+            ts=base_ts + i * day,
+            open=100.0 + i,
+            high=104.0 + i,
+            low=100.0 + i,
+            close=102.0 + i,
+            volume=1_000.0 * (i + 1),
+        )
+        for i in range(40)
+    ]
+
+    vendor = FakeVendor(auto_ticks=False)
+    vendor.seed_raw_bars("SPY", "1D", bars)
+    store = tmp_path / "workspace.json"
+    client, vendor = _client(workspace_path=store, vendor=vendor)
+
+    with client:
+        client.post(
+            "/v1/chart/interest",
+            json={"chart_id": "primary", "instrument": "SPY", "timeframe": "1D"},
+        )
+        apply = client.post(
+            "/v1/indicators",
+            json={
+                "chart_id": "primary",
+                "indicators": [
+                    {"id": "svp", "type": "session_vp", "enabled": True, "rows": 500}
+                ],
+            },
+        )
+        assert apply.status_code == 200
+        profiles = apply.json()["series"]["svp"]["profiles"]
+        assert len(profiles) >= 20
+        assert len(profiles[0]["bins"]) == MAX_VP_WIRE_BINS
+        assert len(json.dumps(apply.json()["series"])) < 4_000_000
+
+        last = bars[-1]
+        with client.websocket_connect("/v1/ws") as ws:
+            for _ in range(5):
+                msg = ws.receive_json()
+                if msg.get("type") == "feed_status":
+                    break
+            vendor.inject_tick(
+                "SPY",
+                price=float(last.close) + 1.0,
+                volume=10.0,
+                ts=float(last.ts + 60),
+            )
+            time.sleep(_CONFLATE_S * 2.5)
+
+            ind_msg = None
+            for _ in range(40):
+                msg = ws.receive_json()
+                if msg.get("type") == "indicator_update" and msg.get("chart_id") == "primary":
+                    ind_msg = msg
+                    break
+            assert ind_msg is not None
+            assert len(ind_msg["series"]["svp"]["profiles"]) == 1
+            assert len(json.dumps(ind_msg)) < 200_000

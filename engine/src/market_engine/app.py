@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from market_engine.chart import ChartService
 from market_engine.feed import FeedState, default_feed_state
-from market_engine.indicators import IndicatorService, parse_indicators_payload
+from market_engine.indicators import IndicatorService, parse_indicators_payload, slim_series_for_live_ws
 from market_engine.paper import PaperBook
 from market_engine.publish import ConflatingHub
 from market_engine.quotes import QuoteService
@@ -204,13 +204,14 @@ def create_app(
         series = indicators.recompute(
             chart_id, bars, instrument=instrument, options=options
         )
+        # Live WS must not dump every session_vp day×bin blob (16 MiB frame cap).
         hub.note_indicator_update(
             {
                 "chart_id": chart_id,
                 "instrument": instrument,
                 "timeframe": timeframe,
                 "indicators": [c.to_public() for c in indicators.get_configs(chart_id)],
-                "series": series,
+                "series": slim_series_for_live_ws(series),
             }
         )
 
